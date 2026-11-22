@@ -11,6 +11,7 @@ Numbers in parentheses are the pull requests that made each change. Each version
 
 ### Changed
 - **The GitHub repository is now [rellik92j/sessionsai](https://github.com/rellik92j/sessionsai)**, renamed from `claude-sessions-vscode`. The listing's Repository link points at the new name, and old links redirect. (#44)
+- **New screenshots** in the README and on the Marketplace listing, made from sample sessions. They show the Session details panel, replying from the transcript, choosing a tool for Continue in New Session, and the Current week and month ranges. (#46)
 
 ## [0.4.5](https://github.com/rellik92j/sessionsai/releases/tag/v0.4.5) - 2026-11-20
 

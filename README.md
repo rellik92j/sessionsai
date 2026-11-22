@@ -4,7 +4,7 @@
 
 [Claude Code](https://claude.com/claude-code) saves every conversation you have with it, but finding an old one means scrolling through `claude --resume` and guessing from the first line. SessionsAI adds a sidebar that shows all of your sessions across every project. You can search everything you and Claude said, read any conversation as a chat transcript, see what each session used and cost (or chart what all of them cost, by day, model and project), and resume it in one click, or carry it over into a fresh session, even in a different tool. Your [GitHub Copilot CLI and VS Code Chat](#github-copilot-cli-and-vs-code-chat-sessions-too) sessions are listed alongside, so one search covers all of them.
 
-![The SessionsAI sidebar next to a transcript](docs/images/overview.png)
+![The SessionsAI sidebar next to a transcript, with the Session details panel open](docs/images/overview.png)
 
 ## What you can do with it
 
@@ -43,7 +43,7 @@ To find the sessions that worked on a file, right-click it in the Explorer or ri
 
 ### Read a session as a chat
 
-![A transcript with markdown, a code block and an expanded edit diff](docs/images/transcript.png)
+![A transcript with an expanded edit diff, a table and a code block](docs/images/transcript.png)
 
 Click a session to open its transcript. Your prompts are on the right and Claude's replies are on the left, with markdown, tables and syntax-highlighted code that you can copy.
 
@@ -70,7 +70,7 @@ The top of each transcript shows the numbers Claude Code's status line shows whi
 
 When you scroll down into the conversation, a one-line version of the stats stays in the bar at the top, along with the switch for showing tool calls. Click it to go back to the top.
 
-![Session cards with cost, context and prompt cache badges](docs/images/cards.png)
+![Session cards with cost, context and prompt cache badges, under the source chips](docs/images/cards.png)
 
 Cards keep it short. Each one shows the cost, plus two badges that only appear when they're worth acting on:
 
@@ -96,7 +96,7 @@ Cost is counted on the day each request was made, so a session that ran over sev
 
 ### Pick up where you left off
 
-![Resuming a session in a Claude Code terminal beside the editor](docs/images/resume.png)
+![Continue in New Session with Tool or Model: choosing Claude Code, GitHub Copilot CLI or VS Code Chat for the new session](docs/images/continue.png)
 
 You'll find these on each card and at the top of each transcript. This is how they work for Claude Code sessions; [Copilot CLI and VS Code Chat sessions](#github-copilot-cli-and-vs-code-chat-sessions-too) work much the same way.
 
@@ -106,6 +106,8 @@ You'll find these on each card and at the top of each transcript. This is how th
 - **Open in Claude Code Chat** reopens the session in the chat panel of the official Claude Code extension, if you have it installed.
 
 #### Reply from the transcript
+
+![The message box at the bottom of a transcript, with its menu open: send to this session or a new one, in Claude Code, Copilot CLI or VS Code Chat](docs/images/reply.png)
 
 At the bottom of every transcript there's a message box. Type what you want next and press Enter (Shift+Enter adds a line). The line under the box always says what will happen:
 
