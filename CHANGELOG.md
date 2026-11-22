@@ -4,6 +4,14 @@ All notable changes to SessionsAI (published as Claude Sessions before 0.4.0) ar
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 Numbers in parentheses are the pull requests that made each change. Each version heading links to its GitHub release, which has the release notes and the `.vsix` for installing that version with **Install from VSIX…**.
 
+## [0.4.6](https://github.com/rellik92j/sessionsai/releases/tag/v0.4.6) - 2026-11-22
+
+### Added
+- **Changelog.** The Marketplace listing has a Changelog tab covering every release since 0.2.1. (#43)
+
+### Changed
+- **The GitHub repository is now [rellik92j/sessionsai](https://github.com/rellik92j/sessionsai)**, renamed from `claude-sessions-vscode`. The listing's Repository link points at the new name, and old links redirect. (#44)
+
 ## [0.4.5](https://github.com/rellik92j/sessionsai/releases/tag/v0.4.5) - 2026-11-20
 
 ### Added
