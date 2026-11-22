@@ -151,7 +151,7 @@ VS Code keeps it up to date on its own.
 
 If you installed an earlier version from a `.vsix` file, uninstall that one first. It was published as `local.claude-sessions`, so VS Code treats it as a different extension and won't update it.
 
-Each release's `.vsix` is also on the [Releases page](https://github.com/rellik92j/claude-sessions-vscode/releases/latest), for installing with **Install from VSIX…** in the Extensions view's `…` menu.
+Each release's `.vsix` is also on the [Releases page](https://github.com/rellik92j/sessionsai/releases/latest), for installing with **Install from VSIX…** in the Extensions view's `…` menu.
 
 ## Privacy
 
