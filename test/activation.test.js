@@ -826,3 +826,96 @@ test('subagent runs render as their own collapsible speakers in the transcript',
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("a subagent's full run opens from the transcript as a read-only transcript of its own log", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-sessions-subagent-run-'));
+  const projectsDir = path.join(root, 'claude');
+  const ID = '5e1f0c2a-1111-4222-8333-944455556666';
+  const BG = '9b9b9b9b-1111-4222-8333-944455556666';
+  try {
+    fs.cpSync(path.join(__dirname, 'fixtures', 'claude-subagents'), projectsDir, { recursive: true });
+    const state = {
+      projectsDir,
+      config: { copilotDir: path.join(root, 'none'), vscodeUserDir: path.join(root, 'none') },
+      providers: {},
+      commands: {},
+      panels: [],
+      panelPosts: [],
+      errors: [],
+      terminals: [],
+      infos: [],
+      // Claude Code is installed, so the parent page has its Open in chat button and the run's page must not.
+      extensions: { 'anthropic.claude-code': { extensionUri: { fsPath: root } } },
+    };
+    await activateWithSidebar(state);
+    await state.commands['claudeSessions.openTranscript']({ sessionKey: `claude:${ID}` });
+    const panel = state.panels[0];
+    const parent = panel.webview.html;
+    // Launch, hand-back and the one-off drafter each offer their run; the side panel's Subagents rows open the same.
+    const opens = [...parent.matchAll(/<button class="subagent-open" data-cmd="openSubagent" data-arg="([^"]+)"/g)].map((m) => m[1]);
+    assert.deepEqual(opens, ['a1111111111111111', 'a2222222222222222', 'a1111111111111111']);
+    const side = /<details class="side-section" data-section="agents"[\s\S]*?<\/details>/.exec(parent)[0];
+    assert.deepEqual([...side.matchAll(/data-cmd="openSubagent" data-arg="([^"]+)"/g)].map((m) => m[1]), ['a1111111111111111', 'a2222222222222222']);
+    assert.match(parent, /data-cmd="resume"/);
+
+    await panel.onMessage({ command: 'openSubagent', arg: 'a1111111111111111' });
+    assert.equal(state.panels.length, 1, 'opens in the preview tab, like any transcript');
+    const run = panel.webview.html;
+    assert.equal(panel.title, 'release-checker: Check release 1.2.0');
+    assert.match(run, /<h1>release-checker: Check release 1\.2\.0<\/h1>/);
+    assert.match(run, /<span class="chip agent" title="Agent type"><i class="codicon codicon-hubot"><\/i>release-checker<\/span>/);
+    const parentTitle = /<h1>(.*?)<\/h1>/.exec(parent)[1];
+    assert.ok(run.includes(`<i class="codicon codicon-arrow-left"></i>${parentTitle}</button>`), 'a chip names the session that ran it');
+    assert.match(run, /<span>Back to session<\/span>/);
+    // Its tool calls and text, in order, with the main session as the one prompting it.
+    const order = ['Main session', 'Check that release 1.2.0 is ready to ship', '<strong>release-checker</strong>', 'npm test', '88 passing', '88 of 88 pass'].map((s) => run.indexOf(s));
+    assert.ok(order.every((i) => i > 0), `all found: ${order}`);
+    assert.deepEqual([...order].sort((a, b) => a - b), order);
+    // Read-only: nothing that resumes, continues, sends to or renames it.
+    for (const cmd of ['resume', 'continueInNewSession', 'continueInNewSessionWithModel', 'openInClaudeCode', 'rename']) {
+      assert.doesNotMatch(run, new RegExp(`data-cmd="${cmd}"`), cmd);
+    }
+    assert.doesNotMatch(run, /id="composer"/);
+    // And the messages are ignored even if one arrives.
+    for (const command of ['resume', 'continueInNewSession', 'openInClaudeCode', 'rename']) {
+      await panel.onMessage({ command });
+    }
+    await panel.onMessage({ command: 'send', text: 'hello', target: 'claude', mode: 'same' });
+    assert.equal(state.terminals.length, 0, 'nothing was resumed or sent');
+    assert.equal(panel.webview.html, run);
+
+    // Back to the session that ran it.
+    await panel.onMessage({ command: 'openParent' });
+    assert.match(panel.webview.html, /data-cmd="resume"/);
+    assert.equal(/<h1>(.*?)<\/h1>/.exec(panel.webview.html)[1], parentTitle);
+
+    // A run whose log is missing has no open control, and asking for it anyway shows a message, not an error.
+    await state.commands['claudeSessions.openTranscript']({ sessionKey: `claude:${BG}` });
+    const bg = panel.webview.html;
+    const reviewer = [...bg.matchAll(/<div class="msg subagent[^"]*">[\s\S]*?<\/details>\s*<\/div>\s*<\/div>/g)].map((m) => m[0]).filter((b) => b.includes('<strong>reviewer</strong>'));
+    assert.equal(reviewer.length, 2);
+    assert.ok(reviewer.every((b) => !b.includes('subagent-open')));
+    await panel.onMessage({ command: 'openSubagent', arg: 'a7777777777777777' });
+    assert.equal(panel.webview.html, bg);
+    assert.match(state.infos.at(-1), /no longer on disk/);
+
+    // The worker's run: the main session's follow-up is its own prompt, between its two replies; Keep open keeps it.
+    await panel.onMessage({ command: 'openSubagent', arg: 'a5555555555555555' });
+    const worker = panel.webview.html;
+    assert.equal((worker.match(/<div class="msg user"/g) ?? []).length, 2);
+    assert.ok(worker.indexOf('SA-1 is done up to the merge') < worker.indexOf('Fix the lint warning'));
+    assert.ok(worker.indexOf('Fix the lint warning') < worker.indexOf('Lint fixed in a second commit'));
+    await panel.onMessage({ command: 'keepOpen' });
+    await panel.onMessage({ command: 'openParent' });
+    assert.equal(state.panels.length, 2, 'the kept run stays; the session opens in a new preview tab');
+    assert.match(state.panels[1].webview.html, /data-cmd="resume"/);
+
+    // A log deleted after the page rendered: a message, no throw.
+    fs.rmSync(path.join(projectsDir, 'C--repo', BG, 'subagents', 'agent-a6666666666666666.jsonl'));
+    await state.panels[1].onMessage({ command: 'openSubagent', arg: 'a6666666666666666' });
+    assert.match(state.infos.at(-1), /no longer on disk/);
+    assert.deepEqual(state.errors, []);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

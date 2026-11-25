@@ -46,7 +46,8 @@ export interface SessionInsights {
   skills: { name: string; count: number }[];
   /** Slash commands typed as prompts ("/model", "/start-change …"), by name. */
   commands: { name: string; count: number }[];
-  subagents: { type: string; description: string }[];
+  /** Agent calls; `agentId` when the run's log was read, so its full run can be opened. */
+  subagents: { type: string; description: string; agentId?: string }[];
   web: { kind: 'fetch' | 'search'; text: string }[];
   /** MCP servers whose tools were called, with call counts. */
   mcpServers: { name: string; count: number }[];
@@ -156,6 +157,13 @@ export function collectInsights(entries: TranscriptEntry[]): SessionInsights {
   const web: SessionInsights['web'] = [];
   const prompts: SessionInsights['prompts'] = [];
   let failedTools = 0;
+  // Runs whose log was read, by the Agent call that started them.
+  const runs = new Map<string, string>();
+  for (const e of entries) {
+    if (e.subagent?.toolUseId && e.subagent.agentId) {
+      runs.set(e.subagent.toolUseId, e.subagent.agentId);
+    }
+  }
 
   entries.forEach((e, index) => {
     if (e.role === 'user') {
@@ -206,7 +214,8 @@ export function collectInsights(entries: TranscriptEntry[]): SessionInsights {
         const skill = p.args.skill;
         bump(skills, skill, () => ({ name: skill, count: 0 }));
       } else if ((name === 'agent' || name === 'task') && (p.args?.description || p.args?.subagent_type)) {
-        subagents.push({ type: p.args?.subagent_type || 'general-purpose', description: p.args?.description ?? '' });
+        const agentId = p.id ? runs.get(p.id) : undefined;
+        subagents.push({ type: p.args?.subagent_type || 'general-purpose', description: p.args?.description ?? '', ...(agentId ? { agentId } : {}) });
       } else if ((name === 'webfetch' || name === 'web_fetch' || name === 'fetch') && p.args?.url) {
         web.push({ kind: 'fetch', text: p.args.url });
       } else if (name === 'websearch' && p.args?.query) {

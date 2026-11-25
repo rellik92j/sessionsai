@@ -89,9 +89,18 @@ export async function readSubagentRuns(sessionFile: string, id: string): Promise
         fs.readFile(f, 'utf8').catch(() => ''),
         fs.readFile(f.replace(/\.jsonl$/, '.meta.json'), 'utf8').catch(() => undefined),
       ]);
-      return parseSubagentRun(log, meta);
+      const run = parseSubagentRun(log, meta);
+      run.file = f;
+      // A log whose records name no agent is still known by its file name, so it can be opened.
+      run.agentId ??= /^agent-([\w-]+)\.jsonl$/.exec(path.basename(f))?.[1];
+      return run;
     }),
   );
+}
+
+/** One subagent run of a session, found by its agent id; undefined when its log is gone or answered another session. */
+export async function findSubagentRun(sessionFile: string, id: string, agentId: string): Promise<SubagentRun | undefined> {
+  return (await readSubagentRuns(sessionFile, id)).find((r) => r.agentId === agentId && (!r.sessionId || r.sessionId === id));
 }
 
 async function readdirSafe(dir: string) {

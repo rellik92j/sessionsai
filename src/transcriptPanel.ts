@@ -7,8 +7,8 @@ import { escapeHtml, formatDateTime, formatTokens, formatUsd } from './format';
 import { collectInsights, editsAsDiff, FileTouch, SessionInsights, TodoStatus } from './insights';
 import { renderMarkdown } from './markdown';
 import { projectName, projectPath, SessionModel } from './model';
-import { SessionInfo, TranscriptEntry, TranscriptPart, TurnStats } from './sessionParser';
-import { readSubagentRuns } from './sessionStore';
+import { parseTranscript, SessionInfo, SubagentRun, TranscriptEntry, TranscriptPart, TurnStats } from './sessionParser';
+import { findSubagentRun, readSubagentRuns } from './sessionStore';
 import { parseTranscriptFor } from './transcripts';
 import { canResumeIn, ContinueTarget, isClaude, NO_FOLDER, sessionKey, SessionSource, SourceInfo, SOURCES, sourceOf } from './sources';
 import { UsageSummary } from './usage';
@@ -24,6 +24,22 @@ interface TranscriptTab {
   preview: boolean;
   /** What the session did, as last rendered; the side panel's file actions look up edits here. */
   insights?: SessionInsights;
+  /** Set when the tab shows one of the session's subagent runs instead of the session: read-only, no resume or send. */
+  run?: SubagentRun;
+}
+
+/** Messages that act on the session as a whole: resuming, continuing, sending or renaming. A subagent tab ignores them. */
+const SESSION_ACTIONS = new Set(['resume', 'continueInNewSession', 'continueInNewSessionWithModel', 'openInClaudeCode', 'send', 'rename']);
+
+/** What a tab shows: a session, or one subagent run of it. */
+function tabKey(session: SessionInfo, run?: SubagentRun): string {
+  return run ? `${sessionKey(session)}#${run.agentId}` : sessionKey(session);
+}
+
+/** A run's speaker label: a named agent's type, or "Subagent" for a built-in one-off agent (as in the transcript). */
+export function subagentName(run: SubagentRun): string {
+  const builtIn = run.isBuiltIn ?? (!run.agentType || run.agentType === 'general-purpose');
+  return builtIn || !run.agentType ? 'Subagent' : run.agentType;
 }
 
 /**
@@ -56,11 +72,11 @@ export class TranscriptPanels {
     }
   }
 
-  async open(session: SessionInfo, highlight: string[] = [], keepOpen = false): Promise<void> {
+  async open(session: SessionInfo, highlight: string[] = [], keepOpen = false, run?: SubagentRun): Promise<void> {
     const usePreview = !keepOpen && vscode.workspace.getConfiguration('claudeSessions').get<boolean>('reuseTranscriptTab', true);
-    const key = sessionKey(session);
+    const key = tabKey(session, run);
     let tab = this.pinned.get(key);
-    if (!tab && this.preview && sessionKey(this.preview.session) === key) {
+    if (!tab && this.preview && tabKey(this.preview.session, this.preview.run) === key) {
       tab = this.preview;
       if (!usePreview) {
         this.promote(tab);
@@ -71,37 +87,74 @@ export class TranscriptPanels {
     }
     if (tab) {
       tab.session = session;
+      tab.run = run;
       tab.highlight = highlight;
       tab.panel.reveal();
       await this.render(tab);
       return;
     }
-    tab = this.create(session, highlight, usePreview);
+    tab = this.create(session, highlight, usePreview, run);
     await this.render(tab);
   }
 
-  private create(session: SessionInfo, highlight: string[], preview: boolean): TranscriptTab {
+  /**
+   * Opens one of a Claude Code session's subagent runs, by agent id, as a read-only transcript of its own log. A run
+   * whose log is gone gets a message instead.
+   */
+  async openSubagent(session: SessionInfo, agentId: string, keepOpen = false): Promise<void> {
+    const run = isClaude(session) ? await findSubagentRun(session.filePath, session.id, agentId) : undefined;
+    if (!run?.file) {
+      vscode.window.showInformationMessage("This subagent run's log is no longer on disk, so only what the session recorded of it can be shown.");
+      return;
+    }
+    await this.open(session, [], keepOpen, run);
+  }
+
+  private create(session: SessionInfo, highlight: string[], preview: boolean, run?: SubagentRun): TranscriptTab {
     const panel = vscode.window.createWebviewPanel('claudeSessions.transcript', session.title, vscode.ViewColumn.Active, {
       enableScripts: true,
       enableFindWidget: true,
       retainContextWhenHidden: true,
       localResourceRoots: [this.codiconsUri, this.mediaUri],
     });
-    const tab: TranscriptTab = { panel, session, highlight, preview };
+    const tab: TranscriptTab = { panel, session, highlight, preview, run };
     if (preview) {
       this.preview = tab;
     } else {
-      this.pinned.set(sessionKey(session), tab);
+      this.pinned.set(tabKey(session, run), tab);
     }
     panel.onDidDispose(() => {
       if (this.preview === tab) {
         this.preview = undefined;
-      } else if (this.pinned.get(sessionKey(tab.session)) === tab) {
-        this.pinned.delete(sessionKey(tab.session));
+      } else if (this.pinned.get(tabKey(tab.session, tab.run)) === tab) {
+        this.pinned.delete(tabKey(tab.session, tab.run));
       }
     });
     panel.webview.onDidReceiveMessage(async (msg) => {
+      if (tab.run && SESSION_ACTIONS.has(msg?.command)) {
+        // A subagent run is not a session: nothing resumes, continues, sends to or renames it.
+        return;
+      }
+      if (tab.run && (msg?.command === 'copyId' || msg?.command === 'openRawFile')) {
+        if (msg.command === 'copyId') {
+          await vscode.env.clipboard.writeText(tab.run.agentId ?? '');
+          vscode.window.setStatusBarMessage('Copied the agent ID', 2000);
+        } else if (tab.run.file) {
+          vscode.commands.executeCommand('vscode.open', vscode.Uri.file(tab.run.file));
+        }
+        return;
+      }
       switch (msg?.command) {
+        case 'openSubagent':
+          if (typeof msg.arg === 'string') {
+            await this.openSubagent(tab.session, msg.arg);
+          }
+          break;
+        case 'openParent':
+          if (tab.run) {
+            await this.open(tab.session);
+          }
+          break;
         case 'resume':
         case 'continueInNewSession':
         case 'continueInNewSessionWithModel':
@@ -200,7 +253,7 @@ export class TranscriptPanels {
       this.preview = undefined;
     }
     tab.preview = false;
-    this.pinned.set(sessionKey(tab.session), tab);
+    this.pinned.set(tabKey(tab.session, tab.run), tab);
   }
 
   private get codiconsUri() {
@@ -212,19 +265,25 @@ export class TranscriptPanels {
   }
 
   private async render(tab: TranscriptTab): Promise<void> {
-    const { panel, session } = tab;
+    const { panel, session, run } = tab;
     // The preview tab switches sessions, and with them sources.
     const claudeCode = vscode.extensions.getExtension('anthropic.claude-code');
-    panel.iconPath =
-      isClaude(session) && claudeCode
+    panel.iconPath = run
+      ? new vscode.ThemeIcon('hubot')
+      : isClaude(session) && claudeCode
         ? vscode.Uri.joinPath(claudeCode.extensionUri, 'resources', 'claude-logo.svg')
         : new vscode.ThemeIcon(isClaude(session) ? 'comment-discussion' : SOURCES[sourceOf(session)].icon);
     let entries: TranscriptEntry[];
     try {
-      const subagents = isClaude(session) ? await readSubagentRuns(session.filePath, session.id) : [];
-      entries = parseTranscriptFor(session, await fs.readFile(session.filePath, 'utf8'), subagents);
+      if (run?.file) {
+        // The run's own log; its nested subagents, if any, show as the tool calls that started them.
+        entries = parseTranscript(await fs.readFile(run.file, 'utf8'), { sidechain: true });
+      } else {
+        const subagents = isClaude(session) ? await readSubagentRuns(session.filePath, session.id) : [];
+        entries = parseTranscriptFor(session, await fs.readFile(session.filePath, 'utf8'), subagents);
+      }
     } catch (err) {
-      vscode.window.showErrorMessage(`Could not read session log: ${(err as Error).message}`);
+      vscode.window.showErrorMessage(`Could not read ${run ? "the subagent run's" : 'session'} log: ${(err as Error).message}`);
       return;
     }
     const insights = collectInsights(entries);
@@ -232,8 +291,10 @@ export class TranscriptPanels {
     tab.insights = insights;
     const showThinking = vscode.workspace.getConfiguration('claudeSessions').get<boolean>('showThinking', false);
     const webview = panel.webview;
-    panel.title = session.title;
+    const name = run ? subagentName(run) : '';
+    panel.title = run ? `${name}: ${run.description ?? session.title}` : session.title;
     webview.html = buildHtml(session, entries, {
+      subagent: run ? { name, agentId: run.agentId ?? '', agentType: run.agentType, description: run.description } : undefined,
       showThinking,
       lineWidth: lineWidthSetting(),
       composerTarget: this.composerTarget(sourceOf(session)),
@@ -404,6 +465,11 @@ interface HtmlOptions {
   highlight?: string[];
   /** Shown in the shared preview tab: offer "Keep open". */
   preview?: boolean;
+  /**
+   * The page shows one of the session's subagent runs (from its own log), not the session: read-only, with the agent
+   * in the header and a way back to the session.
+   */
+  subagent?: { name: string; agentId: string; agentType?: string; description?: string };
   hasClaudeCode: boolean;
   cspSource: string;
   codiconCss: string;
@@ -619,11 +685,15 @@ function renderSubagent(e: TranscriptEntry): string {
       ? '<span class="pill subagent-pill"><i class="codicon codicon-run-all"></i>background</span>'
       : '';
   const desc = s.handback ? (s.description ? `Reply: ${s.description}` : 'Reply') : s.description ?? 'Prompt and reply';
+  // Only a run whose log was read has an agent id, so a missing log gets no control that would lead nowhere.
+  const openRun = s.agentId
+    ? `<button class="subagent-open" data-cmd="openSubagent" data-arg="${escapeHtml(s.agentId)}" title="Open this run's full log: its tool calls and messages"><i class="codicon codicon-go-to-file"></i>Open run</button>`
+    : '';
   return `
     <div class="msg subagent${s.handback ? ' handback' : ''}">
       <div class="avatar subagent-avatar" title="${escapeHtml(name)}"><i class="codicon codicon-hubot"></i></div>
       <div class="msg-main">
-        <div class="msg-meta"><strong>${escapeHtml(name)}</strong>${s.name ? '<span class="pill subagent-pill">subagent</span>' : ''}${state}${time(e.timestamp)}</div>
+        <div class="msg-meta"><strong>${escapeHtml(name)}</strong>${s.name ? '<span class="pill subagent-pill">subagent</span>' : ''}${state}${time(e.timestamp)}${openRun}</div>
         <details class="subagent-card"${open ? ' open' : ''}>
           <summary>
             <i class="codicon codicon-chevron-right"></i>
@@ -636,7 +706,13 @@ function renderSubagent(e: TranscriptEntry): string {
     </div>`;
 }
 
-function renderEntry(e: TranscriptEntry, showThinking: boolean, source: SourceInfo, index: number): string {
+/** Who the speakers are: in a subagent run, its prompts come from the main session and its replies are the agent's. */
+interface Speakers {
+  user: string;
+  assistant: string;
+}
+
+function renderEntry(e: TranscriptEntry, showThinking: boolean, source: SourceInfo, index: number, speakers?: Speakers): string {
   if (e.role === 'subagent') {
     return renderSubagent(e);
   }
@@ -647,7 +723,7 @@ function renderEntry(e: TranscriptEntry, showThinking: boolean, source: SourceIn
   if (e.role === 'user') {
     const body = renderParts(e.parts, 'user', showThinking);
     return body
-      ? `<div class="msg user" id="msg-${index}"><div class="msg-meta">${turnChip(e.turn)}You ${time(e.timestamp)}</div><div class="bubble">${body}</div></div>`
+      ? `<div class="msg user" id="msg-${index}"><div class="msg-meta">${turnChip(e.turn)}${escapeHtml(speakers?.user ?? 'You')} ${time(e.timestamp)}</div><div class="bubble">${body}</div></div>`
       : '';
   }
   if (e.role === 'peer') {
@@ -666,7 +742,7 @@ function renderEntry(e: TranscriptEntry, showThinking: boolean, source: SourceIn
   if (!body) {
     return '';
   }
-  const role = e.role === 'tool' ? 'Tools' : source.assistant;
+  const role = e.role === 'tool' ? 'Tools' : escapeHtml(speakers?.assistant ?? source.assistant);
   return `
     <div class="msg assistant">
       <div class="avatar ${source.id === 'claude' ? 'claude-avatar' : 'source-avatar'}">${assistantMark(source)}</div>
@@ -962,9 +1038,10 @@ function renderSide(ins: SessionInsights, cwd: string): string {
       'agents',
       'hubot',
       'Subagents',
-      ins.subagents.map(
-        (a) =>
-          `<li><div class="side-row static"><span class="side-main">${escapeHtml(a.description || a.type)}</span><span class="side-sub">${escapeHtml(a.type)}</span></div></li>`,
+      ins.subagents.map((a) =>
+        a.agentId
+          ? `<li><button class="side-row" data-cmd="openSubagent" data-arg="${escapeHtml(a.agentId)}" title="Open this run's full log"><span class="side-main">${escapeHtml(a.description || a.type)}</span><span class="side-sub">${escapeHtml(a.type)}</span></button></li>`
+          : `<li><div class="side-row static"><span class="side-main">${escapeHtml(a.description || a.type)}</span><span class="side-sub">${escapeHtml(a.type)}</span></div></li>`,
       ),
     ),
     sideSection('mcp', 'plug', 'MCP servers', ins.mcpServers.map(named)),
@@ -1010,7 +1087,24 @@ export function buildHtml(session: SessionInfo, entries: TranscriptEntry[], o: H
   const proj = projectPath(session);
   const source = SOURCES[sourceOf(session)];
   const claude = source.id === 'claude';
-  const chips = [
+  const sub = o.subagent;
+  const times = entries
+    .map((e) => (e.timestamp ? Date.parse(e.timestamp) : NaN))
+    .filter((t) => !Number.isNaN(t))
+    .sort((a, b) => a - b);
+  const prompts = entries.filter((e) => e.role === 'user').length;
+  const chips = sub
+    ? [
+        `<span class="chip agent" title="Agent type"><i class="codicon codicon-hubot"></i>${escapeHtml(sub.agentType ?? sub.name)}</span>`,
+        `<button class="chip parent" data-cmd="openParent" title="Back to the session that ran this agent"><i class="codicon codicon-arrow-left"></i>${escapeHtml(session.title)}</button>`,
+        `<span class="chip" title="${escapeHtml(proj || NO_FOLDER)}"><i class="codicon codicon-folder"></i>${escapeHtml(projectName(proj))}</span>`,
+        session.gitBranch ? `<span class="chip"><i class="codicon codicon-git-branch"></i>${escapeHtml(session.gitBranch)}</span>` : '',
+        times.length
+          ? `<span class="chip" title="Started ${escapeHtml(formatDateTime(times[0]))}"><i class="codicon codicon-calendar"></i>${escapeHtml(formatDateTime(times[times.length - 1]))}</span>`
+          : '',
+        `<span class="chip"><i class="codicon codicon-comment"></i>${prompts} prompt${prompts === 1 ? '' : 's'}</span>`,
+      ].join('')
+    : [
     claude ? '' : `<span class="chip"><i class="codicon codicon-${source.icon}"></i>${escapeHtml(source.label)}</span>`,
     `<span class="chip" title="${escapeHtml(proj || NO_FOLDER)}"><i class="codicon codicon-folder"></i>${escapeHtml(projectName(proj))}</span>`,
     session.gitBranch ? `<span class="chip"><i class="codicon codicon-git-branch"></i>${escapeHtml(session.gitBranch)}</span>` : '',
@@ -1033,10 +1127,36 @@ export function buildHtml(session: SessionInfo, entries: TranscriptEntry[], o: H
       body.push(`<div class="divider day"><span>${escapeHtml(dayLabel(e.timestamp))}</span></div>`);
       lastDay = day;
     }
-    body.push(renderEntry(e, o.showThinking, source, index));
+    body.push(renderEntry(e, o.showThinking, source, index, sub ? { user: 'Main session', assistant: sub.name } : undefined));
   }
   const conversation = body.filter(Boolean).join('\n');
   const toolCount = entries.reduce((n, e) => n + e.parts.filter((p) => p.kind === 'tool_use').length, 0);
+  const title = sub ? `${sub.name}: ${sub.description ?? 'subagent run'}` : session.title;
+  const keepOpen = o.preview
+    ? '<button class="btn" data-cmd="keepOpen" title="This tab is reused for the next transcript you open. Keep this one in its own tab."><i class="codicon codicon-pinned"></i><span>Keep open</span></button>'
+    : '';
+  // A subagent run is not a session: it can be read, but not resumed, continued, sent to or renamed.
+  const actions = sub
+    ? `
+    <button class="btn" data-cmd="openParent" title="Back to ${escapeHtml(session.title)}"><i class="codicon codicon-arrow-left"></i><span>Back to session</span></button>
+    ${keepOpen}
+    <button class="icon-btn" data-cmd="refresh" title="Reload"><i class="codicon codicon-refresh"></i></button>
+    <button class="icon-btn" data-cmd="copyId" title="Copy agent ID"><i class="codicon codicon-copy"></i></button>
+    <button class="icon-btn" data-cmd="openRawFile" title="Open the subagent's raw log"><i class="codicon codicon-json"></i></button>`
+    : `
+    <button class="btn primary" data-cmd="resume" title="${escapeHtml(source.resumeTitle)}"><i class="codicon codicon-${source.id === 'vscode-chat' ? 'chat-sparkle' : 'play'}"></i><span>${escapeHtml(source.resumeLabel)}</span></button>
+    <button class="btn" data-cmd="continueInNewSession" title="${escapeHtml(source.id === 'vscode-chat' ? 'Start a new chat with a handoff of where this one left off' : `Start a new ${source.label} session with a handoff of where this one left off`)}"><i class="codicon codicon-arrow-circle-right"></i><span>Continue in new session</span></button>
+    <button class="icon-btn" data-cmd="continueInNewSessionWithModel" title="Continue in another tool, or with a different model or effort…"><i class="codicon codicon-chevron-down"></i></button>
+    ${claude && o.hasClaudeCode ? '<button class="btn" data-cmd="openInClaudeCode" title="Open in the Claude Code chat"><i class="codicon codicon-comment-discussion"></i><span>Open in chat</span></button>' : ''}
+    ${keepOpen}
+    ${claude ? '<button class="icon-btn" data-cmd="rename" title="Rename session"><i class="codicon codicon-edit"></i></button>' : ''}
+    <button class="icon-btn" data-cmd="refresh" title="Reload"><i class="codicon codicon-refresh"></i></button>
+    <button class="icon-btn" data-cmd="copyId" title="Copy session ID"><i class="codicon codicon-copy"></i></button>
+    <button class="icon-btn" data-cmd="openRawFile" title="Open the raw session log"><i class="codicon codicon-json"></i></button>`;
+  const mark = sub ? '<span class="subagent-dot"><i class="codicon codicon-hubot"></i></span>' : `<span class="${claude ? 'claude-dot' : 'source-dot'}">${assistantMark(source)}</span>`;
+  // The parent's usage covers the whole session; a run shows only its per-prompt cost, beside each prompt.
+  const usage = sub ? undefined : session.usage;
+  const empty = sub ? 'This subagent run has no messages.' : 'This session has no messages yet.';
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -1046,29 +1166,20 @@ export function buildHtml(session: SessionInfo, entries: TranscriptEntry[], o: H
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link rel="stylesheet" href="${o.codiconCss}">
 <link rel="stylesheet" href="${o.css}">
-<title>${escapeHtml(session.title)}</title>
+<title>${escapeHtml(title)}</title>
 </head>
-<body class="line-${o.lineWidth ?? 'full'}" data-session="${escapeHtml(session.key || session.id || '')}"${o.highlight?.length ? ` data-highlight="${escapeHtml(JSON.stringify(o.highlight))}"` : ''}>
+<body class="line-${o.lineWidth ?? 'full'}${sub ? ' subagent-run' : ''}" data-session="${escapeHtml((session.key || session.id || '') + (sub ? `#${sub.agentId}` : ''))}"${o.highlight?.length ? ` data-highlight="${escapeHtml(JSON.stringify(o.highlight))}"` : ''}>
 <nav class="topbar">
-  <div class="topbar-title"><span class="${claude ? 'claude-dot' : 'source-dot'}">${assistantMark(source)}</span><span>${escapeHtml(session.title)}</span></div>
-  <div class="topbar-actions">
-    <button class="btn primary" data-cmd="resume" title="${escapeHtml(source.resumeTitle)}"><i class="codicon codicon-${source.id === 'vscode-chat' ? 'chat-sparkle' : 'play'}"></i><span>${escapeHtml(source.resumeLabel)}</span></button>
-    <button class="btn" data-cmd="continueInNewSession" title="${escapeHtml(source.id === 'vscode-chat' ? 'Start a new chat with a handoff of where this one left off' : `Start a new ${source.label} session with a handoff of where this one left off`)}"><i class="codicon codicon-arrow-circle-right"></i><span>Continue in new session</span></button>
-    <button class="icon-btn" data-cmd="continueInNewSessionWithModel" title="Continue in another tool, or with a different model or effort…"><i class="codicon codicon-chevron-down"></i></button>
-    ${claude && o.hasClaudeCode ? '<button class="btn" data-cmd="openInClaudeCode" title="Open in the Claude Code chat"><i class="codicon codicon-comment-discussion"></i><span>Open in chat</span></button>' : ''}
-    ${o.preview ? '<button class="btn" data-cmd="keepOpen" title="This tab is reused for the next transcript you open. Keep this one in its own tab."><i class="codicon codicon-pinned"></i><span>Keep open</span></button>' : ''}
-    ${claude ? '<button class="icon-btn" data-cmd="rename" title="Rename session"><i class="codicon codicon-edit"></i></button>' : ''}
-    <button class="icon-btn" data-cmd="refresh" title="Reload"><i class="codicon codicon-refresh"></i></button>
-    <button class="icon-btn" data-cmd="copyId" title="Copy session ID"><i class="codicon codicon-copy"></i></button>
-    <button class="icon-btn" data-cmd="openRawFile" title="Open the raw session log"><i class="codicon codicon-json"></i></button>
+  <div class="topbar-title">${mark}<span>${escapeHtml(title)}</span></div>
+  <div class="topbar-actions">${actions}
     <button class="icon-btn" id="side-toggle" title="Session details" aria-controls="side" aria-expanded="false"><i class="codicon codicon-layout-sidebar-right"></i></button>
   </div>
-  ${renderStatsStrip(session, toolCount)}
+  ${renderStatsStrip(sub ? { ...session, usage: undefined, model: undefined } : session, toolCount)}
 </nav>
 <header class="hero">
-  <h1>${escapeHtml(session.title)}</h1>
+  <h1>${escapeHtml(title)}</h1>
   <div class="chips">${chips}</div>
-  ${session.usage ? renderStats(session.usage) : ''}
+  ${usage ? renderStats(usage) : ''}
   ${
     toolCount
       ? `<label class="switch"><input type="checkbox" id="show-tools" data-tools-toggle checked><span class="track"><span class="thumb"></span></span>Show ${toolCount} tool call${toolCount === 1 ? '' : 's'}</label>`
@@ -1076,9 +1187,9 @@ export function buildHtml(session: SessionInfo, entries: TranscriptEntry[], o: H
   }
 </header>
 <main class="conversation">
-${conversation || '<div class="empty"><i class="codicon codicon-comment-discussion"></i><p>This session has no messages yet.</p></div>'}
+${conversation || `<div class="empty"><i class="codicon codicon-comment-discussion"></i><p>${empty}</p></div>`}
 </main>
-${renderComposer(session, o)}
+${sub ? '' : renderComposer(session, o)}
 ${renderSide(o.insights ?? collectInsights(entries), proj)}
 <button class="fab" id="jump" title="Jump to latest"><i class="codicon codicon-arrow-down"></i></button>
 <script nonce="${nonce}" src="${o.js}"></script>
