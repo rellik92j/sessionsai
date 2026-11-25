@@ -43,7 +43,7 @@ jobs:
           for f in package.json README.md LICENSE dist/extension.js node_modules/@vscode/codicons/dist/codicon.ttf; do
             grep -qxF "$f" "$RUNNER_TEMP/files.txt" || { echo "::error::missing from the package: $f"; exit 1; }
           done
-          if grep -E '^(src|test|scripts|out|docs|\.claude|\.github|\.vscode)/|\.map$|\.ts$|\.vsix$' "$RUNNER_TEMP/files.txt"; then
+          if grep -E '^(src|test|scripts|out|docs|\.claude|\.github|\.vscode|\.tmp)/|\.map$|\.ts$|\.vsix$' "$RUNNER_TEMP/files.txt"; then
             echo "::error::files above should not ship; see .vscodeignore"
             exit 1
           fi
