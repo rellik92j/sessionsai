@@ -37,7 +37,7 @@ export interface CardData {
 
 export function toCard(s: SessionInfo): CardData {
   const p = projectPath(s);
-  // A "<session name> — <topic>" title keeps its name: the agent chip is the `--agent` definition, not that name.
+  // The title is shown whole: the agent chip is the `--agent` definition, not the session's name.
   const title = s.title;
   // Show the latest prompt under the title, unless the title already is that prompt.
   const flat = (t: string) => t.replace(/<\/?pasted_content\b[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
