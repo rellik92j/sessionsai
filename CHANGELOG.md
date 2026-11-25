@@ -4,6 +4,14 @@ All notable changes to SessionsAI (published as Claude Sessions before 0.4.0) ar
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 Numbers in parentheses are the pull requests that made each change. Each version heading links to its GitHub release, which has the release notes and the `.vsix` for installing that version with **Install from VSIX…**.
 
+## [0.4.7](https://github.com/rellik92j/sessionsai/releases/tag/v0.4.7) - 2026-11-25
+
+### Added
+- **Start a continued session as a Claude Code agent.** When a new session goes to the Claude Code CLI (**Continue in New Session with Tool or Model…**, the ⌄ next to **Continue in new session** in a transcript, or **Send with a model and effort…**), a last step asks which agent it starts as. It lists the agents in the session folder's `.claude/agents/` and in `~/.claude/agents/` (or `CLAUDE_CONFIG_DIR`), with **Default (no agent)** first and **Enter an agent name…** for one that isn't listed. The choice is passed as `claude --agent <name>`. Resuming a session doesn't ask, because Claude Code ignores `--agent` with `--resume`. (#48)
+
+### Changed
+- **Step numbers in the continue pickers** count only the steps after the tool choice, so they stay right whichever tool you pick. (#48)
+
 ## [0.4.6](https://github.com/rellik92j/sessionsai/releases/tag/v0.4.6) - 2026-11-22
 
 ### Added
