@@ -90,7 +90,16 @@ export interface TranscriptEntry {
   /** On a user prompt: what the reply to it cost (Claude Code only). */
   turn?: TurnStats;
   /** On a subagent entry: who ran and what it was asked (Claude Code only). */
-  subagent?: { name?: string; description?: string; prompt?: string; toolUseId?: string };
+  subagent?: {
+    name?: string;
+    description?: string;
+    prompt?: string;
+    toolUseId?: string;
+    /** Launched in the background: its reply comes back later, as its own hand-back entry. */
+    background?: true;
+    /** A reply that reached the main session where this entry sits (an `<agent-message>`), not a launch. */
+    handback?: true;
+  };
 }
 
 /** One subagent run, read from `<sessionId>/subagents/agent-<id>.jsonl` and the `.meta.json` beside it. */
@@ -178,6 +187,53 @@ export function parsePeerMessage(content: unknown): { from: string; text: string
   return { from, text: m[2].trim() };
 }
 
+/** A message from an agent (a background subagent's hand-back) that reached the main session. */
+export interface AgentMessage {
+  /** The sending agent's id. */
+  from: string;
+  /** Its agent type as Claude Code recorded it ("reviewer", "general-purpose"), if it did. */
+  name?: string;
+  text: string;
+  /** Identifies this delivery, so one logged twice (as a record and as a queued command) shows once. */
+  key: string;
+}
+
+const AGENT_MESSAGE = /<agent-message\b([^>]*)>([\s\S]*?)(?:<\/agent-message>|$)/;
+/** The frame Claude Code puts around a hand-back; the report after it is indented two spaces. */
+const HANDBACK_FRAME = /^\[Subagent hand-back\][\s\S]*?The report follows:[ \t]*\r?\n/;
+
+/**
+ * Extracts a message an agent sent to this session, from a meta user record whose content holds an
+ * `<agent-message from="<agentId>">`, or from a `queued_command` attachment carrying one (delivered mid-turn).
+ */
+export function parseAgentMessage(r: any): AgentMessage | undefined {
+  let raw: unknown;
+  let origin: any;
+  if (r?.type === 'user') {
+    raw = r.message?.content;
+    origin = r.origin;
+  } else if (r?.type === 'attachment' && r.attachment?.type === 'queued_command') {
+    raw = r.attachment.prompt;
+    origin = r.attachment.origin;
+  }
+  const m = typeof raw === 'string' ? AGENT_MESSAGE.exec(raw) : null;
+  if (!m) {
+    return undefined;
+  }
+  origin = origin && typeof origin === 'object' ? origin : {};
+  const from = /from="([^"]*)"/.exec(m[1])?.[1] || str(origin.from) || '';
+  let text = str(origin.handbackReportText)?.trim();
+  if (!text) {
+    const body = m[2].replace(/^\r?\n/, '');
+    const frame = HANDBACK_FRAME.exec(body);
+    text = (frame ? body.slice(frame[0].length).replace(/^ {2}/gm, '') : body).trim();
+  }
+  if (!text) {
+    return undefined;
+  }
+  return { from, name: str(origin.name), text, key: str(origin.handbackToolUseId) ?? `${from}\n${text}` };
+}
+
 export function oneLine(text: string, max = MAX_TITLE): string {
   const flat = text
     .replace(/<\/?pasted_content\b[^>]*>/g, ' ')
@@ -257,6 +313,8 @@ export function parseSession(
   const commitCalls = new Set<string>();
   let commitCount = 0;
   const usage = new UsageCollector();
+  /** Hand-backs already added to the search text, by delivery. */
+  const handbacks = new Set<string>();
 
   for (const r of records(text)) {
     if (!r || typeof r !== 'object') {
@@ -301,6 +359,15 @@ export function parseSession(
           info.prRepository = typeof r.prRepository === 'string' ? r.prRepository : undefined;
         }
         continue;
+      case 'attachment': {
+        // A subagent's hand-back delivered while Claude was mid-turn; the transcript shows it, so search finds it.
+        const handback = !r.isSidechain ? parseAgentMessage(r) : undefined;
+        if (handback && !handbacks.has(handback.key)) {
+          handbacks.add(handback.key);
+          searchParts.push(handback.text);
+        }
+        continue;
+      }
       case 'user':
       case 'assistant':
         break;
@@ -377,6 +444,14 @@ export function parseSession(
       }
     }
     if (r.isMeta) {
+      const handback = parseAgentMessage(r);
+      if (handback) {
+        if (!handbacks.has(handback.key)) {
+          handbacks.add(handback.key);
+          searchParts.push(handback.text);
+        }
+        continue;
+      }
       const peer = parsePeerMessage(r.message?.content);
       if (peer) {
         info.peerMessageCount++;
@@ -583,6 +658,10 @@ export function parseSubagentRun(log: string, metaText?: string): SubagentRun {
 
 const AGENT_ID = /\bagentId: ([\w-]+)/;
 const isAgentTool = (name: string) => name === 'Agent' || name === 'Task';
+type ToolUsePart = Extract<TranscriptPart, { kind: 'tool_use' }>;
+/** An Agent call's result that only says the agent started in the background. */
+const isAsyncLaunch = (r: any, text: string) =>
+  r?.toolUseResult?.isAsync === true || r?.toolUseResult?.status === 'async_launched' || /^Async agent launched\b/.test(text);
 
 /** Options for parseTranscript. */
 export interface TranscriptOptions {
@@ -603,21 +682,53 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
   /** The tool call's run, by the meta file's toolUseId or the agentId its result names. */
   const runFor = (callId: string | undefined, agentId: string | undefined) =>
     runs.find((s) => !placed.has(s) && ((callId && s.toolUseId === callId) || (agentId && !s.toolUseId && s.agentId === agentId)));
-  const subagentEntry = (run: SubagentRun, call: Extract<TranscriptPart, { kind: 'tool_use' }> | undefined, ts?: string): TranscriptEntry => {
+  /** A named agent's type, or undefined for a built-in one-off agent (shown as "Subagent"). */
+  const agentName = (run: SubagentRun | undefined, call: ToolUsePart | undefined, fallback?: string) => {
+    const type = run?.agentType ?? call?.args?.subagent_type ?? fallback;
+    const builtIn = run?.isBuiltIn ?? (!type || type === 'general-purpose');
+    return builtIn ? undefined : type;
+  };
+  const subagentEntry = (run: SubagentRun, call: ToolUsePart | undefined, ts?: string, background = false): TranscriptEntry => {
     placed.add(run);
-    const type = run.agentType ?? call?.args?.subagent_type;
-    const builtIn = run.isBuiltIn ?? (!type || type === 'general-purpose');
-    return {
+    const entry: TranscriptEntry = {
       role: 'subagent',
-      timestamp: run.timestamp ?? ts,
-      parts: run.reply ? [{ kind: 'text', text: run.reply }] : [],
+      // A background run's block marks its launch; its reply is shown where it arrived.
+      timestamp: background ? ts ?? run.timestamp : run.timestamp ?? ts,
+      parts: run.reply && !background ? [{ kind: 'text', text: run.reply }] : [],
       subagent: {
-        name: builtIn ? undefined : type,
+        name: agentName(run, call),
         description: run.description ?? call?.args?.description,
         prompt: run.prompt ?? call?.args?.prompt,
         toolUseId: call?.id,
       },
     };
+    if (background) {
+      entry.subagent!.background = true;
+    }
+    return entry;
+  };
+  /** Background launches by agentId, so each hand-back can be labelled with the agent that sent it. */
+  const launches = new Map<string, { entry?: TranscriptEntry; run?: SubagentRun; call?: ToolUsePart }>();
+  /** Agents whose hand-back reached the main session, and the deliveries already shown. */
+  const handedBack = new Set<string>();
+  const shownHandbacks = new Set<string>();
+  const handbackEntry = (msg: AgentMessage, ts?: string): TranscriptEntry | undefined => {
+    if (shownHandbacks.has(msg.key)) {
+      return undefined;
+    }
+    shownHandbacks.add(msg.key);
+    handedBack.add(msg.from);
+    const launch = msg.from ? launches.get(msg.from) : undefined;
+    const run = launch?.run ?? (msg.from ? runs.find((s) => s.agentId === msg.from) : undefined);
+    const subagent: NonNullable<TranscriptEntry['subagent']> = {
+      name: agentName(run, launch?.call, msg.name),
+      description: run?.description ?? launch?.call?.args?.description,
+      handback: true,
+    };
+    if (launch?.call?.id) {
+      subagent.toolUseId = launch.call.id;
+    }
+    return { role: 'subagent', timestamp: ts, parts: [{ kind: 'text', text: msg.text }], subagent };
   };
   // tool_use parts by id, so results (logged later as user messages) can be attached to their call.
   const toolUses = new Map<string, Extract<TranscriptPart, { kind: 'tool_use' }>>();
@@ -706,6 +817,17 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
       continue;
     }
 
+    if (r.type === 'attachment' || (r.type === 'user' && r.isMeta)) {
+      // A subagent's reply reaching this session: shown where it arrived, between what Claude did before and after.
+      const msg = parseAgentMessage(r);
+      if (msg) {
+        const entry = handbackEntry(msg, r.timestamp ?? r.attachment?.timestamp);
+        if (entry) {
+          entries.push(entry);
+        }
+        continue;
+      }
+    }
     if (r.type !== 'user') {
       continue;
     }
@@ -734,9 +856,16 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
         }
         // A subagent's run goes where its call returned: when it finished, or when it was launched in the background.
         const spawned = !call || isAgentTool(call.name) ? str(r.toolUseResult?.agentId) ?? AGENT_ID.exec(full)?.[1] : undefined;
+        const background = !!spawned && isAsyncLaunch(r, full);
         const run = runs.length ? runFor(p.tool_use_id, spawned) : undefined;
-        if (run) {
-          answered.push(subagentEntry(run, call, r.timestamp));
+        // A background launch whose log is missing still gets its block, from what the call says.
+        const entry = run || (background && call) ? subagentEntry(run ?? {}, call, r.timestamp, background) : undefined;
+        if (entry) {
+          answered.push(entry);
+        }
+        if (background) {
+          // Kept even when the run's log is missing, so its hand-back can still be labelled from the call.
+          launches.set(spawned!, { entry, run, call });
         }
       }
       if (orphans.length) {
@@ -764,10 +893,20 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
     const run = runFor(id, undefined);
     if (run) {
       let at = entries.indexOf(entry) + 1;
-      while (entries[at]?.role === 'subagent') {
+      // Past the other runs started from the same turn, but not past a reply that arrived later.
+      while (entries[at]?.role === 'subagent' && !entries[at].subagent?.handback) {
         at++;
       }
       entries.splice(at, 0, subagentEntry(run, toolUses.get(id)));
+    }
+  }
+  // A background run whose reply never reached this session (it ended first): show the reply from its log at the launch.
+  for (const [agentId, { entry, run }] of launches) {
+    if (entry && run?.reply && !handedBack.has(agentId)) {
+      entry.parts = [{ kind: 'text', text: run.reply }];
+      if (run.timestamp) {
+        entry.timestamp = run.timestamp;
+      }
     }
   }
   return entries;
