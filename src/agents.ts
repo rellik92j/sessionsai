@@ -136,6 +136,14 @@ export function claudeOverrideArgs(overrides: Overrides): string[] {
   ];
 }
 
+/**
+ * Arguments that start a blank Claude Code session: the overrides and nothing else, so the CLI opens waiting for the
+ * first prompt, and Claude Code names the session itself as it does for one started by hand.
+ */
+export function claudeStartArgs(overrides: Overrides): string[] {
+  return claudeOverrideArgs(overrides);
+}
+
 /** Arguments that start a new Claude Code session named `name` with `prompt` as its first message. */
 export function claudeNewSessionArgs(overrides: Overrides, name: string, prompt: string): string[] {
   return [...claudeOverrideArgs(overrides), '--name', name, prompt];

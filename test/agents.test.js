@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const os = require('node:os');
 const path = require('node:path');
 const fs = require('node:fs');
-const { parseAgentFrontmatter, listAgents, userAgentsDir, claudeOverrideArgs, claudeNewSessionArgs, claudeResumeArgs } = require('../out/agents');
+const { parseAgentFrontmatter, listAgents, userAgentsDir, claudeOverrideArgs, claudeNewSessionArgs, claudeResumeArgs, claudeStartArgs } = require('../out/agents');
 
 const fixtures = path.join(__dirname, 'fixtures', 'claude-agents');
 
@@ -106,4 +106,22 @@ test('Claude Code arguments with and without an agent', () => {
   // Resuming drops the agent: Claude Code ignores --agent with --resume.
   assert.deepEqual(claudeResumeArgs('id-1', {}, 'next'), ['--resume', 'id-1', 'next']);
   assert.deepEqual(claudeResumeArgs('id-1', { model: 'haiku', effort: 'low', agent: 'planner' }, 'next'), ['--resume', 'id-1', '--model', 'haiku', '--effort', 'low', 'next']);
+});
+
+test('a blank Claude Code session: only the chosen overrides, in model, effort, agent order, no name or prompt', () => {
+  const cases = [
+    [{}, []],
+    [{ model: 'opus' }, ['--model', 'opus']],
+    [{ effort: 'max' }, ['--effort', 'max']],
+    [{ agent: 'planner' }, ['--agent', 'planner']],
+    [{ model: 'sonnet', effort: 'low' }, ['--model', 'sonnet', '--effort', 'low']],
+    [{ model: 'haiku', agent: 'plugin:helper' }, ['--model', 'haiku', '--agent', 'plugin:helper']],
+    [{ effort: 'high', agent: 'a b' }, ['--effort', 'high', '--agent', 'a b']],
+    [{ agent: 'x', effort: 'xhigh', model: 'claude-opus-5-5' }, ['--model', 'claude-opus-5-5', '--effort', 'xhigh', '--agent', 'x']],
+    // Empty strings are "not chosen", like undefined.
+    [{ model: '', effort: '', agent: '' }, []],
+  ];
+  for (const [overrides, expected] of cases) {
+    assert.deepEqual(claudeStartArgs(overrides), expected, JSON.stringify(overrides));
+  }
 });

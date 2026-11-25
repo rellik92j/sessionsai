@@ -4,7 +4,7 @@ import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { AgentInfo, claudeNewSessionArgs, claudeResumeArgs, listAgents, Overrides, userAgentsDir } from './agents';
+import { AgentInfo, claudeNewSessionArgs, claudeResumeArgs, claudeStartArgs, listAgents, Overrides, userAgentsDir } from './agents';
 import { formatRelative, isInside } from './format';
 import { buildHandoff, collectHandoffFacts, collectTranscriptFacts } from './handoff';
 import { GroupBy, projectName, projectPath, SessionModel, workspaceFolderPaths } from './model';
@@ -464,6 +464,30 @@ export function activate(context: vscode.ExtensionContext): void {
   };
 
   /**
+   * Starts a blank Claude Code session: asks for the folder, then the model, effort and agent, and runs the CLI in a
+   * terminal there with those as arguments (no sendText, so no shell quoting). Nothing opens if any step is cancelled.
+   */
+  const newClaudeSession = async (): Promise<boolean> => {
+    const title = 'New Claude Code Session';
+    const cwd = await pickFolder(title);
+    if (!cwd) {
+      return false;
+    }
+    const overrides = await pickOverrides(undefined, 'claude', title, await agentsIn(cwd));
+    if (!overrides) {
+      return false;
+    }
+    const [shellPath, ...shellArgs] = claudeCommandParts();
+    const terminal = vscode.window.createTerminal({
+      ...claudeTerminalOptions(`Claude Code · ${path.basename(cwd) || cwd}`, cwd),
+      shellPath,
+      shellArgs: [...shellArgs, ...claudeStartArgs(overrides)],
+    });
+    terminal.show();
+    return true;
+  };
+
+  /**
    * Copilot CLI is often a .bat or .ps1 shim on Windows, which would split a multi-line argument, so the handoff goes
    * in a file the CLI is given access to, and the one-line prompt typed into the shell points at it.
    */
@@ -651,6 +675,7 @@ export function activate(context: vscode.ExtensionContext): void {
         return !!choice && continueInNewSession(s, choice.overrides, choice.target);
       }),
     ),
+    vscode.commands.registerCommand('claudeSessions.newClaudeSession', () => newClaudeSession()),
     vscode.commands.registerCommand('claudeSessions.openInClaudeCode', withClaudeSession('Open in Claude Code Chat', openInClaudeCode)),
     vscode.commands.registerCommand('claudeSessions.rename', withClaudeSession('Rename', rename)),
     // Optional arguments: search words to highlight in the transcript, and true to open it in its own tab
@@ -763,21 +788,62 @@ async function pickContinuation(session: SessionInfo): Promise<{ target: Continu
  * The Claude Code agents for a session's folder and the user's agents folder (`agents` under CLAUDE_CONFIG_DIR, or
  * ~/.claude/agents). Empty when there are none or neither folder can be read.
  */
-async function agentsFor(session: SessionInfo): Promise<AgentInfo[]> {
+function agentsFor(session: SessionInfo): Promise<AgentInfo[]> {
+  return agentsIn(projectPath(session) || undefined);
+}
+
+/** The Claude Code agents for a session started in `folder`, as for agentsFor. */
+async function agentsIn(folder: string | undefined): Promise<AgentInfo[]> {
   try {
-    return await listAgents(projectPath(session) || undefined, userAgentsDir());
+    return await listAgents(folder, userAgentsDir());
   } catch {
     return [];
   }
+}
+
+const OTHER_FOLDER = '\0other-folder';
+
+/**
+ * The folder a new session starts in: a workspace folder (the first is the default) or, as the alternative, one chosen
+ * in a folder dialog, which is the only way when no folder is open. Undefined when cancelled.
+ */
+async function pickFolder(title: string): Promise<string | undefined> {
+  const folders = (vscode.workspace.workspaceFolders ?? []).filter((f) => f.uri.scheme === 'file');
+  const browse = async () =>
+    (
+      await vscode.window.showOpenDialog({
+        title,
+        canSelectFiles: false,
+        canSelectFolders: true,
+        canSelectMany: false,
+        openLabel: 'Start Here',
+        defaultUri: folders[0]?.uri,
+      })
+    )?.[0]?.fsPath;
+  if (!folders.length) {
+    return browse();
+  }
+  const picks: ValuePick[] = [
+    ...folders.map((f) => ({ label: `$(root-folder) ${f.name}`, description: f.uri.fsPath, value: f.uri.fsPath })),
+    { label: '$(folder-opened) Choose a folder…', description: 'any folder on this machine', value: OTHER_FOLDER },
+  ];
+  const picked = await vscode.window.showQuickPick(picks, { title: `${title}: folder`, placeHolder: 'Folder the session starts in' });
+  return picked?.value === OTHER_FOLDER ? browse() : picked?.value;
 }
 
 const OTHER_AGENT = '\0other-agent';
 
 /**
  * Asks for the model, then the effort, then, when `agents` is given (a new Claude Code CLI session), the agent: none,
- * one of `agents`, or a name typed in. Undefined when any step is cancelled.
+ * one of `agents`, or a name typed in. Undefined when any step is cancelled. `session` is the one being continued, whose
+ * model and effort are offered; none for a blank session.
  */
-async function pickOverrides(session: SessionInfo, target: SessionSource, title: string, agents?: AgentInfo[]): Promise<Overrides | undefined> {
+async function pickOverrides(
+  session: SessionInfo | undefined,
+  target: SessionSource,
+  title: string,
+  agents?: AgentInfo[],
+): Promise<Overrides | undefined> {
   const steps = agents ? 3 : 2;
   const usedHere = 'used by this session';
   const claude = target === 'claude';
@@ -794,7 +860,7 @@ async function pickOverrides(session: SessionInfo, target: SessionSource, title:
           { label: 'Fable', description: 'fable · latest Fable', value: 'fable' },
         ]
       : []),
-    ...(session.model && sourceOf(session) === target ? [{ label: session.model, description: usedHere, value: session.model }] : []),
+    ...(session?.model && sourceOf(session) === target ? [{ label: session.model, description: usedHere, value: session.model }] : []),
     { label: '$(edit) Other model…', description: 'enter a model name', value: OTHER_MODEL },
   ];
   const model = await vscode.window.showQuickPick(models, { title: `${title} (1/${steps}): model`, placeHolder: 'Model for the new session' });
@@ -814,7 +880,7 @@ async function pickOverrides(session: SessionInfo, target: SessionSource, title:
       return undefined;
     }
   }
-  const sessionEffort = sourceOf(session) === target ? session.usage?.effort : undefined;
+  const sessionEffort = session && sourceOf(session) === target ? session.usage?.effort : undefined;
   const efforts: ValuePick[] = [
     { label: '$(settings-gear) Default', description: settings },
     ...EFFORTS.map((e) => ({ label: e, description: e === sessionEffort ? usedHere : undefined, value: e })),
