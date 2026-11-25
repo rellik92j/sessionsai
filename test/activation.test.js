@@ -427,24 +427,26 @@ test('the --agent agent is a label on the sidebar card, the transcript header an
     const cards = last('state').groups.flatMap((g) => g.sessions);
     const card = (id) => cards.find((c) => c.id === `claude:${id}`);
     assert.equal(card('agent-0001').agent, 'planner');
-    // The session's name stays in the title now that it is not shown as the agent chip.
-    assert.equal(card('agent-0001').title, 'Plan the release — Draft the release checklist');
+    // A rename is the title, exactly as typed, whether or not the session ran under --agent.
+    assert.equal(card('agent-0001').title, 'Plan the release');
     assert.equal(card('plain-0002').agent, undefined, 'no agent, no label');
-    assert.equal(card('plain-0002').title, 'Tidy the docs — Tidy the README');
+    assert.equal(card('plain-0002').title, 'Tidy the docs');
     send({ type: 'search', query: 'planner' });
     assert.deepEqual(last('searchResults').ids, ['claude:agent-0001'], 'the label is searchable');
 
     const chip = /<span class="chip agent" title="Agent"><i class="codicon codicon-hubot"><\/i>planner<\/span>/;
     await state.commands['claudeSessions.openTranscript']({ sessionKey: 'claude:agent-0001' });
     assert.match(state.panels[0].webview.html, chip);
+    assert.match(state.panels[0].webview.html, /<h1>Plan the release<\/h1>/);
     await state.commands['claudeSessions.openTranscript']({ sessionKey: 'claude:plain-0002' });
     assert.doesNotMatch(state.panels[0].webview.html, /chip agent/);
+    assert.match(state.panels[0].webview.html, /<h1>Tidy the docs<\/h1>/);
 
     await state.commands['claudeSessions.openOverview']();
     const overview = state.panels[state.panels.length - 1];
     overview.onMessage({ type: 'ready', range: 0, scope: 'all' });
     const ov = state.panelPosts.filter((m) => m.type === 'state').pop().overview;
-    assert.deepEqual(ov.recentSessions.map((s) => [s.id, s.agent]), [['claude:agent-0001', 'planner'], ['claude:plain-0002', undefined]]);
+    assert.deepEqual(ov.recentSessions.map((s) => [s.id, s.agent, s.title]), [['claude:agent-0001', 'planner', 'Plan the release'], ['claude:plain-0002', undefined, 'Tidy the docs']]);
     assert.deepEqual(state.errors, []);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });

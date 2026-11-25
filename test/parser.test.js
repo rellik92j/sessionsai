@@ -60,6 +60,8 @@ test('metadata: cwd, branch, times, counts, model, PR, agent', () => {
 });
 
 test('agent-team sessions: peer messages counted, title disambiguated, shown in transcript', () => {
+  // Several agent-team sessions share the agent's name, so one that received a peer message keeps
+  // "<name> — <topic>". That is the only case the topic is added; a plain rename is verbatim (next test).
   const peer = user('Another Claude session sent a message:\n<cross-session-message from="uds:x" from-name="Overseer" from-mode="prompting">\nResearch the auth flow\n</cross-session-message>', { isMeta: true });
   const log = jsonl(
     user('<command-name>/clear</command-name>'),
@@ -79,6 +81,27 @@ test('agent-team sessions: peer messages counted, title disambiguated, shown in 
   assert.equal(parseSession(jsonl(peer), 'f', 'p', 'id').title, 'Overseer: Research the auth flow');
   // A custom title that differs from the agent name is kept verbatim.
   assert.equal(parseSession(jsonl(peer, { type: 'agent-name', agentName: 'A' }, { type: 'custom-title', customTitle: 'Mine' }), 'f', 'p', 'id').title, 'Mine');
+});
+
+test('a renamed session is titled exactly as renamed, though Claude Code writes an equal agent-name', () => {
+  // Shaped like a real rename: custom-title and an equal agent-name, an ai-title, and no peer messages.
+  const renamed = parseSession(jsonl(
+    user('Draft the release checklist'),
+    asst('m1', [{ type: 'text', text: 'Drafted' }]),
+    { type: 'ai-title', aiTitle: 'Release checklist draft' },
+    { type: 'custom-title', customTitle: 'Plan the release' },
+    { type: 'agent-name', agentName: 'Plan the release' },
+  ), 'f', 'p', 'id');
+  assert.equal(renamed.title, 'Plan the release');
+  assert.equal(renamed.titleSource, 'custom');
+  assert.equal(renamed.agentName, 'Plan the release');
+  // Renamed twice: the last name wins, still verbatim.
+  const twice = parseSession(jsonl(
+    user('go'),
+    { type: 'custom-title', customTitle: 'First' }, { type: 'agent-name', agentName: 'First' },
+    { type: 'custom-title', customTitle: 'Second' }, { type: 'agent-name', agentName: 'Second' },
+  ), 'f', 'p', 'id');
+  assert.equal(twice.title, 'Second');
 });
 
 test('claude --agent: the agent comes from the agent-setting record, not agent-name', () => {

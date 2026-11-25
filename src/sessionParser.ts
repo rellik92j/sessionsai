@@ -499,8 +499,10 @@ export function parseSession(
   if (customTitle) {
     info.title = oneLine(customTitle);
     info.titleSource = 'custom';
-    // Agent-team sessions are all titled after the agent ("Project Lead"); add what the session was about.
-    if (info.agentName && customTitle === info.agentName) {
+    // A rename is shown as typed. Claude Code writes an equal agent-name next to every rename, so that alone says
+    // nothing. Agent-team sessions are the exception: several share the agent's name ("Project Lead") and are told
+    // apart only by what they were about, and they are the ones that receive messages from other sessions.
+    if (info.peerMessageCount > 0 && info.agentName && customTitle === info.agentName) {
       const about = aiTitle ?? info.firstPrompt ?? info.firstPeerMessage?.text;
       if (about) {
         info.title = oneLine(`${customTitle} — ${about}`);
