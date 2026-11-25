@@ -49,6 +49,7 @@ Click a session to open its transcript. Your prompts are on the right and Claude
 
 - Each tool call is a compact row with a ✓ or ✗. Click it to see the input and output. File edits show as a red/green diff.
 - Hide tool calls to read just the conversation, or jump straight to the latest message.
+- A message you sent while Claude was still working shows where Claude read it, marked **sent mid-turn**. Its cost stays with the prompt Claude was answering.
 - Subagents show as their own green speaker with the prompt Claude gave them and their reply. One that ran in the background shows twice: where Claude started it, and where its reply reached Claude, so you can see what Claude was doing in between and what it did with the reply. Click **Open run** on a subagent, or its row under Subagents in **Session details**, to read its whole run read-only: every tool call, command and message.
 - If you opened the transcript from a search, your search words are highlighted and it starts at the first match. Step through matches with F3 / Shift+F3.
 - The **Session details** panel (the sidebar button at the top right) lists what the session did: files changed, commits (click for the diff), pull requests, its to-do list as it left it, skills and slash commands, subagents, MCP servers, web lookups, files read, tool calls with failures, and every prompt so you can jump between them.
