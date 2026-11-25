@@ -135,11 +135,38 @@ test('cost, request and token totals are the same with and without the subagent 
   // The session's totals still add the subagents in once, from the logs, whatever the transcript shows.
   const s = parseSession(text, logOf(ID), 'C--repo', ID, subagentLogs(ID));
   const bare = parseSession(text, logOf(ID), 'C--repo', ID);
-  // msg_r1a, msg_r1b, msg_r2a, msg_r2b and the stray log's msg_r3a: counted as before this change.
-  assert.equal(s.usage.requests, bare.usage.requests + 5);
+  // msg_r1a, msg_r1b, msg_r2a and msg_r2b; not the stray log's msg_r3a, which answered another session.
+  assert.equal(s.usage.requests, bare.usage.requests + 4);
   assert.ok(s.usage.subagentCost > 0);
   assert.equal(s.assistantCount, bare.assistantCount);
   assert.equal(s.promptCount, bare.promptCount);
+});
+
+test("a subagent log that answered another session adds nothing to this session's totals", () => {
+  const text = read(ID);
+  const sub = path.join(dir, ID, 'subagents');
+  const log = (agent) => fs.readFileSync(path.join(sub, `agent-${agent}.jsonl`), 'utf8');
+  const own = [log('a1111111111111111'), log('a2222222222222222')];
+  const stray = log('a3333333333333333');
+  assert.match(stray, /"sessionId":"7a7a7a7a-/, 'the stray log names session 2');
+
+  // The stray log in this session's folder changes no cost, request or token total.
+  const withStray = parseSession(text, logOf(ID), 'C--repo', ID, [...own, stray]);
+  const ownOnly = parseSession(text, logOf(ID), 'C--repo', ID, own);
+  assert.deepEqual(withStray.usage, ownOnly.usage);
+  assert.equal(parseSession(text, logOf(ID), 'C--repo', ID, [stray]).usage.subagentCost, 0);
+  // It still counts for the session it answered.
+  const other = parseSession(read(OTHER), logOf(OTHER), 'C--repo', OTHER, [stray]);
+  assert.equal(other.usage.requests, parseSession(read(OTHER), logOf(OTHER), 'C--repo', OTHER).usage.requests + 1);
+
+  // Logs whose records name no session are counted, as before: the same three logs without their session ids.
+  const unnamed = [...own, stray].map((l) => l.replace(/"sessionId":"[^"]*",/g, ''));
+  assert.ok(unnamed.every((l) => !l.includes('"sessionId"')));
+  const counted = parseSession(text, logOf(ID), 'C--repo', ID, unnamed);
+  const bare = parseSession(text, logOf(ID), 'C--repo', ID);
+  assert.equal(counted.usage.requests, bare.usage.requests + 5, 'msg_r1a, msg_r1b, msg_r2a, msg_r2b and msg_r3a');
+  assert.ok(counted.usage.subagentCost > ownOnly.usage.subagentCost);
+  assert.ok(counted.usage.tokens.output > ownOnly.usage.tokens.output);
 });
 
 test("a subagent's reply is searchable, but not one from another session", () => {

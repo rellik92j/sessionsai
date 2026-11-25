@@ -283,7 +283,7 @@ export function* records(text: string): Generator<any> {
 
 /**
  * Extracts summary metadata for one session log. `subagentLogs` are the logs of its subagents
- * (`<sessionId>/subagents/*.jsonl`), which only add to its usage.
+ * (`<sessionId>/subagents/*.jsonl`), which only add to its usage; one whose records name another session is skipped.
  */
 export function parseSession(
   text: string,
@@ -479,14 +479,19 @@ export function parseSession(
   }
 
   for (const log of subagentLogs) {
+    // A log whose records name another session is not this session's, as in the transcript: it adds nothing here.
+    // One whose records name no session is still counted.
+    const run = parseSubagentRun(log);
+    if (run.sessionId && run.sessionId !== id) {
+      continue;
+    }
     for (const r of records(log)) {
       if (r?.type === 'assistant') {
         usage.add(r, true);
       }
     }
     // The transcript shows each subagent's reply, so a search for it should find the session.
-    const run = parseSubagentRun(log);
-    if (run.reply && (!run.sessionId || run.sessionId === id)) {
+    if (run.reply) {
       searchParts.push(run.reply);
     }
   }
