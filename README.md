@@ -10,7 +10,7 @@
 
 ### Browse every session in one place
 
-The sidebar shows a card for each session with its title, your latest prompt, when it happened, the git branch, how many prompts it has, and badges for subagents and pull requests. A pulsing green dot marks sessions that were active in the last few minutes.
+The sidebar shows a card for each session with its title, your latest prompt, when it happened, the git branch, the agent it ran as (for a session started with `claude --agent`, also shown in its transcript and on the Overview), how many prompts it has, and badges for subagents and pull requests. A pulsing green dot marks sessions that were active in the last few minutes.
 
 Each card also shows what the session cost, plus a couple of [usage badges](#see-what-a-session-used-and-cost) when they're worth knowing about.
 

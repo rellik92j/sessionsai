@@ -37,7 +37,10 @@ export interface SessionInfo {
   prUrl?: string;
   prNumber?: number;
   prRepository?: string;
+  /** The session's name as other sessions address it; Claude Code writes it alongside every rename, so it is not an agent. */
   agentName?: string;
+  /** The agent definition the session ran under (`claude --agent <name>`), from its `agent-setting` record. */
+  agent?: string;
   version?: string;
   model?: string;
   /** Prompts, peer messages and Claude's replies (no tool I/O or thinking), for full-text search. */
@@ -264,6 +267,11 @@ export function parseSession(
       case 'agent-name':
         if (typeof r.agentName === 'string') {
           info.agentName = r.agentName;
+        }
+        continue;
+      case 'agent-setting':
+        if (typeof r.agentSetting === 'string' && r.agentSetting.trim()) {
+          info.agent = r.agentSetting.trim();
         }
         continue;
       case 'pr-link':

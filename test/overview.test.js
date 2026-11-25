@@ -72,6 +72,14 @@ test('overview: range splits a long session, totals, projects, models and top se
   close(all.buckets.reduce((n, b) => n + b.cost, 0), all.totals.cost);
 });
 
+test('overview: session rows carry the --agent agent, and only that', () => {
+  const withAgent = parseSession(jsonl({ type: 'agent-setting', agentSetting: 'planner' }, { type: 'user', message: { content: 'go' }, cwd: '/repo', timestamp: at(1) }), 'x.jsonl', 'p', 'x');
+  // agent-name is the session's name (written on every rename), not an agent.
+  const renamed = parseSession(jsonl({ type: 'agent-name', agentName: 'Named' }, { type: 'user', message: { content: 'go' }, cwd: '/repo', timestamp: at(2) }), 'y.jsonl', 'p', 'y');
+  const o = buildOverview([withAgent, renamed], 7, now);
+  assert.deepEqual(o.recentSessions.map((s) => [s.id, s.agent]), [['claude:x', 'planner'], ['claude:y', undefined]]);
+});
+
 test('overview: current week starts on Monday, current month on the 1st', () => {
   // `now` is Monday 2026-10-05.
   const sessions = [session('a', '/repo', [0, 1, 4, 6]), session('b', '/repo', [40])];
