@@ -722,8 +722,11 @@ function renderEntry(e: TranscriptEntry, showThinking: boolean, source: SourceIn
   }
   if (e.role === 'user') {
     const body = renderParts(e.parts, 'user', showThinking);
+    const queued = e.queued
+      ? '<span class="pill" title="Sent while Claude was still working on an earlier prompt. Claude read it during that turn."><i class="codicon codicon-history"></i>sent mid-turn</span>'
+      : '';
     return body
-      ? `<div class="msg user" id="msg-${index}"><div class="msg-meta">${turnChip(e.turn)}${escapeHtml(speakers?.user ?? 'You')} ${time(e.timestamp)}</div><div class="bubble">${body}</div></div>`
+      ? `<div class="msg user" id="msg-${index}"><div class="msg-meta">${turnChip(e.turn)}${queued}${escapeHtml(speakers?.user ?? 'You')} ${time(e.timestamp)}</div><div class="bubble">${body}</div></div>`
       : '';
   }
   if (e.role === 'peer') {

@@ -89,6 +89,11 @@ export interface TranscriptEntry {
   parts: TranscriptPart[];
   /** On a user prompt: what the reply to it cost (Claude Code only). */
   turn?: TurnStats;
+  /**
+   * On a user prompt: typed while Claude was mid-turn and folded into that turn, so it has no cost of its own
+   * unless a user record repeating it later started a turn.
+   */
+  queued?: true;
   /** On a subagent entry: who ran and what it was asked (Claude Code only). */
   subagent?: {
     name?: string;
@@ -238,6 +243,23 @@ export function parseAgentMessage(r: any): AgentMessage | undefined {
   return { from, name: str(origin.name), text, key: str(origin.handbackToolUseId) ?? `${from}\n${text}` };
 }
 
+/**
+ * A prompt the user typed while Claude was mid-turn. Claude Code logs it as a `queued_command` attachment
+ * (`commandMode: "prompt"`, `origin.kind: "human"`) and folds it into the running turn, so it usually never
+ * gets a user record of its own. Task notifications, peer messages and hand-backs share the shape and are not prompts.
+ */
+export function parseQueuedPrompt(r: any): string | undefined {
+  const a = r?.type === 'attachment' && !r.isMeta ? r.attachment : undefined;
+  if (!a || a.type !== 'queued_command' || a.commandMode !== 'prompt' || a.isMeta || typeof a.prompt !== 'string') {
+    return undefined;
+  }
+  if (a.origin != null && a.origin?.kind !== 'human') {
+    return undefined;
+  }
+  const c = classifyUserContent(a.prompt);
+  return c.kind === 'prompt' ? c.text : undefined;
+}
+
 export function oneLine(text: string, max = MAX_TITLE): string {
   const flat = text
     .replace(/<\/?pasted_content\b[^>]*>/g, ' ')
@@ -319,6 +341,14 @@ export function parseSession(
   const usage = new UsageCollector();
   /** Hand-backs already added to the search text, by delivery. */
   const handbacks = new Set<string>();
+  /** Prompts queued mid-turn since the last typed prompt, so a user record repeating one is not counted twice. */
+  const queuedPrompts = new Set<string>();
+  const countPrompt = (text: string) => {
+    info.promptCount++;
+    info.firstPrompt ??= text;
+    info.lastPrompt = text;
+    searchParts.push(text);
+  };
 
   for (const r of records(text)) {
     if (!r || typeof r !== 'object') {
@@ -369,6 +399,12 @@ export function parseSession(
         if (handback && !handbacks.has(handback.key)) {
           handbacks.add(handback.key);
           searchParts.push(handback.text);
+        }
+        // A prompt typed mid-turn counts like any other; a user record repeating it next is not counted again.
+        const queued = !r.isSidechain && !handback ? parseQueuedPrompt(r) : undefined;
+        if (queued) {
+          queuedPrompts.add(queued);
+          countPrompt(queued);
         }
         continue;
       }
@@ -469,12 +505,14 @@ export function parseSession(
     }
     const c = classifyUserContent(r.message?.content);
     if (c.kind === 'prompt') {
-      info.promptCount++;
-      info.firstPrompt ??= c.text;
-      info.lastPrompt = c.text;
-      searchParts.push(c.text);
+      if (!queuedPrompts.has(c.text)) {
+        countPrompt(c.text);
+      }
     } else if (c.kind === 'command') {
       firstCommand ??= c.text;
+    }
+    if (c.kind !== 'noise') {
+      queuedPrompts.clear();
     }
   }
 
@@ -760,11 +798,13 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
   // The entry each tool call went into, for runs whose call never got a result.
   const callEntries = new Map<string, TranscriptEntry>();
   // The prompt being answered, with the requests made since it, to give each prompt its cost.
-  let turn: { entry: TranscriptEntry; usage: UsageCollector; last?: number } | undefined;
+  let turn: { entry: TranscriptEntry; usage: UsageCollector; start?: number; last?: number } | undefined;
+  /** Prompts queued mid-turn since the last typed prompt, so a user record repeating one shows once. */
+  let queuedEntries: TranscriptEntry[] = [];
   const endTurn = () => {
     const u = turn?.usage.summary();
     if (turn && u) {
-      const start = parseTime(turn.entry.timestamp);
+      const start = turn.start;
       turn.entry.turn = {
         cost: u.cost,
         requests: u.requests,
@@ -862,6 +902,15 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
         }
         continue;
       }
+      // A prompt typed mid-turn: shown where Claude took it in. The running turn goes on, so its cost stays with
+      // the prompt that started it.
+      const queued = parseQueuedPrompt(r);
+      if (queued) {
+        const entry: TranscriptEntry = { role: 'user', timestamp: r.timestamp ?? r.attachment?.timestamp, parts: [{ kind: 'text', text: queued }], queued: true };
+        entries.push(entry);
+        queuedEntries.push(entry);
+        continue;
+      }
     }
     if (r.type !== 'user') {
       continue;
@@ -917,10 +966,15 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
     if (c.kind === 'noise') {
       continue;
     }
-    const entry: TranscriptEntry = { role: 'user', timestamp: r.timestamp, parts: [{ kind: 'text', text: c.text }] };
-    entries.push(entry);
+    // A prompt already shown where it was queued mid-turn is not shown again, but it still starts the turn it opens.
+    const repeated = c.kind === 'prompt' ? queuedEntries.find((e) => e.parts[0]?.kind === 'text' && e.parts[0].text === c.text) : undefined;
+    queuedEntries = [];
+    const entry: TranscriptEntry = repeated ?? { role: 'user', timestamp: r.timestamp, parts: [{ kind: 'text', text: c.text }] };
+    if (!repeated) {
+      entries.push(entry);
+    }
     endTurn();
-    turn = { entry, usage: new UsageCollector() };
+    turn = { entry, usage: new UsageCollector(), start: parseTime(r.timestamp) };
   }
   endTurn();
   // A call whose result was never logged (interrupted): its run goes right after the call.

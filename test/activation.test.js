@@ -1118,3 +1118,42 @@ test('New Claude Code Session: folder, model, effort and agent, started as argv 
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('a prompt typed while Claude was mid-turn renders as a user message marked as sent mid-turn', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-sessions-queued-'));
+  const projectsDir = path.join(root, 'claude');
+  const ID = '0e0e0e0e-1111-4222-8333-944455556666';
+  try {
+    fs.mkdirSync(path.join(projectsDir, 'C--repo'), { recursive: true });
+    fs.copyFileSync(path.join(__dirname, 'fixtures', 'claude-code', 'queued-prompt.jsonl'), path.join(projectsDir, 'C--repo', `${ID}.jsonl`));
+    relocate(projectsDir, 'C:\\repo', path.join(root, 'repo'));
+    const state = {
+      projectsDir,
+      config: { copilotDir: path.join(root, 'none'), vscodeUserDir: path.join(root, 'none') },
+      providers: {},
+      commands: {},
+      panels: [],
+      panelPosts: [],
+      errors: [],
+      terminals: [],
+      infos: [],
+    };
+    const { send, last } = await activateWithSidebar(state);
+    await state.commands['claudeSessions.openTranscript']({ sessionKey: `claude:${ID}` });
+    const html = state.panels[0].webview.html;
+    const users = [...html.matchAll(/<div class="msg user" id="msg-\d+"><div class="msg-meta">([\s\S]*?)<\/div><div class="bubble">([\s\S]*?)<\/div><\/div>/g)];
+    assert.equal(users.length, 3);
+    assert.doesNotMatch(users[0][1], /sent mid-turn/);
+    assert.match(users[0][1], /turn-chip/, 'the prompt that started the turn carries its cost');
+    assert.match(users[1][1], /codicon-history"><\/i>sent mid-turn<\/span>/);
+    assert.doesNotMatch(users[1][1], /turn-chip/, 'a queued prompt has no cost of its own');
+    assert.match(users[1][2], /read the handoff file if there is one/);
+    assert.doesNotMatch(users[2][1], /sent mid-turn/);
+
+    send({ type: 'search', query: '"read the handoff file if there is one"' });
+    assert.deepEqual(last('searchResults').ids, [`claude:${ID}`]);
+    assert.deepEqual(state.errors, []);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
