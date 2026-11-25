@@ -4,6 +4,17 @@ All notable changes to SessionsAI (published as Claude Sessions before 0.4.0) ar
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 Numbers in parentheses are the pull requests that made each change. Each version heading links to its GitHub release, which has the release notes and the `.vsix` for installing that version with **Install from VSIX…**.
 
+## [0.4.8](https://github.com/rellik92j/sessionsai/releases/tag/v0.4.8) - 2026-11-24
+
+### Added
+- **The agent a session ran as.** A session started with `claude --agent <name>` shows that agent as an orange chip on its sidebar card, in its transcript header and on its Overview session row. Sidebar search finds sessions by agent name. (#50)
+- **Subagents in the transcript.** When Claude hands work to a subagent, the transcript shows it as its own speaker: an indented green block with the prompt Claude gave it and its reply, placed where the run happened, so the transcript reads Claude, subagent, Claude. Named agents show their name and a "subagent" pill; built-in one-off agents read "Subagent". Long prompts and replies start collapsed. Sidebar search and the transcript's find bar match text in subagent replies. Cost and token totals are unchanged. (#51)
+- **Background subagent replies where they arrived.** A subagent started in the background shows twice: where Claude started it, with a "background" pill and its prompt, and again where its reply reached Claude, as a "Reply: …" entry with a "reply" pill. You can see what Claude did while it waited and what it did with the reply. (#52)
+- **Open a subagent's full run.** Click **Open run** on a subagent block, or a row under **Subagents** in the **Session details** panel, to read everything that subagent did: its tool calls, the commands it ran, its messages and any follow-ups Claude sent it. The run opens read-only in the transcript tab, with the agent's name and description in the header and **Back to session** to return. Runs whose log is no longer on disk have no button. (#55)
+
+### Fixed
+- **Renamed sessions show their title exactly as you typed it.** A renamed session's name no longer shows up as an agent chip, and its title no longer gets the topic added after a dash. Agent-team sessions, which share one name and receive messages from other sessions, still show "Name — topic" so you can tell them apart. (#50, #53)
+
 ## [0.4.7](https://github.com/rellik92j/sessionsai/releases/tag/v0.4.7) - 2026-11-24
 
 ### Added
