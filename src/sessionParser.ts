@@ -95,6 +95,8 @@ export interface TranscriptEntry {
     description?: string;
     prompt?: string;
     toolUseId?: string;
+    /** The run's agent id, set only when its log was read, so the transcript can offer to open the full run. */
+    agentId?: string;
     /** Launched in the background: its reply comes back later, as its own hand-back entry. */
     background?: true;
     /** A reply that reached the main session where this entry sits (an `<agent-message>`), not a launch. */
@@ -117,6 +119,8 @@ export interface SubagentRun {
   reply?: string;
   /** When the reply was written. */
   timestamp?: string;
+  /** The log file it was read from (set by readSubagentRuns). */
+  file?: string;
 }
 
 const MAX_TITLE = 120;
@@ -671,7 +675,15 @@ export interface TranscriptOptions {
   sessionId?: string;
   /** The session's subagent runs, shown after the tool call that started each one. */
   subagents?: SubagentRun[];
+  /**
+   * The log is a subagent's own (`subagents/agent-<id>.jsonl`), whose records are all sidechain records: keep them,
+   * show the main session's follow-up messages as prompts, and its SubagentHandback call as its reply.
+   */
+  sidechain?: boolean;
 }
+
+/** A message the main session sent a running subagent; logged in the subagent's log as a meta user record. */
+const isCoordinatorMessage = (r: any) => r?.isMeta === true && r.origin?.kind === 'coordinator';
 
 /** Builds a readable transcript of the main conversation thread, with its subagents' prompts and replies. */
 export function parseTranscript(text: string, options: TranscriptOptions = {}): TranscriptEntry[] {
@@ -704,6 +716,9 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
         toolUseId: call?.id,
       },
     };
+    if (run.agentId) {
+      entry.subagent!.agentId = run.agentId;
+    }
     if (background) {
       entry.subagent!.background = true;
     }
@@ -730,6 +745,9 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
     if (launch?.call?.id) {
       subagent.toolUseId = launch.call.id;
     }
+    if (run?.agentId) {
+      subagent.agentId = run.agentId;
+    }
     return { role: 'subagent', timestamp: ts, parts: [{ kind: 'text', text: msg.text }], subagent };
   };
   // tool_use parts by id, so results (logged later as user messages) can be attached to their call.
@@ -752,8 +770,11 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
     turn = undefined;
   };
 
+  // In a subagent's own log: its SubagentHandback calls, shown as its reply, whose "delivered" results are dropped.
+  const handbackCalls = new Set<string>();
+
   for (const r of records(text)) {
-    if (!r || typeof r !== 'object' || r.isSidechain) {
+    if (!r || typeof r !== 'object' || (r.isSidechain && !options.sidechain)) {
       continue;
     }
     if (r.type === 'assistant' && turn) {
@@ -777,6 +798,13 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
           parts.push({ kind: 'text', text: p.text });
         } else if (p?.type === 'thinking' && typeof p.thinking === 'string' && p.thinking.trim()) {
           parts.push({ kind: 'thinking', text: p.thinking });
+        } else if (options.sidechain && p?.type === 'tool_use' && p.name === 'SubagentHandback' && typeof p.input?.message === 'string') {
+          if (typeof p.id === 'string') {
+            handbackCalls.add(p.id);
+          }
+          if (p.input.message.trim()) {
+            parts.push({ kind: 'text', text: p.input.message });
+          }
         } else if (p?.type === 'tool_use') {
           const part: Extract<TranscriptPart, { kind: 'tool_use' }> = {
             kind: 'tool_use',
@@ -833,7 +861,7 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
     if (r.type !== 'user') {
       continue;
     }
-    if (r.isMeta) {
+    if (r.isMeta && !(options.sidechain && isCoordinatorMessage(r))) {
       const peer = parsePeerMessage(r.message?.content);
       if (peer) {
         entries.push({ role: 'peer', timestamp: r.timestamp, parts: [{ kind: 'text', text: peer.text, from: peer.from }] });
@@ -845,7 +873,7 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
       const orphans: TranscriptPart[] = [];
       const answered: TranscriptEntry[] = [];
       for (const p of content) {
-        if (p?.type !== 'tool_result') {
+        if (p?.type !== 'tool_result' || handbackCalls.has(p.tool_use_id)) {
           continue;
         }
         const full = stringifyToolContent(p.content);

@@ -59,10 +59,17 @@ test('subagent runs appear in order, each after the tool call that started it, a
     description: 'Check release 1.2.0',
     prompt: 'Check that release 1.2.0 is ready to ship and report back.',
     toolUseId: 'toolu_A',
+    agentId: 'a1111111111111111',
     background: true,
   });
   assert.deepEqual(checker.parts, [], 'the reply is not shown at the launch as well');
-  assert.deepEqual(checkerReply.subagent, { name: 'release-checker', description: 'Check release 1.2.0', handback: true, toolUseId: 'toolu_A' });
+  assert.deepEqual(checkerReply.subagent, {
+    name: 'release-checker',
+    description: 'Check release 1.2.0',
+    handback: true,
+    toolUseId: 'toolu_A',
+    agentId: 'a1111111111111111',
+  });
   assert.equal(reply(checkerReply), 'Release 1.2.0 is ready to ship.\n\n- Tests: 88 of 88 pass.');
   assert.equal(checkerReply.timestamp, '2026-11-20T10:02:00.000Z');
 
@@ -263,4 +270,85 @@ test('hand-backs leave cost, request and token totals unchanged, and are searcha
   }
   // Without the subagent logs, the hand-backs alone still make the replies searchable.
   assert.ok(parseSession(text, logOf(BG), 'C--repo', BG).searchText.includes('Verdict on PR #47'));
+});
+
+// A subagent's full run, opened from the transcript: its own log read as a transcript.
+const runLog = (id, agent) => fs.readFileSync(path.join(dir, id, 'subagents', `agent-${agent}.jsonl`), 'utf8');
+
+test("a subagent's own log reads as a full transcript: prompt, tool calls, text and reply in order", () => {
+  assert.deepEqual(parseTranscript(runLog(ID, 'a1111111111111111')), [], 'without the option its sidechain records are skipped, as before');
+
+  const t = parseTranscript(runLog(ID, 'a1111111111111111'), { sidechain: true });
+  assert.deepEqual(t.map((e) => e.role), ['user', 'assistant']);
+  assert.equal(t[0].parts[0].text, 'Check that release 1.2.0 is ready to ship and report back.', 'the system reminder after it is not shown');
+  assert.equal(t[0].turn.requests, 2, 'the prompt carries what answering it cost');
+  const [bash, handback] = t[1].parts;
+  assert.equal(bash.kind, 'tool_use');
+  assert.equal(bash.name, 'Bash');
+  assert.deepEqual(bash.result, { text: '88 passing', isError: false });
+  assert.deepEqual(handback, { kind: 'text', text: 'Release 1.2.0 is ready to ship.\n\n- Tests: 88 of 88 pass.' }, 'the SubagentHandback call is the reply');
+  assert.ok(!JSON.stringify(t).includes('Delivered.'), "the hand-back call's own result is not shown");
+
+  // No meta file, a message logged as two lines, and a corrupt line at the end.
+  const drafter = parseTranscript(runLog(ID, 'a2222222222222222'), { sidechain: true });
+  assert.deepEqual(drafter.map((e) => e.role), ['user', 'assistant']);
+  assert.deepEqual(drafter[1].parts.map((p) => p.text), ['Looking at the commits.', '## Notes for 1.2.0', '- Faster search']);
+
+  // A message the main session sent while it ran is a prompt of its own, between its two replies.
+  const worker = parseTranscript(runLog(BG, 'a5555555555555555'), { sidechain: true });
+  assert.deepEqual(worker.map((e) => e.role), ['user', 'assistant', 'user', 'assistant']);
+  assert.match(worker[2].parts[0].text, /Fix the lint warning\.$/);
+  assert.equal(worker[3].parts[0].text, 'Lint fixed in a second commit on PR #47; CI is green again.');
+  // Outside a subagent's own log the same meta record stays hidden, and so the two replies read as one turn.
+  const asMain = runLog(BG, 'a5555555555555555').replace(/"isSidechain":true/g, '"isSidechain":false');
+  assert.deepEqual(parseTranscript(asMain).map((e) => e.role), ['user', 'assistant']);
+});
+
+test("a subagent's nested agents and unknown records never break its transcript", () => {
+  const rec = (o) => JSON.stringify({ isSidechain: true, agentId: 'a9', sessionId: ID, timestamp: '2026-11-20T10:00:00.000Z', ...o });
+  const log = [
+    rec({ type: 'user', message: { role: 'user', content: 'Plan the work.' } }),
+    rec({ type: 'brand-new-record', payload: { anything: 1 } }),
+    rec({ type: 'assistant', message: { id: 'm1', content: [{ type: 'tool_use', id: 'toolu_N', name: 'Agent', input: { subagent_type: 'planner', description: 'Nested plan', prompt: 'Go.', run_in_background: true } }] } }),
+    rec({
+      type: 'user',
+      message: { role: 'user', content: [{ tool_use_id: 'toolu_N', type: 'tool_result', content: 'Async agent launched successfully.\nagentId: anested0000000000' }] },
+      toolUseResult: { isAsync: true, status: 'async_launched', agentId: 'anested0000000000' },
+    }),
+    rec({ type: 'assistant', message: { id: 'm2', content: [{ type: 'tool_use', id: 'toolu_H', name: 'SubagentHandback', input: { message: 42 } }] } }),
+    rec({ type: 'assistant', message: { id: 'm3', content: [{ type: 'text', text: 'Done.' }] } }),
+    '{"cut off mid-wri',
+  ].join('\n');
+  let t;
+  assert.doesNotThrow(() => (t = parseTranscript(log, { sidechain: true })));
+  assert.deepEqual(t.map((e) => e.role), ['user', 'assistant', 'subagent', 'assistant']);
+  assert.equal(t[2].subagent.name, 'planner');
+  assert.equal(t[2].subagent.agentId, undefined, "a nested run's log is not read, so it offers nothing to open");
+  assert.equal(t[3].parts.at(-1).text, 'Done.');
+});
+
+test('subagent runs know their log file and agent id, and are found by it only for their own session', async () => {
+  const { findSubagentRun } = require('../out/sessionStore');
+  const runs = await readSubagentRuns(logOf(ID), ID);
+  for (const r of runs) {
+    assert.equal(r.file, path.join(dir, ID, 'subagents', `agent-${r.agentId}.jsonl`));
+  }
+  assert.equal((await findSubagentRun(logOf(ID), ID, 'a1111111111111111')).agentType, 'release-checker');
+  assert.equal(await findSubagentRun(logOf(ID), ID, 'a3333333333333333'), undefined, 'a run that answered another session');
+  assert.equal(await findSubagentRun(logOf(ID), ID, 'a0000000000000000'), undefined, 'no such log');
+  assert.equal(await findSubagentRun(logOf(BG), BG, 'a7777777777777777'), undefined, "the reviewer's log is missing");
+
+  // Session details > Subagents: rows whose run's log was read carry its agent id; the reviewer's does not.
+  const { collectInsights } = require('../out/insights');
+  const bg = collectInsights(parseTranscript(read(BG), { sessionId: BG, subagents: await readSubagentRuns(logOf(BG), BG) }));
+  assert.deepEqual(
+    bg.subagents.map((a) => [a.description, a.agentId]),
+    [
+      ['Build SA-1 CI workflow', 'a5555555555555555'],
+      ['Check the changelog', 'a6666666666666666'],
+      ['Review PR #47', undefined],
+    ],
+  );
+  const t = parseTranscript(read(BG), { sessionId: BG, subagents: await readSubagentRuns(logOf(BG), BG) });
+  assert.ok(t.filter((e) => e.subagent?.toolUseId === 'toolu_R').every((e) => !e.subagent.agentId), 'no open control for the missing log');
 });
