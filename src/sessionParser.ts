@@ -186,14 +186,49 @@ export function classifyUserContent(content: unknown): Classified {
 const PEER_MESSAGE = /<cross-session-message\b([^>]*)>([\s\S]*?)(?:<\/cross-session-message>|$)/;
 
 /** Extracts a message sent by another Claude session (agent teams), which is logged as a meta user message. */
-export function parsePeerMessage(content: unknown): { from: string; text: string } | undefined {
+export function parsePeerMessage(content: unknown, fallbackName?: string): { from: string; text: string } | undefined {
   const raw = typeof content === 'string' ? content : undefined;
   const m = raw ? PEER_MESSAGE.exec(raw) : null;
   if (!m) {
     return undefined;
   }
-  const from = /from-name="([^"]*)"/.exec(m[1])?.[1] || 'another session';
+  const from = /from-name="([^"]*)"/.exec(m[1])?.[1] || fallbackName || 'another session';
   return { from, text: m[2].trim() };
+}
+
+/** A message from another Claude session, with a key that identifies its delivery. */
+export interface PeerMessage {
+  from: string;
+  text: string;
+  /** The message id Claude Code gave it, so one logged twice (as a record and as a queued command) shows once. */
+  key: string;
+}
+
+/**
+ * Extracts a message another Claude session sent to this one, from a meta user record holding a
+ * `<cross-session-message>`, or from a `queued_command` attachment carrying one (`origin.kind: "peer"`), which is how
+ * Claude Code logs a message that arrived while Claude was mid-turn. Callers check `isMeta` on user records.
+ */
+export function parsePeerRecord(r: any): PeerMessage | undefined {
+  let raw: unknown;
+  let origin: any;
+  if (r?.type === 'user') {
+    raw = r.message?.content;
+    origin = r.origin;
+  } else if (r?.type === 'attachment' && r.attachment?.type === 'queued_command') {
+    origin = r.attachment.origin;
+    // A typed prompt or a task notification that happens to quote one is not a message from another session.
+    if (origin != null && origin?.kind !== 'peer') {
+      return undefined;
+    }
+    raw = r.attachment.prompt;
+  }
+  origin = origin && typeof origin === 'object' ? origin : {};
+  const peer = parsePeerMessage(raw, str(origin.name));
+  if (!peer) {
+    return undefined;
+  }
+  return { ...peer, key: str(origin.msg_id) ?? `${peer.from}\n${peer.text}` };
 }
 
 /** A message from an agent (a background subagent's hand-back) that reached the main session. */
@@ -349,6 +384,17 @@ export function parseSession(
     info.lastPrompt = text;
     searchParts.push(text);
   };
+  /** Messages from other sessions already counted, by delivery. */
+  const peerMessages = new Set<string>();
+  const countPeer = (peer: PeerMessage) => {
+    if (peerMessages.has(peer.key)) {
+      return;
+    }
+    peerMessages.add(peer.key);
+    info.peerMessageCount++;
+    info.firstPeerMessage ??= { from: peer.from, text: peer.text };
+    searchParts.push(peer.text);
+  };
 
   for (const r of records(text)) {
     if (!r || typeof r !== 'object') {
@@ -400,8 +446,13 @@ export function parseSession(
           handbacks.add(handback.key);
           searchParts.push(handback.text);
         }
+        // A message from another session that arrived mid-turn counts like one that arrived between turns.
+        const peer = !r.isSidechain && !handback ? parsePeerRecord(r) : undefined;
+        if (peer) {
+          countPeer(peer);
+        }
         // A prompt typed mid-turn counts like any other; a user record repeating it next is not counted again.
-        const queued = !r.isSidechain && !handback ? parseQueuedPrompt(r) : undefined;
+        const queued = !r.isSidechain && !handback && !peer ? parseQueuedPrompt(r) : undefined;
         if (queued) {
           queuedPrompts.add(queued);
           countPrompt(queued);
@@ -492,11 +543,9 @@ export function parseSession(
         }
         continue;
       }
-      const peer = parsePeerMessage(r.message?.content);
+      const peer = parsePeerRecord(r);
       if (peer) {
-        info.peerMessageCount++;
-        info.firstPeerMessage ??= peer;
-        searchParts.push(peer.text);
+        countPeer(peer);
       }
       continue;
     }
@@ -793,6 +842,15 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
     }
     return { role: 'subagent', timestamp: ts, parts: [{ kind: 'text', text: msg.text }], subagent };
   };
+  /** Messages from other sessions already shown, by delivery. */
+  const shownPeers = new Set<string>();
+  const peerEntry = (peer: PeerMessage, ts?: string): TranscriptEntry | undefined => {
+    if (shownPeers.has(peer.key)) {
+      return undefined;
+    }
+    shownPeers.add(peer.key);
+    return { role: 'peer', timestamp: ts, parts: [{ kind: 'text', text: peer.text, from: peer.from }] };
+  };
   // tool_use parts by id, so results (logged later as user messages) can be attached to their call.
   const toolUses = new Map<string, Extract<TranscriptPart, { kind: 'tool_use' }>>();
   // The entry each tool call went into, for runs whose call never got a result.
@@ -902,6 +960,18 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
         }
         continue;
       }
+      // A message from another session that arrived mid-turn: shown where Claude took it in, like one that arrived
+      // between turns. Neither starts a turn.
+      if (r.type === 'attachment') {
+        const peer = parsePeerRecord(r);
+        if (peer) {
+          const entry = peerEntry(peer, r.timestamp ?? r.attachment?.timestamp);
+          if (entry) {
+            entries.push(entry);
+          }
+          continue;
+        }
+      }
       // A prompt typed mid-turn: shown where Claude took it in. The running turn goes on, so its cost stays with
       // the prompt that started it.
       const queued = parseQueuedPrompt(r);
@@ -916,9 +986,10 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
       continue;
     }
     if (r.isMeta && !(options.sidechain && isCoordinatorMessage(r))) {
-      const peer = parsePeerMessage(r.message?.content);
-      if (peer) {
-        entries.push({ role: 'peer', timestamp: r.timestamp, parts: [{ kind: 'text', text: peer.text, from: peer.from }] });
+      const peer = parsePeerRecord(r);
+      const entry = peer ? peerEntry(peer, r.timestamp) : undefined;
+      if (entry) {
+        entries.push(entry);
       }
       continue;
     }

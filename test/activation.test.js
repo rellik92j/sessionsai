@@ -1157,3 +1157,39 @@ test('a prompt typed while Claude was mid-turn renders as a user message marked 
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('a message from another session that arrived mid-turn renders as a session message from its sender', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-sessions-queued-peer-'));
+  const projectsDir = path.join(root, 'claude');
+  const ID = '0f0f0f0f-2222-4333-8444-955566667777';
+  try {
+    fs.mkdirSync(path.join(projectsDir, 'C--repo'), { recursive: true });
+    fs.copyFileSync(path.join(__dirname, 'fixtures', 'claude-code', 'queued-peer-message.jsonl'), path.join(projectsDir, 'C--repo', `${ID}.jsonl`));
+    relocate(projectsDir, 'C:\\repo', path.join(root, 'repo'));
+    const state = {
+      projectsDir,
+      config: { copilotDir: path.join(root, 'none'), vscodeUserDir: path.join(root, 'none') },
+      providers: {},
+      commands: {},
+      panels: [],
+      panelPosts: [],
+      errors: [],
+      terminals: [],
+      infos: [],
+    };
+    const { send, last } = await activateWithSidebar(state);
+    await state.commands['claudeSessions.openTranscript']({ sessionKey: `claude:${ID}` });
+    const html = state.panels[0].webview.html;
+    const peers = [...html.matchAll(/<div class="msg peer">[\s\S]*?<strong>([^<]*)<\/strong><span class="pill">session message<\/span>[\s\S]*?<div class="peer-card">([\s\S]*?)<\/div>\s*<\/div>\s*<\/div>/g)];
+    assert.equal(peers.length, 2);
+    assert.equal(peers[0][1], 'Project Lead — split the parser work');
+    assert.match(peers[0][2], /start on the parser scope now/);
+    assert.match(peers[1][2], /Hold off on the Copilot reader/);
+
+    send({ type: 'search', query: '"start on the parser scope now"' });
+    assert.deepEqual(last('searchResults').ids, [`claude:${ID}`]);
+    assert.deepEqual(state.errors, []);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
