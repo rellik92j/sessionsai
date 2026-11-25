@@ -96,6 +96,28 @@ function fakeVscode(state) {
   };
 }
 
+/**
+ * Resolves once `condition()` is truthy, checking every 10 ms; throws after `timeout` ms naming `what`. Use it in place
+ * of a fixed sleep wherever the step has something to wait for: a slow CI runner can take longer than any fixed sleep.
+ * A step that checks nothing happened (a cancelled pick) has nothing to wait for and keeps its sleep.
+ */
+async function waitFor(condition, what, timeout = 10000) {
+  const start = Date.now();
+  while (!condition()) {
+    if (Date.now() - start > timeout) {
+      throw new Error(`timed out after ${timeout} ms waiting for ${what}`);
+    }
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+/** The sidebar's last `state` post, once the session store has finished loading. */
+async function waitForLoadedState(posted) {
+  const last = () => posted.filter((m) => m.type === 'state').pop();
+  await waitFor(() => last()?.loaded === true, 'the sidebar to post a loaded state');
+  return last();
+}
+
 function writeSession(dir, id, lines) {
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, `${id}.jsonl`), lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
@@ -183,8 +205,7 @@ test('bundled extension activates, fills the sidebar, and renders a transcript',
     assert.match(view.webview.html, /codicon\.css/);
 
     handler({ type: 'ready' });
-    await new Promise((r) => setTimeout(r, 300));
-    const msg = posted.filter((m) => m.type === 'state').pop();
+    const msg = await waitForLoadedState(posted);
     assert.ok(msg, 'state posted to sidebar');
     assert.equal(msg.loaded, true);
     assert.equal(msg.total, 1);
@@ -233,7 +254,7 @@ test('bundled extension activates, fills the sidebar, and renders a transcript',
 
     // Opening from a search passes the words on to the transcript page.
     handler({ type: 'run', command: 'openTranscript', id: 'aaaa-1111', highlight: ['const', 42] });
-    await new Promise((r) => setTimeout(r, 100));
+    await waitFor(() => /data-highlight=/.test(state.panels[0].webview.html), 'the transcript to render with highlights');
     assert.equal(state.panels.length, 1, 'existing panel reused');
     assert.match(state.panels[0].webview.html, /<body class="line-full" data-session="[^"]*" data-highlight="\[&quot;const&quot;\]">/);
     assert.deepEqual(state.errors, []);
@@ -241,11 +262,11 @@ test('bundled extension activates, fills the sidebar, and renders a transcript',
     // The transcriptLineWidth setting becomes a class on the page; an unknown value falls back to full.
     state.config = { ...(state.config ?? {}), transcriptLineWidth: 'narrow' };
     handler({ type: 'run', command: 'openTranscript', id: 'aaaa-1111' });
-    await new Promise((r) => setTimeout(r, 100));
+    await waitFor(() => !/line-full/.test(state.panels[0].webview.html), 'the transcript to render again');
     assert.match(state.panels[0].webview.html, /<body class="line-narrow"/);
     state.config.transcriptLineWidth = 'huge';
     handler({ type: 'run', command: 'openTranscript', id: 'aaaa-1111' });
-    await new Promise((r) => setTimeout(r, 100));
+    await waitFor(() => !/line-narrow/.test(state.panels[0].webview.html), 'the transcript to render again');
     assert.match(state.panels[0].webview.html, /<body class="line-full"/);
     delete state.config.transcriptLineWidth;
 
@@ -259,7 +280,7 @@ test('bundled extension activates, fills the sidebar, and renders a transcript',
     assert.equal(state.panels.length, 1, 'preview tab reused for another session');
     assert.equal(state.panels[0].title, 'Session bbbb');
     await state.panels[0].onMessage({ command: 'keepOpen' });
-    await new Promise((r) => setTimeout(r, 50));
+    await waitFor(() => !keepButton.test(state.panels[0].webview.html), 'the kept tab to render again');
     assert.doesNotMatch(state.panels[0].webview.html, keepButton, 'kept tab drops the button');
     await open('cccc');
     assert.equal(state.panels.length, 2, 'next transcript gets a new preview tab');
@@ -281,7 +302,7 @@ test('bundled extension activates, fills the sidebar, and renders a transcript',
 
     // Continue in new session: the CLI is the terminal's process, with the handoff as one argument (no shell typing).
     await state.panels[0].onMessage({ command: 'continueInNewSession' });
-    await new Promise((r) => setTimeout(r, 300));
+    await waitFor(() => state.terminals.length > 0, 'a terminal');
     const t = state.terminals.pop();
     assert.ok(t, 'terminal created');
     assert.equal(t.shellPath, 'claude');
@@ -301,14 +322,14 @@ test('bundled extension activates, fills the sidebar, and renders a transcript',
       return items.find((i) => i.value === ['claude', 'sonnet', 'xhigh'][titles.length - 1]);
     };
     await state.panels[0].onMessage({ command: 'continueInNewSessionWithModel' });
-    await new Promise((r) => setTimeout(r, 300));
+    await waitFor(() => state.terminals.length > 0, 'a terminal');
     const tm = state.terminals.pop();
     assert.equal(titles.length, 4, 'tool, model, effort, agent');
     assert.deepEqual(tm.shellArgs.slice(0, 6), ['--model', 'sonnet', '--effort', 'xhigh', '--name', 'Continued: Session bbbb']);
     // Default for both adds no flags; cancelling starts nothing.
     state.pick = (items) => items[0];
     await state.panels[0].onMessage({ command: 'continueInNewSessionWithModel' });
-    await new Promise((r) => setTimeout(r, 300));
+    await waitFor(() => state.terminals.length > 0, 'a terminal');
     assert.equal(state.terminals.pop().shellArgs[0], '--name');
     state.pick = () => undefined;
     await state.panels[0].onMessage({ command: 'continueInNewSessionWithModel' });
@@ -316,7 +337,7 @@ test('bundled extension activates, fills the sidebar, and renders a transcript',
     assert.equal(state.terminals.length, 0);
     // Continuing a continued session doesn't stack the prefix.
     await state.commands['claudeSessions.continueInNewSession']({ ...sessionA, title: 'Continued: Continued: Session aaaa' });
-    await new Promise((r) => setTimeout(r, 300));
+    await waitFor(() => state.terminals.length > 0, 'a terminal');
     assert.deepEqual(state.terminals.pop().shellArgs.slice(0, 2), ['--name', 'Continued: Session aaaa']);
 
     // Message box: the page says where it sends; sending resumes this session with the message as one argument.
@@ -332,7 +353,7 @@ test('bundled extension activates, fills the sidebar, and renders a transcript',
     const sendBox = async (msg) => {
       state.panelPosts.length = 0;
       await state.panels[0].onMessage({ command: 'send', ...msg });
-      await new Promise((r) => setTimeout(r, 300));
+      await waitFor(() => state.panelPosts.some((m) => m.type === 'sent' || m.type === 'sendFailed'), 'the page to hear sent or sendFailed');
       return state.panelPosts.map((m) => m.type).filter((t) => t === 'sent' || t === 'sendFailed').pop();
     };
     assert.equal(await sendBox({ text: 'Add tests\nfor it', target: 'claude', mode: 'same' }), 'sent');
@@ -354,7 +375,7 @@ test('bundled extension activates, fills the sidebar, and renders a transcript',
     assert.match(chatOpen.query, /Over to chat$/);
     assert.equal(state.memento['composerTarget.claude'], 'vscode-chat');
     await state.panels[0].onMessage({ command: 'refresh' });
-    await new Promise((r) => setTimeout(r, 200));
+    await waitFor(() => composerData(state.panels[0].webview.html).target !== 'claude', 'the transcript to render again');
     assert.equal(composerData(state.panels[0].webview.html).target, 'vscode-chat', 'the last tool chosen is the next default');
     // Nothing to send, or an unknown target: nothing happens and the page keeps the text.
     assert.equal(await sendBox({ text: '   ', target: 'claude', mode: 'same' }), 'sendFailed');
@@ -438,7 +459,7 @@ async function activateWithSidebar(state) {
     show() {},
   });
   handler({ type: 'ready' });
-  await new Promise((r) => setTimeout(r, 300));
+  await waitForLoadedState(posted);
   return { vscode, posted, send: handler, last: (type) => posted.filter((m) => m.type === type).pop() };
 }
 
@@ -770,7 +791,7 @@ test('Claude Code agents: an agent step after effort for a new Claude Code CLI s
       shown = [];
       state.pick = answer([undefined, undefined, 'ship-it']);
       await state.panels[0].onMessage({ command: 'send', text: 'Next', target: 'claude', mode, pickModel: true });
-      await new Promise((r) => setTimeout(r, 300));
+      await waitFor(() => state.terminals.length > 0, 'a terminal');
       return state.terminals.pop();
     };
     t = await send('handoff');
