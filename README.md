@@ -223,8 +223,9 @@ How the code is laid out:
 | `src/insights.ts` | What a session did, for the transcript's Session details panel |
 | `src/overview.ts`, `src/overviewPanel.ts`, `media/overview.*` | The overview tab: `overview.ts` builds the numbers, the panel picks the projects |
 | `src/handoff.ts` | The prompt that starts Continue in New Session |
+| `src/agents.ts` | The Claude Code agents a new session can start as, and the `claude` arguments that launch it |
 
-Files without VS Code imports (the three parsers, `usage`, `query`, `overview`, `handoff`, `insights`, `markdown`, `format`) are unit tested directly from `out/`; `test/activation.test.js` loads the bundled extension against a fake VS Code API and drives the webviews' messages.
+Files without VS Code imports (the three parsers, `usage`, `query`, `overview`, `handoff`, `agents`, `insights`, `markdown`, `format`) are unit tested directly from `out/`; `test/activation.test.js` loads the bundled extension against a fake VS Code API and drives the webviews' messages.
 
 ## License
 
