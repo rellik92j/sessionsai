@@ -196,12 +196,14 @@ export function parsePeerMessage(content: unknown, fallbackName?: string): { fro
   return { from, text: m[2].trim() };
 }
 
-/** A message from another Claude session, with a key that identifies its delivery. */
+/** A message from another Claude session, with what identifies its delivery. */
 export interface PeerMessage {
   from: string;
   text: string;
   /** The message id Claude Code gave it, so one logged twice (as a record and as a queued command) shows once. */
-  key: string;
+  msgId?: string;
+  /** Whether it was logged as a `queued_command` attachment rather than as a meta user record. */
+  queued: boolean;
 }
 
 /**
@@ -212,13 +214,15 @@ export interface PeerMessage {
 export function parsePeerRecord(r: any): PeerMessage | undefined {
   let raw: unknown;
   let origin: any;
+  const queued = r?.type === 'attachment';
   if (r?.type === 'user') {
     raw = r.message?.content;
     origin = r.origin;
-  } else if (r?.type === 'attachment' && r.attachment?.type === 'queued_command') {
+  } else if (queued && r.attachment?.type === 'queued_command') {
     origin = r.attachment.origin;
-    // A typed prompt or a task notification that happens to quote one is not a message from another session.
-    if (origin != null && origin?.kind !== 'peer') {
+    // A typed prompt or a task notification that happens to quote one is not a message from another session. Older
+    // logs write typed prompts with no origin at all, but never as meta, and peer messages always are.
+    if (origin != null ? origin?.kind !== 'peer' : r.attachment.isMeta !== true) {
       return undefined;
     }
     raw = r.attachment.prompt;
@@ -228,7 +232,40 @@ export function parsePeerRecord(r: any): PeerMessage | undefined {
   if (!peer) {
     return undefined;
   }
-  return { ...peer, key: str(origin.msg_id) ?? `${peer.from}\n${peer.text}` };
+  const msgId = str(origin.msg_id);
+  return msgId ? { ...peer, msgId, queued } : { ...peer, queued };
+}
+
+/**
+ * Tells repeat deliveries of a peer message from new ones. A message id names one message, however many times it is
+ * logged. Without one, the sender and words only pair a queued command with the user record logging the same
+ * delivery: two records (or two queued commands) with the same words are two messages.
+ */
+export class PeerDeliveries {
+  private readonly ids = new Set<string>();
+  /** Unpaired deliveries without an id, by sender and words, counted per kind. */
+  private readonly unpaired = new Map<string, { queued: number; record: number }>();
+
+  /** Records the delivery and returns true if it repeats one already seen. */
+  isRepeat(peer: PeerMessage): boolean {
+    if (peer.msgId) {
+      if (this.ids.has(peer.msgId)) {
+        return true;
+      }
+      this.ids.add(peer.msgId);
+      return false;
+    }
+    const key = `${peer.from}\n${peer.text}`;
+    const n = this.unpaired.get(key) ?? { queued: 0, record: 0 };
+    this.unpaired.set(key, n);
+    const other = peer.queued ? 'record' : 'queued';
+    if (n[other] > 0) {
+      n[other]--;
+      return true;
+    }
+    n[peer.queued ? 'queued' : 'record']++;
+    return false;
+  }
 }
 
 /** A message from an agent (a background subagent's hand-back) that reached the main session. */
@@ -385,12 +422,11 @@ export function parseSession(
     searchParts.push(text);
   };
   /** Messages from other sessions already counted, by delivery. */
-  const peerMessages = new Set<string>();
+  const peerMessages = new PeerDeliveries();
   const countPeer = (peer: PeerMessage) => {
-    if (peerMessages.has(peer.key)) {
+    if (peerMessages.isRepeat(peer)) {
       return;
     }
-    peerMessages.add(peer.key);
     info.peerMessageCount++;
     info.firstPeerMessage ??= { from: peer.from, text: peer.text };
     searchParts.push(peer.text);
@@ -843,12 +879,11 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
     return { role: 'subagent', timestamp: ts, parts: [{ kind: 'text', text: msg.text }], subagent };
   };
   /** Messages from other sessions already shown, by delivery. */
-  const shownPeers = new Set<string>();
+  const shownPeers = new PeerDeliveries();
   const peerEntry = (peer: PeerMessage, ts?: string): TranscriptEntry | undefined => {
-    if (shownPeers.has(peer.key)) {
+    if (shownPeers.isRepeat(peer)) {
       return undefined;
     }
-    shownPeers.add(peer.key);
     return { role: 'peer', timestamp: ts, parts: [{ kind: 'text', text: peer.text, from: peer.from }] };
   };
   // tool_use parts by id, so results (logged later as user messages) can be attached to their call.

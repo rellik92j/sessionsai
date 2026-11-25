@@ -129,6 +129,8 @@ test('queued commands that are not peer messages are not read as one, and bad sh
     { type: 'attachment', attachment: { type: 'queued_command', prompt: 'continue', commandMode: 'prompt', origin: { kind: 'human' } } },
     { type: 'attachment', attachment: { type: 'queued_command', prompt: 'continue', commandMode: 'prompt' } },
     { type: 'attachment', attachment: { type: 'queued_command', prompt: csm('Lead', 'quoted'), commandMode: 'prompt', origin: { kind: 'human' } } },
+    // Older logs (2.1.219) write typed prompts with no origin and no isMeta; quoting a peer tag does not make one.
+    { type: 'attachment', attachment: { type: 'queued_command', prompt: `look at this: ${csm('Lead', 'old quote')}`, commandMode: 'prompt' } },
     // A task notification.
     { type: 'attachment', attachment: { type: 'queued_command', prompt: csm('Lead', 'x'), commandMode: 'task-notification', origin: { kind: 'task-notification' } } },
     // Malformed shapes.
@@ -146,8 +148,9 @@ test('queued commands that are not peer messages are not read as one, and bad sh
   // No from-name: the origin's name, then a placeholder.
   const unnamed = queuedPeer('hi', 't', 'm', { prompt: '<cross-session-message from="uds:x">\nhi\n</cross-session-message>' });
   assert.equal(parsePeerRecord(unnamed).from, 'Lead');
+  assert.equal(parsePeerRecord(unnamed).msgId, 'm');
   unnamed.attachment.origin = undefined;
-  assert.deepEqual(parsePeerRecord(unnamed), { from: 'another session', text: 'hi', key: 'another session\nhi' });
+  assert.deepEqual(parsePeerRecord(unnamed), { from: 'another session', text: 'hi', queued: true });
 
   // A subagent's own mid-turn message, logged in the main file as a sidechain record, is not the main session's.
   const side = { ...queuedPeer('to the subagent', 't', 'm-side'), isSidechain: true };
@@ -156,5 +159,53 @@ test('queued commands that are not peer messages are not read as one, and bad sh
   assert.deepEqual(t.filter((e) => e.role === 'peer'), []);
   const s = parseSession(text, 'f', 'p', 'id');
   assert.equal(s.peerMessageCount, 0);
-  assert.equal(s.promptCount, 4, 'the typed prompts still count: the record, the two queued "continue"s and the quote');
+  assert.equal(s.promptCount, 5, 'the typed prompts still count: the record, the two queued "continue"s and the two quotes');
+  const typed = t.filter((e) => e.role === 'user').map((e) => e.parts[0].text);
+  assert.ok(
+    typed.some((x) => x.startsWith('look at this: <cross-session-message') && x.includes('old quote')),
+    'the origin-less quote renders as the user\'s prompt',
+  );
+});
+
+test('an origin-less queued prompt quoting a peer tag counts and renders as a prompt, as without it', () => {
+  const quote = { type: 'attachment', attachment: { type: 'queued_command', prompt: `look at this: ${csm('Lead', 'quoted')}`, commandMode: 'prompt' }, timestamp: 't2' };
+  const base = [user('first', 't0'), asst('a1', [{ type: 'text', text: 'working' }], 't1')];
+  const end = asst('a2', [{ type: 'text', text: 'done' }], 't3');
+  const text = jsonl(...base, quote, end);
+  const s = parseSession(text, 'f', 'p', 'id');
+  assert.equal(s.promptCount, 2);
+  assert.equal(s.peerMessageCount, 0);
+  assert.equal(s.lastPrompt, quote.attachment.prompt);
+  const t = parseTranscript(text);
+  assert.deepEqual(t.filter((e) => e.role === 'peer'), []);
+  assert.deepEqual(
+    t.filter((e) => e.role === 'user').map((e) => e.parts[0].text),
+    ['first', quote.attachment.prompt],
+  );
+});
+
+test('identical peer messages without ids are separate messages, and each pairs with its own queued copy', () => {
+  // Two meta records with the same words from one sender and no msg_id: two messages, as before.
+  const two = jsonl(user('first', 't0'), metaPeer('ok', 't1'), metaPeer('ok', 't2'));
+  assert.equal(parseTranscript(two).filter((e) => e.role === 'peer').length, 2);
+  assert.equal(parseSession(two, 'f', 'p', 'id').peerMessageCount, 2);
+  // Two queued commands with the same words: two messages too.
+  const twoQueued = jsonl(user('first', 't0'), queuedPeer('ok', 't1'), queuedPeer('ok', 't2'));
+  assert.equal(parseTranscript(twoQueued).filter((e) => e.role === 'peer').length, 2);
+  assert.equal(parseSession(twoQueued, 'f', 'p', 'id').peerMessageCount, 2);
+  // Each logged both ways, in either order: still two.
+  for (const recs of [
+    [queuedPeer('ok', 't1'), metaPeer('ok', 't2'), queuedPeer('ok', 't3'), metaPeer('ok', 't4')],
+    [queuedPeer('ok', 't1'), queuedPeer('ok', 't2'), metaPeer('ok', 't3'), metaPeer('ok', 't4')],
+    [metaPeer('ok', 't1'), queuedPeer('ok', 't2'), metaPeer('ok', 't3'), queuedPeer('ok', 't4')],
+  ]) {
+    const text = jsonl(user('first', 't0'), ...recs);
+    const peers = parseTranscript(text).filter((e) => e.role === 'peer');
+    assert.equal(peers.length, 2, recs.map((r) => r.type).join(','));
+    assert.equal(parseSession(text, 'f', 'p', 'id').peerMessageCount, 2);
+  }
+  // Three records and one queued copy: three messages.
+  const three = jsonl(user('first', 't0'), metaPeer('ok', 't1'), queuedPeer('ok', 't2'), metaPeer('ok', 't3'), metaPeer('ok', 't4'));
+  assert.equal(parseTranscript(three).filter((e) => e.role === 'peer').length, 3);
+  assert.equal(parseSession(three, 'f', 'p', 'id').peerMessageCount, 3);
 });
