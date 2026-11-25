@@ -37,17 +37,12 @@ jobs:
       # bundle). realData.test.js skips itself here: the runner has no ~/.claude/projects.
       - run: npm test
 
+      # The rules live in scripts/check-package.mjs, which every local `vsce package` also runs (vscode:prepublish).
+      # Here it can only catch a .vscodeignore rule going missing: gitignored local-only folders (.claude/, .tmp/)
+      # never exist on the runner. A real file in one of them is caught when packaging locally, where releases are built.
       - name: Check what the .vsix would contain
-        run: |
-          npx vsce ls | tee "$RUNNER_TEMP/files.txt"
-          for f in package.json README.md LICENSE dist/extension.js node_modules/@vscode/codicons/dist/codicon.ttf; do
-            grep -qxF "$f" "$RUNNER_TEMP/files.txt" || { echo "::error::missing from the package: $f"; exit 1; }
-          done
-          if grep -E '^(src|test|scripts|out|docs|\.claude|\.github|\.vscode|\.tmp)/|\.map$|\.ts$|\.vsix$' "$RUNNER_TEMP/files.txt"; then
-            echo "::error::files above should not ship; see .vscodeignore"
-            exit 1
-          fi
+        run: node scripts/check-package.mjs --list
 
-      # Full manifest validation; the .vsix goes to the runner's temp folder and is not kept.
+      # Full manifest validation (and the prepublish check again); the .vsix goes to the runner's temp folder and is not kept.
       - name: Package
         run: npx vsce package --out "$RUNNER_TEMP/check.vsix"
