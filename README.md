@@ -232,6 +232,8 @@ Files without VS Code imports (the three parsers, `usage`, `query`, `overview`, 
 
 Every pull request to `main`, and every push to it, runs `npm test` on Windows in GitHub Actions (`.github/workflows/test.yml`), then checks the file list `vsce` would package and builds a throwaway `.vsix` to validate the manifest.
 
+The file-list check is `scripts/check-package.mjs`, and it also runs on every local `vsce package` or `npm run package` (through `vscode:prepublish`). Packaging stops if a required file is missing, or if sources, tests, source maps, `.claude/`, `.tmp/` or any other gitignored local-only file would ship. CI's clean checkout never has those local-only folders, so there it only catches a `.vscodeignore` rule going missing. Files actually sitting in them are caught only by the local run, on the machine where releases are packaged.
+
 ## License
 
 [MIT](LICENSE)

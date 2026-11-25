@@ -468,7 +468,7 @@
     "test": "npm run compile && npm run bundle && node --test test/*.test.js",
     "package": "npm run compile && npm run bundle && vsce package --allow-missing-repository",
     "bundle": "esbuild src/extension.ts --bundle --platform=node --format=cjs --target=node20 --external:vscode --sourcemap --outfile=dist/extension.js",
-    "vscode:prepublish": "npm run bundle"
+    "vscode:prepublish": "npm run bundle && node scripts/check-package.mjs"
   },
   "devDependencies": {
     "@types/markdown-it": "^14.2.0",
