@@ -964,3 +964,136 @@ test("a subagent's full run opens from the transcript as a read-only transcript 
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('New Claude Code Session: folder, model, effort and agent, started as argv in that folder', async () => {
+  const fixtures = path.join(__dirname, 'fixtures', 'claude-agents');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-sessions-new-'));
+  // The projects folder and every folder a session starts in are under the temp root. This test needs user agents,
+  // so it points CLAUDE_CONFIG_DIR at its own folder with some, then puts back the file's empty sandbox.
+  const configDir = path.join(root, 'config');
+  const projectsDir = path.join(configDir, 'projects');
+  const repo = path.join(root, 'repo');
+  const other = path.join(root, 'other');
+  const picked = path.join(root, 'picked');
+  process.env.CLAUDE_CONFIG_DIR = configDir;
+  try {
+    fs.mkdirSync(projectsDir, { recursive: true });
+    fs.cpSync(path.join(fixtures, 'project'), path.join(repo, '.claude', 'agents'), { recursive: true });
+    fs.cpSync(path.join(fixtures, 'user'), path.join(configDir, 'agents'), { recursive: true });
+    fs.mkdirSync(other);
+    fs.mkdirSync(picked);
+    const state = {
+      projectsDir,
+      config: { copilotDir: path.join(root, 'none'), vscodeUserDir: path.join(root, 'none') },
+      providers: {},
+      commands: {},
+      panels: [],
+      panelPosts: [],
+      errors: [],
+      terminals: [],
+      infos: [],
+    };
+    const { vscode } = await activateWithSidebar(state);
+    const folder = (p) => ({ name: path.basename(p), uri: { ...vscode.Uri.file(p), scheme: 'file' } });
+    // A virtual folder has no path a terminal can start in, so it is not offered.
+    vscode.workspace.workspaceFolders = [folder(repo), folder(other), { name: 'remote', uri: { ...vscode.Uri.file('/r'), scheme: 'vscode-vfs' } }];
+    let dialogs = [];
+    let dialogAnswer;
+    vscode.window.showOpenDialog = async (options) => (dialogs.push(options), dialogAnswer);
+    let shown = [];
+    const answer = (values) => (items, options) => (shown.push({ items, title: options.title }), items.find((i) => i.value === values[shown.length - 1]));
+    const run = async (values) => {
+      shown = [];
+      dialogs = [];
+      state.pick = answer(values);
+      return state.commands['claudeSessions.newClaudeSession']();
+    };
+    const OTHER_FOLDER = '\0other-folder';
+    const OTHER_AGENT = '\0other-agent';
+
+    // Workspace folders first, then a folder dialog; model, effort and agent counted from 1 after it.
+    assert.equal(await run([repo, 'opus', 'high', 'ship-it']), true);
+    assert.deepEqual(shown.map((s) => s.title), [
+      'New Claude Code Session: folder',
+      'New Claude Code Session (1/3): model',
+      'New Claude Code Session (2/3): effort',
+      'New Claude Code Session (3/3): agent',
+    ]);
+    assert.deepEqual(shown[0].items.map((i) => i.value), [repo, other, OTHER_FOLDER]);
+    // No session is being continued, so none of its model or effort is offered.
+    assert.ok(!shown[1].items.some((i) => i.description === 'used by this session'));
+    assert.ok(!shown[2].items.some((i) => i.description === 'used by this session'));
+    // The agents of the chosen folder, then the user's.
+    assert.deepEqual(shown[3].items.map((i) => [i.value, i.description]).slice(1, -1), [
+      ['planner', 'project agent'],
+      ['ship-it', 'project agent'],
+      ['reviewer', 'user agent'],
+    ]);
+    let t = state.terminals.pop();
+    assert.equal(t.shellPath, 'claude');
+    assert.deepEqual(t.shellArgs, ['--model', 'opus', '--effort', 'high', '--agent', 'ship-it']);
+    assert.equal(t.cwd, repo);
+    assert.equal(t.name, 'Claude Code · repo');
+    assert.equal(t.sent, undefined, 'argv, never sendText');
+
+    // All defaults: claude with no arguments, in the folder chosen.
+    assert.equal(await run([other, undefined, undefined, undefined]), true);
+    t = state.terminals.pop();
+    assert.deepEqual(t.shellArgs, []);
+    assert.equal(t.cwd, other);
+    // That folder has no project agents: only the user's are listed, including the planner the repo's own one hid.
+    assert.deepEqual(shown[3].items.map((i) => [i.value, i.description]).slice(1, -1), [
+      ['planner', 'user agent'],
+      ['reviewer', 'user agent'],
+    ]);
+
+    // A typed agent name, and the claudeCommand setting split into executable and leading arguments.
+    state.config.claudeCommand = 'npx claude';
+    state.input = () => '  plugin:helper ';
+    assert.equal(await run([repo, undefined, 'max', OTHER_AGENT]), true);
+    t = state.terminals.pop();
+    assert.equal(t.shellPath, 'npx');
+    assert.deepEqual(t.shellArgs, ['claude', '--effort', 'max', '--agent', 'plugin:helper']);
+    delete state.config.claudeCommand;
+    state.input = undefined;
+
+    // "Choose a folder…" opens a folder dialog; the folder picked there is where the session starts.
+    dialogAnswer = [vscode.Uri.file(picked)];
+    assert.equal(await run([OTHER_FOLDER, 'sonnet', undefined, undefined]), true);
+    assert.equal(dialogs.length, 1);
+    assert.equal(dialogs[0].canSelectFolders, true);
+    assert.equal(dialogs[0].canSelectFiles, false);
+    t = state.terminals.pop();
+    assert.equal(t.cwd, picked);
+    assert.deepEqual(t.shellArgs, ['--model', 'sonnet']);
+
+    // No folder open: straight to the dialog, with no folder step.
+    vscode.workspace.workspaceFolders = undefined;
+    assert.equal(await run(['haiku', undefined, undefined]), true);
+    assert.equal(dialogs.length, 1);
+    assert.equal(shown[0].title, 'New Claude Code Session (1/3): model');
+    t = state.terminals.pop();
+    assert.equal(t.cwd, picked);
+    assert.deepEqual(t.shellArgs, ['--model', 'haiku']);
+
+    // Cancelling at any step opens nothing: the dialog, then each quick pick in turn.
+    dialogAnswer = undefined;
+    assert.equal(await run([]), false);
+    assert.equal(dialogs.length, 1);
+    vscode.workspace.workspaceFolders = [folder(repo)];
+    assert.equal(await run([OTHER_FOLDER]), false);
+    assert.equal(dialogs.length, 1);
+    for (let step = 0; step < 4; step++) {
+      // Answers the steps before `step` with their first value and cancels `step` itself.
+      shown = [];
+      state.pick = (items, options) => (shown.push(options.title), shown.length - 1 < step ? items[0] : undefined);
+      assert.equal(await state.commands['claudeSessions.newClaudeSession'](), false);
+      assert.equal(shown.length, step + 1);
+    }
+    assert.equal(state.terminals.length, 0);
+    assert.deepEqual(state.errors, []);
+  } finally {
+    process.env.CLAUDE_CONFIG_DIR = emptyConfigDir;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

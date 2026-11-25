@@ -93,6 +93,12 @@
         "category": "SessionsAI"
       },
       {
+        "command": "claudeSessions.newClaudeSession",
+        "title": "New Claude Code Session…",
+        "category": "SessionsAI",
+        "icon": "$(add)"
+      },
+      {
         "command": "claudeSessions.openInClaudeCode",
         "title": "Open in Claude Code Chat",
         "category": "SessionsAI",
@@ -169,19 +175,24 @@
     "menus": {
       "view/title": [
         {
-          "command": "claudeSessions.openOverview",
+          "command": "claudeSessions.newClaudeSession",
           "when": "view == claudeSessions.list",
           "group": "navigation@0"
         },
         {
-          "command": "claudeSessions.focusSearch",
+          "command": "claudeSessions.openOverview",
           "when": "view == claudeSessions.list",
           "group": "navigation@1"
         },
         {
-          "command": "claudeSessions.refresh",
+          "command": "claudeSessions.focusSearch",
           "when": "view == claudeSessions.list",
           "group": "navigation@2"
+        },
+        {
+          "command": "claudeSessions.refresh",
+          "when": "view == claudeSessions.list",
+          "group": "navigation@3"
         },
         {
           "command": "claudeSessions.groupByProject",
