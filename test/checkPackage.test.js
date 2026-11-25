@@ -29,6 +29,40 @@ test('a missing required file is reported', async () => {
   assert.deepEqual(packageProblems(files, []), ['missing from the package: dist/extension.js']);
 });
 
+test('the codicon stylesheet is required', async () => {
+  const { packageProblems } = await load();
+  const css = 'node_modules/@vscode/codicons/dist/codicon.css';
+  assert.deepEqual(packageProblems(GOOD.filter((f) => f !== css), []), [`missing from the package: ${css}`]);
+});
+
+test('webview files in media/ are required when passed in, as main() does', async () => {
+  const { packageProblems, REQUIRED } = await load();
+  const media = ['media/icon.png', 'media/sidebar.js', 'media/sidebar.css', 'media/transcript.js'];
+  const required = [...REQUIRED, ...media];
+  assert.deepEqual(packageProblems([...GOOD, ...media], [], required), []);
+  // What a `media/**` line in .vscodeignore would do: every one of them drops out of the list.
+  assert.deepEqual(
+    packageProblems(GOOD.filter((f) => !f.startsWith('media/')), [], required),
+    media.map((f) => `missing from the package: ${f}`),
+  );
+});
+
+test('every webview asset the source loads from media/ is tracked in git', () => {
+  // mediaFiles() requires what git tracks in media/. This ties that list to what the code loads, so a renamed or
+  // new asset that was never committed is caught here rather than in a broken webview.
+  const fs = require('node:fs');
+  const { execFileSync } = require('node:child_process');
+  const root = path.join(__dirname, '..');
+  const tracked = new Set(execFileSync('git', ['ls-files', 'media'], { cwd: root, encoding: 'utf8' }).split(/\r?\n/));
+  const loaded = new Set();
+  for (const f of fs.readdirSync(path.join(root, 'src')).filter((n) => n.endsWith('.ts'))) {
+    const text = fs.readFileSync(path.join(root, 'src', f), 'utf8');
+    for (const m of text.matchAll(/(?:uri\(media|joinPath\(this\.mediaUri),\s*'([^']+)'/g)) loaded.add(`media/${m[1]}`);
+  }
+  assert.ok(loaded.size >= 6, `expected the sidebar, transcript and overview assets, found ${[...loaded]}`);
+  for (const f of loaded) assert.ok(tracked.has(f), `${f} is loaded by a webview but not tracked in git`);
+});
+
 test('local agent files, scratch files and sources are refused', async () => {
   const { packageProblems } = await load();
   const leaks = [
