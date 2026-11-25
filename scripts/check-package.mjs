@@ -8,17 +8,23 @@
 //   node scripts/check-package.mjs [--list]      --list prints every packaged file first
 
 import { execFileSync } from 'node:child_process';
+import { readdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 
-/** Files the extension cannot work without. */
+/**
+ * Files the extension cannot work without. The webview scripts and styles in media/ are required too, but they are
+ * listed by `mediaFiles()` from the checkout, so a new one is covered without editing this list.
+ */
 export const REQUIRED = [
   'package.json',
   'README.md',
   'LICENSE',
   'dist/extension.js',
+  'node_modules/@vscode/codicons/dist/codicon.css',
   'node_modules/@vscode/codicons/dist/codicon.ttf',
 ];
 
@@ -30,12 +36,12 @@ export const IGNORED_BUT_SHIPPED = /^(dist|node_modules)\//;
 
 /**
  * What is wrong with a package file list. `ignored` is the subset of `files` that git ignores, or undefined when
- * git could not be asked.
+ * git could not be asked. `required` is every file that must ship: REQUIRED plus the media/ files.
  */
-export function packageProblems(files, ignored) {
+export function packageProblems(files, ignored, required = REQUIRED) {
   const have = new Set(files);
   const problems = [];
-  for (const f of REQUIRED) if (!have.has(f)) problems.push(`missing from the package: ${f}`);
+  for (const f of required) if (!have.has(f)) problems.push(`missing from the package: ${f}`);
   const flagged = new Set();
   for (const f of files) {
     if (FORBIDDEN.test(f)) {
@@ -65,6 +71,27 @@ function gitIgnored(files) {
   }
 }
 
+/**
+ * Every file in media/: the webview scripts and styles the sidebar, transcript and overview load, and the icon.
+ * Tracked files come from git, so a stray local file is not demanded; without git, the folder is read instead.
+ */
+function mediaFiles() {
+  try {
+    const out = execFileSync('git', ['ls-files', '-z', '--', 'media'], {
+      cwd: ROOT,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const files = out.split('\0').filter(Boolean);
+    if (files.length) return files;
+  } catch {
+    // Not a git checkout, or git is not installed: fall through to the folder.
+  }
+  return readdirSync(path.join(ROOT, 'media'), { recursive: true, withFileTypes: true })
+    .filter((d) => d.isFile())
+    .map((d) => path.relative(ROOT, path.join(d.parentPath ?? d.path, d.name)).replace(/\\/g, '/'));
+}
+
 async function main() {
   const { listFiles } = createRequire(import.meta.url)('@vscode/vsce');
   const files = (await listFiles({ cwd: ROOT })).map((f) => f.replace(/\\/g, '/'));
@@ -73,7 +100,7 @@ async function main() {
   const ignored = gitIgnored(files);
   if (!ignored) console.warn('check-package: git is not available, so only the fixed patterns were checked.');
 
-  const problems = packageProblems(files, ignored);
+  const problems = packageProblems(files, ignored, [...REQUIRED, ...mediaFiles()]);
   if (problems.length) {
     for (const p of problems) console.error(`::error::${p}`);
     console.error(`check-package: ${problems.length} problem(s) in the .vsix file list. Fix .vscodeignore and try again.`);
