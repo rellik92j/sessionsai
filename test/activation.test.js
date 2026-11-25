@@ -771,13 +771,22 @@ test('subagent runs render as their own collapsible speakers in the transcript',
     assert.match(blocks[0], /<span class="subagent-desc">Check release 1\.2\.0<\/span>/);
     assert.match(blocks[0], /class="subagent-prompt" open><summary>.*Prompt/, 'a short prompt is shown open');
     assert.match(blocks[0], /Check that release 1\.2\.0 is ready to ship/);
-    assert.match(blocks[0], /88 of 88 pass/);
-    assert.match(blocks[0], /<details class="subagent-card" open>/, 'a short reply is shown open');
+    // It ran in the background: the launch says so, and its reply is its own block where it arrived.
+    assert.match(blocks[0], /codicon-run-all"><\/i>background<\/span>/);
+    assert.match(blocks[0], /Started in the background/);
+    assert.doesNotMatch(blocks[0], /88 of 88 pass/);
     assert.match(blocks[1], /<strong>Subagent<\/strong><time/, 'a one-off agent: generic label, no pill');
     assert.match(blocks[1], /Faster search/);
-    assert.doesNotMatch(html, /FOREIGN REPLY|OTHER SESSION REPLY/);
+    const handbacks = [...html.matchAll(/<div class="msg subagent handback">[\s\S]*?<\/details>\s*<\/div>\s*<\/div>/g)].map((m) => m[0]);
+    assert.equal(handbacks.length, 1);
+    assert.match(handbacks[0], /<strong>release-checker<\/strong><span class="pill subagent-pill">subagent<\/span><span class="pill subagent-pill"><i class="codicon codicon-reply"><\/i>reply<\/span>/);
+    assert.match(handbacks[0], /<span class="subagent-desc">Reply: Check release 1\.2\.0<\/span>/);
+    assert.match(handbacks[0], /88 of 88 pass/);
+    assert.match(handbacks[0], /<details class="subagent-card" open>/, 'a short reply is shown open');
+    assert.doesNotMatch(handbacks[0], /subagent-prompt/, 'the prompt is shown once, at the launch');
+    assert.doesNotMatch(html, /FOREIGN REPLY|OTHER SESSION REPLY|Subagent hand-back/);
     // Order: the main reply is split around each run, so it doesn't read as one block.
-    const order = ['have the release checker look first', 'release-checker</strong>', 'While that runs', '<strong>Subagent</strong>', 'Both agents are done', 'Docs Lead'].map((s) => html.indexOf(s));
+    const order = ['have the release checker look first', 'release-checker</strong>', 'While that runs', '<strong>Subagent</strong>', 'Reply: Check release 1.2.0', 'Both agents are done', 'Docs Lead'].map((s) => html.indexOf(s));
     assert.ok(order.every((i) => i > 0), `all found: ${order}`);
     assert.deepEqual([...order].sort((a, b) => a - b), order);
     assert.equal((html.match(/<div class="msg assistant">/g) ?? []).length, 3);
@@ -791,6 +800,21 @@ test('subagent runs render as their own collapsible speakers in the transcript',
     await state.commands['claudeSessions.openTranscript']({ sessionKey: 'claude:5e1f0c2a-1111-4222-8333-944455556666' });
     const again = state.panels[0].webview.html;
     assert.match(again, /<details class="subagent-card">\s*<summary>[\s\S]*?<span class="subagent-preview">## Notes for 1\.2\.0 - Faster search - more/);
+
+    // Background runs that hand back later: each reply where it arrived, a long one collapsed.
+    await state.commands['claudeSessions.openTranscript']({ sessionKey: 'claude:9b9b9b9b-1111-4222-8333-944455556666' });
+    const bg = state.panels[0].webview.html;
+    const replies = [...bg.matchAll(/<div class="msg subagent handback">[\s\S]*?<\/details>\s*<\/div>\s*<\/div>/g)].map((m) => m[0]);
+    assert.deepEqual(
+      replies.map((b) => /<strong>([^<]*)<\/strong>/.exec(b)[1]),
+      ['ext-worker', 'Subagent', 'ext-worker', 'reviewer', 'Subagent'],
+    );
+    assert.match(replies[0], /<details class="subagent-card">\s*<summary>[\s\S]*?<span class="subagent-preview">\*\*SA-1 is done up to the merge/, 'a long reply starts collapsed');
+    assert.match(replies[2], /<details class="subagent-card" open>[\s\S]*Lint fixed in a second commit/);
+    const bgOrder = ['waiting for their reports', 'SA-1 is done up to the merge', 'Asking it to fix the lint', 'no entry for 0.4.7', 'Noted: the changelog', 'Lint fixed', 'Verdict on PR #47', 'shared fixture moved', 'Ready for you to merge'].map((s) => bg.indexOf(s));
+    assert.ok(bgOrder.every((i) => i > 0), `all found: ${bgOrder}`);
+    assert.deepEqual([...bgOrder].sort((a, b) => a - b), bgOrder);
+    assert.doesNotMatch(bg, /task-notification|Subagent hand-back/);
 
     // Searching for a subagent's reply finds the session.
     send({ type: 'search', query: '"88 of 88"' });

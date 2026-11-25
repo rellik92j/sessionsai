@@ -609,16 +609,25 @@ function renderSubagent(e: TranscriptEntry): string {
     : '';
   const body = reply
     ? `<div class="subagent-reply"><div class="pane-label">Reply</div><div class="md">${renderMarkdown(reply)}</div></div>`
-    : '<div class="subagent-reply none">No reply recorded.</div>';
+    : s.background
+      ? '<div class="subagent-reply none">Started in the background. Its reply appears where it reached the main session.</div>'
+      : '<div class="subagent-reply none">No reply recorded.</div>';
+  // A launch says it started in the background; a hand-back says it is the reply arriving.
+  const state = s.handback
+    ? '<span class="pill subagent-pill"><i class="codicon codicon-reply"></i>reply</span>'
+    : s.background && !reply
+      ? '<span class="pill subagent-pill"><i class="codicon codicon-run-all"></i>background</span>'
+      : '';
+  const desc = s.handback ? (s.description ? `Reply: ${s.description}` : 'Reply') : s.description ?? 'Prompt and reply';
   return `
-    <div class="msg subagent">
+    <div class="msg subagent${s.handback ? ' handback' : ''}">
       <div class="avatar subagent-avatar" title="${escapeHtml(name)}"><i class="codicon codicon-hubot"></i></div>
       <div class="msg-main">
-        <div class="msg-meta"><strong>${escapeHtml(name)}</strong>${s.name ? '<span class="pill subagent-pill">subagent</span>' : ''}${time(e.timestamp)}</div>
+        <div class="msg-meta"><strong>${escapeHtml(name)}</strong>${s.name ? '<span class="pill subagent-pill">subagent</span>' : ''}${state}${time(e.timestamp)}</div>
         <details class="subagent-card"${open ? ' open' : ''}>
           <summary>
             <i class="codicon codicon-chevron-right"></i>
-            <span class="subagent-desc">${escapeHtml(s.description ?? 'Prompt and reply')}</span>
+            <span class="subagent-desc">${escapeHtml(desc)}</span>
             <span class="subagent-preview">${escapeHtml(preview)}</span>
           </summary>
           ${prompt}${body}

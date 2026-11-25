@@ -3,7 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
-const { parseSession, parseTranscript, parseSubagentRun } = require('../out/sessionParser');
+const { parseSession, parseTranscript, parseSubagentRun, parseAgentMessage } = require('../out/sessionParser');
 const { readSubagentRuns } = require('../out/sessionStore');
 
 const dir = path.join(__dirname, 'fixtures', 'claude-subagents', 'C--repo');
@@ -48,18 +48,23 @@ test('subagent runs appear in order, each after the tool call that started it, a
   const t = parseTranscript(read(ID), { sessionId: ID, subagents: runs });
   assert.deepEqual(
     t.map((e) => e.role),
-    ['user', 'assistant', 'subagent', 'assistant', 'subagent', 'assistant', 'peer'],
+    ['user', 'assistant', 'subagent', 'assistant', 'subagent', 'subagent', 'assistant', 'peer'],
   );
 
-  const [, first, checker, second, drafter, last, peer] = t;
+  const [, first, checker, second, drafter, checkerReply, last, peer] = t;
   assert.equal(first.parts.at(-1).id, 'toolu_A', 'the named run follows its call');
+  // The checker ran in the background: its launch shows who and what, and its reply comes where it arrived.
   assert.deepEqual(checker.subagent, {
     name: 'release-checker',
     description: 'Check release 1.2.0',
     prompt: 'Check that release 1.2.0 is ready to ship and report back.',
     toolUseId: 'toolu_A',
+    background: true,
   });
-  assert.equal(reply(checker), 'Release 1.2.0 is ready to ship.\n\n- Tests: 88 of 88 pass.');
+  assert.deepEqual(checker.parts, [], 'the reply is not shown at the launch as well');
+  assert.deepEqual(checkerReply.subagent, { name: 'release-checker', description: 'Check release 1.2.0', handback: true, toolUseId: 'toolu_A' });
+  assert.equal(reply(checkerReply), 'Release 1.2.0 is ready to ship.\n\n- Tests: 88 of 88 pass.');
+  assert.equal(checkerReply.timestamp, '2026-11-20T10:02:00.000Z');
 
   assert.equal(second.parts[0].text, 'While that runs, a one-off agent drafts the notes.');
   assert.equal(second.parts[1].id, 'toolu_B');
@@ -79,13 +84,19 @@ test("another session's subagent logs never show in this session's transcript", 
   const others = await readSubagentRuns(logOf(OTHER), OTHER);
   assert.equal(others.length, 1);
   const t = parseTranscript(read(ID), { sessionId: ID, subagents: others });
-  assert.equal(t.filter((e) => e.role === 'subagent').length, 0);
+  // What this session's own log says still shows: the background launch (from its call) and the reply it received.
+  // Nothing comes from the other session's run.
+  const shown = t.filter((e) => e.role === 'subagent');
+  assert.deepEqual(shown.map((e) => e.subagent.toolUseId), ['toolu_A', 'toolu_A']);
   assert.ok(!JSON.stringify(t).includes('OTHER SESSION REPLY'));
+  assert.ok(!JSON.stringify(shown).includes('Notes for 1.2.0'), 'the foreground run has no block without its log');
 
   // The foreign log sitting in this session's folder, with a meta file naming this session's call, on its own.
   const foreign = (await readSubagentRuns(logOf(ID), ID)).filter((r) => r.agentType === 'intruder');
   assert.equal(foreign.length, 1);
-  assert.equal(parseTranscript(read(ID), { sessionId: ID, subagents: foreign }).filter((e) => e.role === 'subagent').length, 0);
+  const withForeign = parseTranscript(read(ID), { sessionId: ID, subagents: foreign }).filter((e) => e.role === 'subagent');
+  assert.ok(!JSON.stringify(withForeign).includes('FOREIGN REPLY'));
+  assert.ok(withForeign.every((e) => e.subagent.name !== 'intruder' && e.subagent.description !== "Not this session's"));
 
   // And session 2 shows its own run.
   const own = parseTranscript(read(OTHER), { sessionId: OTHER, subagents: others }).filter((e) => e.role === 'subagent');
@@ -129,4 +140,127 @@ test("a subagent's reply is searchable, but not one from another session", () =>
   assert.match(s.searchText, /88 of 88 pass/);
   assert.match(s.searchText, /Faster search/);
   assert.doesNotMatch(s.searchText, /FOREIGN REPLY/);
+});
+
+// Background runs, trimmed from a real Claude Code 2.1.332 session: replies arrive later as <agent-message> records.
+const BG = '9b9b9b9b-1111-4222-8333-944455556666';
+
+test("a background run's reply shows where it reached the main session, labelled with its agent", async () => {
+  const runs = await readSubagentRuns(logOf(BG), BG);
+  const t = parseTranscript(read(BG), { sessionId: BG, subagents: runs });
+  const kind = (e) =>
+    e.role !== 'subagent' ? e.role : `${e.subagent.handback ? 'reply' : 'launch'}:${e.subagent.name ?? 'Subagent'}`;
+  assert.deepEqual(t.map(kind), [
+    'user',
+    'assistant',
+    'launch:ext-worker',
+    'assistant',
+    'launch:Subagent',
+    'assistant',
+    'launch:reviewer',
+    'assistant',
+    'reply:ext-worker',
+    'assistant',
+    'reply:Subagent',
+    'assistant',
+    'reply:ext-worker',
+    'reply:reviewer',
+    'reply:Subagent',
+    'assistant',
+  ]);
+
+  // Launches: name, description and prompt, no reply.
+  const launches = t.filter((e) => e.subagent?.background);
+  assert.equal(launches.length, 3);
+  assert.ok(launches.every((e) => e.parts.length === 0 && !e.subagent.handback));
+  assert.equal(launches[0].subagent.prompt, 'Your item is SA-1. Add a CI workflow that runs npm test.');
+  assert.equal(launches[2].subagent.prompt, 'Review PR #47.', "the reviewer's log is missing, so its block comes from the call");
+  assert.equal(launches[2].subagent.description, 'Review PR #47');
+
+  const replies = t.filter((e) => e.subagent?.handback);
+  // The worker handed back twice; each reply sits where it arrived.
+  const worker = replies.filter((e) => e.subagent.toolUseId === 'toolu_W');
+  assert.equal(worker.length, 2);
+  assert.match(reply(worker[0]), /^\*\*SA-1 is done up to the merge\.\*\*[\s\S]*\n- New workflow `\.github\/workflows\/test\.yml`\.\n {2}- Runs `npm ci`/, 'the report as written, nesting kept');
+  assert.equal(reply(worker[1]), 'Lint fixed in a second commit on PR #47; CI is green again.', 'read from the framed body when the record has no report text');
+  assert.equal(worker[0].subagent.description, 'Build SA-1 CI workflow');
+
+  // A one-off agent's reply delivered mid-turn (a queued command), and the reviewer whose log is missing.
+  const [, oneOff, , reviewer, stranger] = replies;
+  assert.equal(oneOff.subagent.name, undefined);
+  assert.equal(oneOff.subagent.description, 'Check the changelog');
+  assert.equal(reply(oneOff), 'The changelog has no entry for 0.4.7 yet.');
+  assert.equal(reviewer.subagent.name, 'reviewer');
+  assert.equal(reply(reviewer), 'Verdict on PR #47: approve. The workflow is read-only and cancels stale runs.');
+  // An agent this session didn't launch: still shown, since it was sent here, as "Subagent" with no description.
+  assert.deepEqual(stranger.subagent, { name: undefined, description: undefined, handback: true });
+  assert.equal(reply(stranger), 'Hello from an agent of another session: the shared fixture moved.');
+
+  const json = JSON.stringify(t);
+  assert.ok(!json.includes('task-notification'), 'task notifications stay hidden');
+  assert.ok(!json.includes('Subagent hand-back') && !json.includes('other Claude session'), 'the frame around a hand-back is not shown');
+});
+
+test('hand-backs show without any subagent logs, and a run that never handed back keeps its reply at the launch', async () => {
+  const t = parseTranscript(read(BG), { sessionId: BG });
+  const replies = t.filter((e) => e.subagent?.handback);
+  assert.deepEqual(replies.map((e) => e.subagent.name), ['ext-worker', undefined, 'ext-worker', 'reviewer', undefined]);
+  assert.ok(replies.every((e) => reply(e).length > 0));
+
+  // Without its <agent-message> records (the session ended first), the worker's reply from its log shows at the launch.
+  const text = read(BG)
+    .split('\n')
+    .filter((l) => !l.includes('agent-message from=\\"a5555555555555555'))
+    .join('\n');
+  const runs = await readSubagentRuns(logOf(BG), BG);
+  const t2 = parseTranscript(text, { sessionId: BG, subagents: runs });
+  const launch = t2.find((e) => e.subagent?.toolUseId === 'toolu_W');
+  assert.equal(reply(launch), 'Lint fixed in a second commit on PR #47; CI is green again.');
+  assert.equal(t2.filter((e) => e.subagent?.handback && e.subagent.toolUseId === 'toolu_W').length, 0);
+});
+
+test('a hand-back logged twice (as a record and as a queued command) shows once', () => {
+  const lines = read(BG).split('\n');
+  const queued = lines.find((l) => l.includes('"queued_command"'));
+  const t = parseTranscript([...lines, queued].join('\n'), { sessionId: BG });
+  assert.equal(t.filter((e) => e.subagent?.handback && reply(e).startsWith('The changelog')).length, 1);
+});
+
+test('parseAgentMessage reads both shapes and skips what it does not know', () => {
+  assert.equal(parseAgentMessage({ type: 'user', message: { content: 'plain text' } }), undefined);
+  assert.equal(parseAgentMessage({ type: 'attachment', attachment: { type: 'skill_listing', prompt: '<agent-message from="x">hi</agent-message>' } }), undefined);
+  assert.equal(parseAgentMessage(null), undefined);
+  assert.equal(parseAgentMessage({ type: 'user', message: { content: [{ type: 'text', text: '<agent-message from="x">hi</agent-message>' }] } }), undefined);
+  assert.equal(parseAgentMessage({ type: 'user', message: { content: '<agent-message from="a1">\n</agent-message>' } }), undefined, 'empty');
+  const m = parseAgentMessage({
+    type: 'user',
+    message: { content: '<agent-message from="a1">\n[Subagent hand-back] Frame. The report follows:\n  line one\n    nested\n</agent-message>' },
+  });
+  assert.deepEqual(m, { from: 'a1', name: undefined, text: 'line one\n  nested', key: 'a1\nline one\n  nested' });
+  assert.equal(parseAgentMessage({ type: 'user', message: { content: '<agent-message from="a2">cut off mid-wri' } }).text, 'cut off mid-wri');
+});
+
+test('hand-backs leave cost, request and token totals unchanged, and are searchable', async () => {
+  const text = read(BG);
+  const runs = await readSubagentRuns(logOf(BG), BG);
+  const withoutHandbacks = text
+    .split('\n')
+    .filter((l) => !l.includes('<agent-message'))
+    .join('\n');
+  const turns = (t) => t.filter((e) => e.turn).map((e) => e.turn);
+  assert.deepEqual(turns(parseTranscript(text, { sessionId: BG, subagents: runs })), turns(parseTranscript(withoutHandbacks)));
+  assert.equal(turns(parseTranscript(text))[0].requests, 7);
+
+  const s = parseSession(text, logOf(BG), 'C--repo', BG, subagentLogs(BG));
+  const bare = parseSession(withoutHandbacks, logOf(BG), 'C--repo', BG, subagentLogs(BG));
+  assert.deepEqual(s.usage, bare.usage);
+  assert.equal(s.promptCount, 1);
+  assert.equal(s.peerMessageCount, 0, 'a hand-back is not a message from another session');
+  assert.equal(s.assistantCount, bare.assistantCount);
+  assert.equal(s.title, 'Build and review SA-1');
+  for (const needle of ['Verdict on PR #47', 'shared fixture moved', 'no entry for 0.4.7', 'Whether to protect main']) {
+    assert.ok(s.searchText.includes(needle), needle);
+  }
+  // Without the subagent logs, the hand-backs alone still make the replies searchable.
+  assert.ok(parseSession(text, logOf(BG), 'C--repo', BG).searchText.includes('Verdict on PR #47'));
 });
