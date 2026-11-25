@@ -6,6 +6,21 @@ const Module = require('module');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const { pathToFileURL } = require('url');
+
+// The user's agents are read from CLAUDE_CONFIG_DIR/agents (else ~/.claude/agents). Every test here starts with that
+// pointed at an empty temp folder, so agents on this machine never add a step to a picker a test drives.
+const savedConfigDir = process.env.CLAUDE_CONFIG_DIR;
+const emptyConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-sessions-config-'));
+process.env.CLAUDE_CONFIG_DIR = emptyConfigDir;
+test.after(() => {
+  if (savedConfigDir === undefined) {
+    delete process.env.CLAUDE_CONFIG_DIR;
+  } else {
+    process.env.CLAUDE_CONFIG_DIR = savedConfigDir;
+  }
+  fs.rmSync(emptyConfigDir, { recursive: true, force: true });
+});
 
 function fakeVscode(state) {
   class EventEmitter {
@@ -86,6 +101,22 @@ function writeSession(dir, id, lines) {
   fs.writeFileSync(path.join(dir, `${id}.jsonl`), lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
 }
 
+/**
+ * Moves the session folder `from` recorded in fixtures copied under `dir` to `to`, an empty folder it creates, so a
+ * test never reads a real folder (C:\repo, a home folder) and its .claude/agents. Rewrites the raw and JSON forms.
+ */
+function relocate(dir, from, to) {
+  fs.mkdirSync(to, { recursive: true });
+  const json = (s) => JSON.stringify(s).slice(1, -1);
+  for (const name of fs.readdirSync(dir, { recursive: true })) {
+    const file = path.join(dir, name);
+    if (fs.statSync(file).isFile()) {
+      const text = fs.readFileSync(file, 'utf8');
+      fs.writeFileSync(file, text.split(json(from)).join(json(to)).split(from).join(to));
+    }
+  }
+}
+
 test('bundled extension activates, fills the sidebar, and renders a transcript', async () => {
   // EXT_DIR lets this run against an unpacked .vsix to check what actually ships.
   const extDir = process.env.EXT_DIR || path.join(__dirname, '..');
@@ -93,9 +124,11 @@ test('bundled extension activates, fills the sidebar, and renders a transcript',
   assert.ok(fs.existsSync(bundle), 'run `npm run bundle` first');
 
   const projectsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-sessions-'));
+  // The session's folder: an empty temp folder, so no project agents.
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-sessions-repo-'));
   const ts = new Date().toISOString();
   writeSession(path.join(projectsDir, 'C--repo'), 'aaaa-1111', [
-    { type: 'user', message: { content: 'Add a **dark mode** toggle' }, cwd: 'C:\\repo', gitBranch: 'main', timestamp: ts },
+    { type: 'user', message: { content: 'Add a **dark mode** toggle' }, cwd: repo, gitBranch: 'main', timestamp: ts },
     {
       type: 'assistant',
       message: {
@@ -193,9 +226,9 @@ test('bundled extension activates, fills the sidebar, and renders a transcript',
     assert.deepEqual(search('toggle -const').ids, []);
 
     // Right-clicking a file searches the sidebar for its name, quoted when it has spaces.
-    await state.commands['claudeSessions.searchForFile'](vscode.Uri.file(path.join('C:', 'repo', 'toggle.ts')));
+    await state.commands['claudeSessions.searchForFile'](vscode.Uri.file(path.join(repo, 'toggle.ts')));
     assert.deepEqual(posted.filter((m) => m.type === 'setQuery').pop(), { type: 'setQuery', query: 'toggle.ts' });
-    await state.commands['claudeSessions.searchForFile'](vscode.Uri.file(path.join('C:', 'repo', 'dark mode.md')));
+    await state.commands['claudeSessions.searchForFile'](vscode.Uri.file(path.join(repo, 'dark mode.md')));
     assert.equal(posted.filter((m) => m.type === 'setQuery').pop().query, '"dark mode.md"');
 
     // Opening from a search passes the words on to the transcript page.
@@ -219,7 +252,7 @@ test('bundled extension activates, fills the sidebar, and renders a transcript',
     // Transcripts share one preview tab until kept open (Keep open button, or keepOpen from a double-click).
     const open = (id, ...args) =>
       state.commands['claudeSessions.openTranscript']({ ...sessionA, id, title: `Session ${id}` }, ...args);
-    const sessionA = { id: 'aaaa-1111', filePath: path.join(projectsDir, 'C--repo', 'aaaa-1111.jsonl'), projectDir: 'C--repo', promptCount: 1 };
+    const sessionA = { id: 'aaaa-1111', filePath: path.join(projectsDir, 'C--repo', 'aaaa-1111.jsonl'), projectDir: 'C--repo', cwd: repo, promptCount: 1 };
     const keepButton = /data-cmd="keepOpen"/;
     assert.match(state.panels[0].webview.html, keepButton, 'first tab is the preview');
     await open('bbbb');
@@ -363,7 +396,7 @@ test('bundled extension activates, fills the sidebar, and renders a transcript',
     assert.equal(ws.scope, 'workspace');
     assert.deepEqual(ws.workspaceKeys, []);
     assert.equal(ws.overview.totals.sessions, 0);
-    vscode.workspace.workspaceFolders = [{ uri: vscode.Uri.file('C:\\repo') }];
+    vscode.workspace.workspaceFolders = [{ uri: vscode.Uri.file(repo) }];
     overview.onMessage({ type: 'setFilters', range: 30, scope: 'workspace' });
     assert.equal(state.panelPosts.filter((m) => m.type === 'state').pop().overview.totals.sessions, 1);
     vscode.workspace.workspaceFolders = [];
@@ -375,6 +408,7 @@ test('bundled extension activates, fills the sidebar, and renders a transcript',
   } finally {
     Module._load = originalLoad;
     fs.rmSync(projectsDir, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
     fs.rmSync(noSources, { recursive: true, force: true });
   }
 });
@@ -416,11 +450,13 @@ test('the --agent agent is a label on the sidebar card, the transcript header an
     const dir = path.join(projectsDir, 'C--work-demo');
     fs.mkdirSync(dir, { recursive: true });
     fs.copyFileSync(path.join(__dirname, 'fixtures', 'claude-code', 'agent-setting.jsonl'), path.join(dir, 'agent-0001.jsonl'));
+    const demo = path.join(root, 'demo');
+    relocate(dir, 'C:\\work\\demo', demo);
     // Renamed but started without --agent: agent-name holds its name, which is no agent.
     writeSession(dir, 'plain-0002', [
       { type: 'custom-title', customTitle: 'Tidy the docs' },
       { type: 'agent-name', agentName: 'Tidy the docs' },
-      { type: 'user', message: { content: 'Tidy the README' }, cwd: 'C:\\work\\demo', timestamp: '2026-11-19T09:00:00.000Z' },
+      { type: 'user', message: { content: 'Tidy the README' }, cwd: demo, timestamp: '2026-11-19T09:00:00.000Z' },
     ]);
     const state = { projectsDir, config: { copilotDir: noSources, vscodeUserDir: noSources }, providers: {}, commands: {}, panels: [], panelPosts: [], errors: [], terminals: [] };
     const { send, last } = await activateWithSidebar(state);
@@ -462,14 +498,21 @@ test('Copilot CLI and VS Code Chat sessions: source chips, filters, search, tran
   try {
     // One Claude session whose id is also a Copilot session's id, to check keys keep them apart.
     const shared = 'b380c8e3-1729-4e04-a560-1517aa38fb97';
+    const repo = path.join(root, 'repo');
+    fs.mkdirSync(repo);
     writeSession(path.join(projectsDir, 'C--repo'), shared, [
-      { type: 'user', message: { content: 'Fix the login race' }, cwd: 'C:\\repo', timestamp: new Date().toISOString() },
+      { type: 'user', message: { content: 'Fix the login race' }, cwd: repo, timestamp: new Date().toISOString() },
     ]);
     fs.cpSync(path.join(fixtures, 'copilot-cli'), path.join(copilotDir, 'session-state'), { recursive: true });
+    // The fixtures ran in a home folder and C:\Users\me\repo; here those are empty temp folders.
+    relocate(copilotDir, 'C:\\Users\\bisch', path.join(root, 'home'));
+    relocate(copilotDir, 'C:\\Users\\me\\repo', path.join(root, 'me-repo'));
     const chats = path.join(userDir, 'workspaceStorage', 'abc123', 'chatSessions');
     fs.mkdirSync(chats, { recursive: true });
     fs.copyFileSync(path.join(fixtures, 'vscode-chat', '63869299-99f3-491c-89c4-bb361f7147f7.jsonl'), path.join(chats, '63869299-99f3-491c-89c4-bb361f7147f7.jsonl'));
-    fs.writeFileSync(path.join(userDir, 'workspaceStorage', 'abc123', 'workspace.json'), JSON.stringify({ folder: 'file:///c%3A/work/site' }));
+    const site = path.join(root, 'work', 'site');
+    fs.mkdirSync(site, { recursive: true });
+    fs.writeFileSync(path.join(userDir, 'workspaceStorage', 'abc123', 'workspace.json'), JSON.stringify({ folder: pathToFileURL(site).href }));
     // An empty chat in an empty window: hidden like any empty session.
     const empty = path.join(userDir, 'globalStorage', 'emptyWindowChatSessions');
     fs.mkdirSync(empty, { recursive: true });
@@ -753,6 +796,7 @@ test('subagent runs render as their own collapsible speakers in the transcript',
   const projectsDir = path.join(root, 'claude');
   try {
     fs.cpSync(path.join(__dirname, 'fixtures', 'claude-subagents'), projectsDir, { recursive: true });
+    relocate(projectsDir, 'C:\\repo', path.join(root, 'repo'));
     const state = {
       projectsDir,
       config: { copilotDir: path.join(root, 'none'), vscodeUserDir: path.join(root, 'none') },
@@ -834,6 +878,7 @@ test("a subagent's full run opens from the transcript as a read-only transcript 
   const BG = '9b9b9b9b-1111-4222-8333-944455556666';
   try {
     fs.cpSync(path.join(__dirname, 'fixtures', 'claude-subagents'), projectsDir, { recursive: true });
+    relocate(projectsDir, 'C:\\repo', path.join(root, 'repo'));
     const state = {
       projectsDir,
       config: { copilotDir: path.join(root, 'none'), vscodeUserDir: path.join(root, 'none') },
