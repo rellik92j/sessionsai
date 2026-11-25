@@ -103,6 +103,7 @@ You'll find these on each card and at the top of each transcript. This is how th
 - **Resume** (▶) opens `claude --resume <id>` in a terminal tab beside your editor, in the session's project folder. If the session is already open, its terminal is focused instead.
 - **Continue in New Session** (⮕) starts a fresh session with a handoff of where the old one stopped. The handoff includes your last request, Claude's last reply, the files it edited and read, any open to-dos, the current `git status`, and the path to the old transcript. If you asked the old session to write a handoff (for example "save a handoff.md for this session", or a handoff skill), the new prompt opens with where it was saved, including any copies, and tells Claude to read it first. Claude is asked to summarize and wait for your instruction before changing anything. Use this when a session has grown too long to keep working in.
 - **Continue in New Session with Tool or Model…** does the same, but first asks where the new session runs: the Claude Code CLI, Claude Code Chat (the Claude Code extension's chat tab, offered when that extension is installed), GitHub Copilot CLI or VS Code Chat. For a CLI it then asks which model and effort level to use, instead of that CLI's settings. The two chats open with the handoff in the input box, so you can pick a model there and press Enter. This also lets you move work between tools, for example from a Copilot chat to Claude Code. Find it in a card's right-click menu, or click the ⌄ next to **Continue in new session** in a transcript.
+- **Pick an agent:** a new Claude Code CLI session (from **Continue in New Session with Tool or Model…** or **Send with a model and effort…**) also asks which agent to start as: none, one from the session folder's `.claude/agents/` or your `~/.claude/agents/`, or any name you type. It is passed as `claude --agent <name>`. Resuming doesn't ask, because Claude Code ignores `--agent` with `--resume`.
 - **Open in Claude Code Chat** reopens the session in the chat panel of the official Claude Code extension, if you have it installed.
 
 #### Reply from the transcript
@@ -222,8 +223,9 @@ How the code is laid out:
 | `src/insights.ts` | What a session did, for the transcript's Session details panel |
 | `src/overview.ts`, `src/overviewPanel.ts`, `media/overview.*` | The overview tab: `overview.ts` builds the numbers, the panel picks the projects |
 | `src/handoff.ts` | The prompt that starts Continue in New Session |
+| `src/agents.ts` | The Claude Code agents a new session can start as, and the `claude` arguments that launch it |
 
-Files without VS Code imports (the three parsers, `usage`, `query`, `overview`, `handoff`, `insights`, `markdown`, `format`) are unit tested directly from `out/`; `test/activation.test.js` loads the bundled extension against a fake VS Code API and drives the webviews' messages.
+Files without VS Code imports (the three parsers, `usage`, `query`, `overview`, `handoff`, `agents`, `insights`, `markdown`, `format`) are unit tested directly from `out/`; `test/activation.test.js` loads the bundled extension against a fake VS Code API and drives the webviews' messages.
 
 Every pull request to `main`, and every push to it, runs `npm test` on Windows in GitHub Actions (`.github/workflows/test.yml`), then checks the file list `vsce` would package and builds a throwaway `.vsix` to validate the manifest.
 
