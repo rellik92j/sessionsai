@@ -4,6 +4,11 @@ All notable changes to SessionsAI (published as Claude Sessions before 0.4.0) ar
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 Numbers in parentheses are the pull requests that made each change. Each version heading links to its GitHub release, which has the release notes and the `.vsix` for installing that version with **Install from VSIX…**.
 
+## [0.4.9](https://github.com/rellik92j/sessionsai/releases/tag/v0.4.9) - 2026-11-25
+
+### Added
+- **Start a new Claude Code session from SessionsAI.** Run **New Claude Code Session…** from the command palette, or click **+** at the top of the sidebar. Pick the folder (a workspace folder, or **Choose a folder…** for any other), then the model, effort and agent, and `claude` opens in a terminal in that folder with your choices as `--model`, `--effort` and `--agent`. Leave a step on its default and that option is left out; cancel any step and nothing opens. (#56)
+
 ## [0.4.8](https://github.com/rellik92j/sessionsai/releases/tag/v0.4.8) - 2026-11-24
 
 ### Added
