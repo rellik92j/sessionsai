@@ -225,6 +225,8 @@ How the code is laid out:
 
 Files without VS Code imports (the three parsers, `usage`, `query`, `overview`, `handoff`, `insights`, `markdown`, `format`) are unit tested directly from `out/`; `test/activation.test.js` loads the bundled extension against a fake VS Code API and drives the webviews' messages.
 
+Every pull request to `main`, and every push to it, runs `npm test` on Windows in GitHub Actions (`.github/workflows/test.yml`), then checks the file list `vsce` would package and builds a throwaway `.vsix` to validate the manifest.
+
 ## License
 
 [MIT](LICENSE)

@@ -1,0 +1,53 @@
+# Every pull request to main, and every push to main: install, build, run the tests, and check what would ship.
+name: Test
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A new push to a pull request cancels the run still going for the old one; runs on main always finish.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    # Windows, like the machine the extension is developed on: some handoff tests use Windows paths.
+    runs-on: windows-latest
+    # Git Bash rather than PowerShell; naming bash explicitly also adds pipefail.
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # npm runs scripts with cmd on Windows, so `node --test test/*.test.js` needs Node 22+ to expand the glob.
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      # Compiles, bundles dist/extension.js, then runs test/*.test.js (including activation.test.js against the
+      # bundle). realData.test.js skips itself here: the runner has no ~/.claude/projects.
+      - run: npm test
+
+      - name: Check what the .vsix would contain
+        run: |
+          npx vsce ls | tee "$RUNNER_TEMP/files.txt"
+          for f in package.json README.md LICENSE dist/extension.js node_modules/@vscode/codicons/dist/codicon.ttf; do
+            grep -qxF "$f" "$RUNNER_TEMP/files.txt" || { echo "::error::missing from the package: $f"; exit 1; }
+          done
+          if grep -E '^(src|test|scripts|out|docs|\.claude|\.github|\.vscode)/|\.map$|\.ts$|\.vsix$' "$RUNNER_TEMP/files.txt"; then
+            echo "::error::files above should not ship; see .vscodeignore"
+            exit 1
+          fi
+
+      # Full manifest validation; the .vsix goes to the runner's temp folder and is not kept.
+      - name: Package
+        run: npx vsce package --out "$RUNNER_TEMP/check.vsix"
