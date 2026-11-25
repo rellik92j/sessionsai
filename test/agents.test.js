@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const os = require('node:os');
 const path = require('node:path');
 const fs = require('node:fs');
-const { parseAgentFrontmatter, listAgents, claudeOverrideArgs, claudeNewSessionArgs, claudeResumeArgs } = require('../out/agents');
+const { parseAgentFrontmatter, listAgents, userAgentsDir, claudeOverrideArgs, claudeNewSessionArgs, claudeResumeArgs } = require('../out/agents');
 
 const fixtures = path.join(__dirname, 'fixtures', 'claude-agents');
 
@@ -88,6 +88,13 @@ test('listAgents: project agents first, then the user\'s; bad files skipped; a p
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('userAgentsDir: agents under CLAUDE_CONFIG_DIR, else ~/.claude/agents', () => {
+  const home = path.join('C:', 'Users', 'me');
+  assert.equal(userAgentsDir({}, home), path.join(home, '.claude', 'agents'));
+  assert.equal(userAgentsDir({ CLAUDE_CONFIG_DIR: '' }, home), path.join(home, '.claude', 'agents'));
+  assert.equal(userAgentsDir({ CLAUDE_CONFIG_DIR: path.join('D:', 'claude') }, home), path.join('D:', 'claude', 'agents'));
 });
 
 test('Claude Code arguments with and without an agent', () => {

@@ -4,7 +4,7 @@ import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { AgentInfo, claudeNewSessionArgs, claudeResumeArgs, listAgents, Overrides } from './agents';
+import { AgentInfo, claudeNewSessionArgs, claudeResumeArgs, listAgents, Overrides, userAgentsDir } from './agents';
 import { formatRelative, isInside } from './format';
 import { buildHandoff, collectHandoffFacts, collectTranscriptFacts } from './handoff';
 import { GroupBy, projectName, projectPath, SessionModel, workspaceFolderPaths } from './model';
@@ -393,7 +393,7 @@ export function activate(context: vscode.ExtensionContext): void {
     let overrides: Overrides = {};
     if (pickModel && target !== 'vscode-chat' && target !== 'claude-chat') {
       // Claude Code ignores --agent when resuming, so the agent step is only for a new session.
-      const picked = await pickOverrides(session, target, 'Send', target === 'claude' && !resumes ? await agentsFor(session) : []);
+      const picked = await pickOverrides(session, target, 'Send', target === 'claude' && !resumes ? await agentsFor(session) : undefined);
       if (!picked) {
         return false;
       }
@@ -716,8 +716,8 @@ const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 const IN_INPUT_BOX = 'with the handoff in the input box, to send when you are ready';
 
 /**
- * Asks which tool the new session runs in, then (for a CLI) its model and effort, and for the Claude Code CLI its agent
- * when the session's folder or the user has any. Undefined when any step is cancelled.
+ * Asks which tool the new session runs in, then (for a CLI) its model and effort, and for the Claude Code CLI its agent.
+ * Undefined when any step is cancelled.
  * The chats have their own model pickers, so they take no overrides. The Claude Code chat is offered, next to its CLI,
  * when the Claude Code extension is installed.
  */
@@ -745,9 +745,9 @@ async function pickContinuation(session: SessionInfo): Promise<{ target: Continu
       },
     ];
   });
-  // Read before the first step so its count is right for the Claude Code CLI, the usual target when agents exist.
-  const agents = await agentsFor(session);
-  const tool = await vscode.window.showQuickPick(tools, { title: `${title} (1/${agents.length ? 4 : 3}): tool`, placeHolder: 'Where the new session runs' });
+  // How many steps follow depends on the tool (none for the chats, two for Copilot CLI, three for Claude Code CLI), so
+  // this one has no count; the steps after it count from 1 once the tool is known.
+  const tool = await vscode.window.showQuickPick(tools, { title: `${title}: tool`, placeHolder: 'Where the new session runs' });
   if (!tool?.value) {
     return undefined;
   }
@@ -755,28 +755,30 @@ async function pickContinuation(session: SessionInfo): Promise<{ target: Continu
   if (target === 'vscode-chat' || target === 'claude-chat') {
     return { target, overrides: {} };
   }
-  const overrides = await pickOverrides(session, target, title, target === 'claude' ? agents : []);
+  const overrides = await pickOverrides(session, target, title, target === 'claude' ? await agentsFor(session) : undefined);
   return overrides && { target, overrides };
 }
 
 /**
- * The Claude Code agents for a session's folder and the user's agents folder, which sits next to the projects folder
- * (~/.claude/agents by default, or under CLAUDE_CONFIG_DIR). Empty when there are none or neither folder can be read.
+ * The Claude Code agents for a session's folder and the user's agents folder (`agents` under CLAUDE_CONFIG_DIR, or
+ * ~/.claude/agents). Empty when there are none or neither folder can be read.
  */
 async function agentsFor(session: SessionInfo): Promise<AgentInfo[]> {
   try {
-    return await listAgents(projectPath(session) || undefined, path.join(path.dirname(projectsDir()), 'agents'));
+    return await listAgents(projectPath(session) || undefined, userAgentsDir());
   } catch {
     return [];
   }
 }
 
+const OTHER_AGENT = '\0other-agent';
+
 /**
- * Asks for the model, then the effort, then (when `agents` is not empty) the Claude Code agent of a CLI session.
- * Undefined when any step is cancelled.
+ * Asks for the model, then the effort, then, when `agents` is given (a new Claude Code CLI session), the agent: none,
+ * one of `agents`, or a name typed in. Undefined when any step is cancelled.
  */
-async function pickOverrides(session: SessionInfo, target: SessionSource, title: string, agents: AgentInfo[] = []): Promise<Overrides | undefined> {
-  const steps = agents.length ? 4 : 3;
+async function pickOverrides(session: SessionInfo, target: SessionSource, title: string, agents?: AgentInfo[]): Promise<Overrides | undefined> {
+  const steps = agents ? 3 : 2;
   const usedHere = 'used by this session';
   const claude = target === 'claude';
   const settings = claude ? 'whatever your Claude Code settings say' : 'whatever your Copilot CLI settings say';
@@ -795,7 +797,7 @@ async function pickOverrides(session: SessionInfo, target: SessionSource, title:
     ...(session.model && sourceOf(session) === target ? [{ label: session.model, description: usedHere, value: session.model }] : []),
     { label: '$(edit) Other model…', description: 'enter a model name', value: OTHER_MODEL },
   ];
-  const model = await vscode.window.showQuickPick(models, { title: `${title} (2/${steps}): model`, placeHolder: 'Model for the new session' });
+  const model = await vscode.window.showQuickPick(models, { title: `${title} (1/${steps}): model`, placeHolder: 'Model for the new session' });
   if (!model) {
     return undefined;
   }
@@ -817,14 +819,24 @@ async function pickOverrides(session: SessionInfo, target: SessionSource, title:
     { label: '$(settings-gear) Default', description: settings },
     ...EFFORTS.map((e) => ({ label: e, description: e === sessionEffort ? usedHere : undefined, value: e })),
   ];
-  const effort = await vscode.window.showQuickPick(efforts, { title: `${title} (3/${steps}): effort`, placeHolder: 'Effort level for the new session' });
+  const effort = await vscode.window.showQuickPick(efforts, { title: `${title} (2/${steps}): effort`, placeHolder: 'Effort level for the new session' });
   if (!effort) {
     return undefined;
   }
-  if (!agents.length) {
+  if (!agents) {
     return { model: modelValue, effort: effort.value };
   }
-  const agentPicks: ValuePick[] = [
+  const agent = await pickAgent(agents, `${title} (3/${steps}): agent`, settings);
+  return agent && { model: modelValue, effort: effort.value, agent: agent.name };
+}
+
+/**
+ * The agent step: Default (no agent), the agents found, and a typed name. `{ name: undefined }` is the default;
+ * undefined is cancelled. An empty or cancelled name box goes back to the list. A name that isn't an agent is left
+ * to Claude Code, which stops with "--agent 'x' not found" and lists the ones it has.
+ */
+async function pickAgent(agents: AgentInfo[], title: string, settings: string): Promise<{ name?: string } | undefined> {
+  const picks: ValuePick[] = [
     { label: '$(settings-gear) Default (no agent)', description: settings },
     ...agents.map((a) => ({
       label: `$(${a.scope === 'project' ? 'folder' : 'account'}) ${a.name}`,
@@ -832,17 +844,26 @@ async function pickOverrides(session: SessionInfo, target: SessionSource, title:
       detail: a.description && (a.description.length > 200 ? `${a.description.slice(0, 199)}…` : a.description),
       value: a.name,
     })),
+    { label: '$(edit) Enter an agent name…', description: 'any agent Claude Code knows, as for claude --agent', value: OTHER_AGENT },
   ];
-  const agent = await vscode.window.showQuickPick(agentPicks, {
-    title: `${title} (4/${steps}): agent`,
-    placeHolder: 'Claude Code agent for the new session (claude --agent)',
-    matchOnDescription: true,
-    matchOnDetail: true,
-  });
-  if (!agent) {
-    return undefined;
+  for (;;) {
+    const picked = await vscode.window.showQuickPick(picks, {
+      title,
+      placeHolder: agents.length ? 'Claude Code agent for the new session (claude --agent)' : 'No agents found in this project or ~/.claude/agents',
+      matchOnDescription: true,
+      matchOnDetail: true,
+    });
+    if (!picked) {
+      return undefined;
+    }
+    if (picked.value !== OTHER_AGENT) {
+      return { name: picked.value };
+    }
+    const typed = (await vscode.window.showInputBox({ title, prompt: 'Agent name, as for claude --agent', placeHolder: 'code-reviewer' }))?.trim();
+    if (typed) {
+      return { name: typed };
+    }
   }
-  return { model: modelValue, effort: effort.value, agent: agent.value };
 }
 
 interface SessionPick extends vscode.QuickPickItem {

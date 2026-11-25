@@ -70,7 +70,8 @@ function fakeVscode(state) {
       setStatusBarMessage() {},
       // Tests answer quick picks by setting state.pick to a function of the items and options.
       showQuickPick: async (items, options) => state.pick?.(items, options),
-      showInputBox: async () => undefined,
+      // Tests answer input boxes the same way, with state.input.
+      showInputBox: async (options) => state.input?.(options),
     },
     commands: {
       registerCommand: (id, f) => ((state.commands[id] = f), disposable),
@@ -260,7 +261,7 @@ test('bundled extension activates, fills the sidebar, and renders a transcript',
     assert.match(handoff, /wait for my instruction\.$/);
     assert.deepEqual(state.errors, []);
 
-    // With model: two quick picks, then --model and --effort ahead of the handoff.
+    // With model: tool, model, effort and agent picks (Default agent), then --model and --effort ahead of the handoff.
     const titles = [];
     state.pick = (items, options) => {
       titles.push(options.title);
@@ -269,7 +270,7 @@ test('bundled extension activates, fills the sidebar, and renders a transcript',
     await state.panels[0].onMessage({ command: 'continueInNewSessionWithModel' });
     await new Promise((r) => setTimeout(r, 300));
     const tm = state.terminals.pop();
-    assert.equal(titles.length, 3, 'tool, model, effort');
+    assert.equal(titles.length, 4, 'tool, model, effort, agent');
     assert.deepEqual(tm.shellArgs.slice(0, 6), ['--model', 'sonnet', '--effort', 'xhigh', '--name', 'Continued: Session bbbb']);
     // Default for both adds no flags; cancelling starts nothing.
     state.pick = (items) => items[0];
@@ -573,19 +574,24 @@ test('Copilot CLI and VS Code Chat sessions: source chips, filters, search, tran
   }
 });
 
-test('Claude Code agents: offered after effort for a new Claude Code CLI session, passed as --agent', async () => {
+test('Claude Code agents: an agent step after effort for a new Claude Code CLI session, passed as --agent', async () => {
   const fixtures = path.join(__dirname, 'fixtures', 'claude-agents');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-sessions-agents-'));
-  // The user's agents folder sits next to the projects folder, as ~/.claude/agents does next to ~/.claude/projects.
-  const projectsDir = path.join(root, 'claude', 'projects');
+  const projectsDir = path.join(root, 'projects');
   const repo = path.join(root, 'repo');
+  const bare = path.join(root, 'bare');
+  // The user's agents are read from CLAUDE_CONFIG_DIR/agents, so this keeps the test away from ~/.claude/agents.
+  const configDir = path.join(root, 'config');
+  const savedConfigDir = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = configDir;
   try {
     fs.cpSync(path.join(fixtures, 'project'), path.join(repo, '.claude', 'agents'), { recursive: true });
-    fs.cpSync(path.join(fixtures, 'user'), path.join(root, 'claude', 'agents'), { recursive: true });
+    fs.cpSync(path.join(fixtures, 'user'), path.join(configDir, 'agents'), { recursive: true });
+    fs.mkdirSync(bare);
     const id = 'aaaa-2222';
-    writeSession(path.join(projectsDir, 'repo'), id, [
-      { type: 'user', message: { content: 'Plan the release' }, cwd: repo, timestamp: new Date().toISOString() },
-    ]);
+    const ts = new Date().toISOString();
+    writeSession(path.join(projectsDir, 'repo'), id, [{ type: 'user', message: { content: 'Plan the release' }, cwd: repo, timestamp: ts }]);
+    writeSession(path.join(projectsDir, 'bare'), 'bbbb-3333', [{ type: 'user', message: { content: 'No agents here' }, cwd: bare, timestamp: ts }]);
     const state = {
       projectsDir,
       config: { copilotDir: path.join(root, 'none'), vscodeUserDir: path.join(root, 'none') },
@@ -599,17 +605,20 @@ test('Claude Code agents: offered after effort for a new Claude Code CLI session
     };
     await activateWithSidebar(state);
     const session = { sessionKey: `claude:${id}` };
+    const continueWithModel = (s = session) => state.commands['claudeSessions.continueInNewSessionWithModel'](s);
+    const OTHER = '\0other-agent';
 
-    // Tool, model, effort, agent: the agent step lists Default first, then the project's agents, then the user's.
+    // Tool, then model, effort and agent counted from 1: the agent step lists Default first, the project's agents,
+    // the user's, and a typed name last.
     let shown = [];
     const answer = (values) => (items, options) => (shown.push({ items, title: options.title }), items.find((i) => i.value === values[shown.length - 1]));
     state.pick = answer(['claude', undefined, 'high', 'ship-it']);
-    await state.commands['claudeSessions.continueInNewSessionWithModel'](session);
+    await continueWithModel();
     assert.deepEqual(shown.map((s) => s.title), [
-      'Continue in New Session (1/4): tool',
-      'Continue in New Session (2/4): model',
-      'Continue in New Session (3/4): effort',
-      'Continue in New Session (4/4): agent',
+      'Continue in New Session: tool',
+      'Continue in New Session (1/3): model',
+      'Continue in New Session (2/3): effort',
+      'Continue in New Session (3/3): agent',
     ]);
     const agentStep = shown[3].items;
     assert.match(agentStep[0].label, /Default \(no agent\)$/);
@@ -618,7 +627,9 @@ test('Claude Code agents: offered after effort for a new Claude Code CLI session
       ['planner', 'project agent'],
       ['ship-it', 'project agent'],
       ['reviewer', 'user agent'],
+      [OTHER, 'any agent Claude Code knows, as for claude --agent'],
     ]);
+    assert.match(agentStep[4].label, /Enter an agent name…$/);
     assert.match(agentStep[3].detail, /^Reviews a diff/);
     let t = state.terminals.pop();
     assert.equal(t.shellPath, 'claude');
@@ -627,43 +638,67 @@ test('Claude Code agents: offered after effort for a new Claude Code CLI session
     // Default (no agent) adds no flag.
     shown = [];
     state.pick = answer(['claude', undefined, undefined, undefined]);
-    await state.commands['claudeSessions.continueInNewSessionWithModel'](session);
+    await continueWithModel();
     t = state.terminals.pop();
     assert.equal(shown.length, 4);
     assert.deepEqual(t.shellArgs.slice(0, 2), ['--name', 'Continued: Plan the release']);
 
+    // A typed name, trimmed. An empty name, or Esc in the name box, goes back to the list rather than cancelling.
+    shown = [];
+    state.pick = answer(['claude', undefined, undefined, OTHER, OTHER, OTHER]);
+    const typed = ['   ', undefined, '  plugin:helper  '];
+    state.input = () => typed.shift();
+    await continueWithModel();
+    assert.equal(shown.length, 6, 'the agent list came back twice');
+    assert.deepEqual(state.terminals.pop().shellArgs.slice(0, 4), ['--agent', 'plugin:helper', '--name', 'Continued: Plan the release']);
+    state.input = undefined;
+
     // Cancelling the agent step starts nothing.
     shown = [];
     state.pick = (items, options) => (shown.push(options.title), shown.length < 4 ? items.find((i) => i.value === 'claude') ?? items[0] : undefined);
-    await state.commands['claudeSessions.continueInNewSessionWithModel'](session);
+    await continueWithModel();
     assert.equal(shown.length, 4);
     assert.equal(state.terminals.length, 0);
 
-    // Copilot CLI as the target: no agent step (its custom agents are a different thing).
+    // No agents in the session's folder or the user's: the step still shows, with Default and a typed name.
+    fs.rmSync(path.join(configDir, 'agents'), { recursive: true });
+    shown = [];
+    state.pick = answer(['claude', undefined, undefined, undefined]);
+    await continueWithModel({ sessionKey: 'claude:bbbb-3333' });
+    assert.equal(shown[3].title, 'Continue in New Session (3/3): agent');
+    assert.deepEqual(shown[3].items.map((i) => i.value), [undefined, OTHER]);
+    assert.deepEqual(state.terminals.pop().shellArgs.slice(0, 2), ['--name', 'Continued: No agents here']);
+
+    // Copilot CLI as the target: no agent step (its custom agents are a different thing), and the count says so.
     shown = [];
     state.pick = answer(['copilot-cli', undefined, undefined, 'planner']);
-    await state.commands['claudeSessions.continueInNewSessionWithModel'](session);
-    assert.equal(shown.length, 3);
+    await continueWithModel();
+    assert.deepEqual(shown.slice(1).map((s) => s.title), ['Continue in New Session (1/2): model', 'Continue in New Session (2/2): effort']);
     assert.doesNotMatch(state.terminals.pop().sent, /--agent/);
 
     // Send with a model into a new Claude Code session: model, effort, agent.
     await state.commands['claudeSessions.openTranscript'](session);
     const send = async (mode) => {
       shown = [];
-      state.pick = answer([undefined, undefined, 'reviewer']);
+      state.pick = answer([undefined, undefined, 'ship-it']);
       await state.panels[0].onMessage({ command: 'send', text: 'Next', target: 'claude', mode, pickModel: true });
       await new Promise((r) => setTimeout(r, 300));
       return state.terminals.pop();
     };
     t = await send('handoff');
-    assert.equal(shown.length, 3);
-    assert.deepEqual(t.shellArgs.slice(0, 4), ['--agent', 'reviewer', '--name', 'Continued: Plan the release']);
+    assert.deepEqual(shown.map((s) => s.title), ['Send (1/3): model', 'Send (2/3): effort', 'Send (3/3): agent']);
+    assert.deepEqual(t.shellArgs.slice(0, 4), ['--agent', 'ship-it', '--name', 'Continued: Plan the release']);
     // Resuming this same session: Claude Code ignores --agent with --resume, so there is no agent step.
     t = await send('same');
-    assert.equal(shown.length, 2);
+    assert.deepEqual(shown.map((s) => s.title), ['Send (1/2): model', 'Send (2/2): effort']);
     assert.deepEqual(t.shellArgs, ['--resume', id, 'Next']);
     assert.deepEqual(state.errors, []);
   } finally {
+    if (savedConfigDir === undefined) {
+      delete process.env.CLAUDE_CONFIG_DIR;
+    } else {
+      process.env.CLAUDE_CONFIG_DIR = savedConfigDir;
+    }
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

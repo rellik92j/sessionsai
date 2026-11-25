@@ -1,5 +1,11 @@
 import * as fs from 'fs/promises';
+import * as os from 'os';
 import * as path from 'path';
+
+/** The user's agents folder, where Claude Code looks: `agents` under CLAUDE_CONFIG_DIR, or ~/.claude/agents. */
+export function userAgentsDir(env: NodeJS.ProcessEnv = process.env, home = os.homedir()): string {
+  return path.join(env.CLAUDE_CONFIG_DIR || path.join(home, '.claude'), 'agents');
+}
 
 /**
  * Claude Code subagents a session can be started as (`claude --agent <name>`). They are Markdown files with YAML
