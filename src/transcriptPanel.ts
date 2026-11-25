@@ -8,6 +8,7 @@ import { collectInsights, editsAsDiff, FileTouch, SessionInsights, TodoStatus } 
 import { renderMarkdown } from './markdown';
 import { projectName, projectPath, SessionModel } from './model';
 import { SessionInfo, TranscriptEntry, TranscriptPart, TurnStats } from './sessionParser';
+import { readSubagentRuns } from './sessionStore';
 import { parseTranscriptFor } from './transcripts';
 import { canResumeIn, ContinueTarget, isClaude, NO_FOLDER, sessionKey, SessionSource, SourceInfo, SOURCES, sourceOf } from './sources';
 import { UsageSummary } from './usage';
@@ -220,7 +221,8 @@ export class TranscriptPanels {
         : new vscode.ThemeIcon(isClaude(session) ? 'comment-discussion' : SOURCES[sourceOf(session)].icon);
     let entries: TranscriptEntry[];
     try {
-      entries = parseTranscriptFor(session, await fs.readFile(session.filePath, 'utf8'));
+      const subagents = isClaude(session) ? await readSubagentRuns(session.filePath, session.id) : [];
+      entries = parseTranscriptFor(session, await fs.readFile(session.filePath, 'utf8'), subagents);
     } catch (err) {
       vscode.window.showErrorMessage(`Could not read session log: ${(err as Error).message}`);
       return;
@@ -589,7 +591,46 @@ function turnChip(t: TurnStats | undefined): string {
   return `<span class="turn-chip" title="${escapeHtml(title)}"><i class="codicon codicon-credit-card"></i>${formatUsd(t.cost)}${took ? ` · ${took}` : ''}</span>`;
 }
 
+/** A reply longer than this starts collapsed, so a long report doesn't push the main conversation away. */
+const SUBAGENT_OPEN_CHARS = 1200;
+const SUBAGENT_OPEN_LINES = 16;
+/** A prompt up to this long is shown open; longer ones (most briefs) are a click away. */
+const SUBAGENT_PROMPT_OPEN_CHARS = 300;
+
+/** A subagent's run: its own speaker, with the prompt it was given and the reply it sent back. */
+function renderSubagent(e: TranscriptEntry): string {
+  const s = e.subagent ?? {};
+  const name = s.name ?? 'Subagent';
+  const reply = e.parts.map((p) => (p.kind === 'text' ? p.text : '')).join('\n\n');
+  const open = reply.length <= SUBAGENT_OPEN_CHARS && lineCount(reply) <= SUBAGENT_OPEN_LINES;
+  const preview = reply.replace(/\s+/g, ' ').trim().slice(0, 160);
+  const prompt = s.prompt
+    ? `<details class="subagent-prompt"${s.prompt.length <= SUBAGENT_PROMPT_OPEN_CHARS ? ' open' : ''}><summary><i class="codicon codicon-arrow-right"></i>Prompt <span>${lineCount(s.prompt)} lines</span></summary><div class="md">${renderMarkdown(s.prompt)}</div></details>`
+    : '';
+  const body = reply
+    ? `<div class="subagent-reply"><div class="pane-label">Reply</div><div class="md">${renderMarkdown(reply)}</div></div>`
+    : '<div class="subagent-reply none">No reply recorded.</div>';
+  return `
+    <div class="msg subagent">
+      <div class="avatar subagent-avatar" title="${escapeHtml(name)}"><i class="codicon codicon-hubot"></i></div>
+      <div class="msg-main">
+        <div class="msg-meta"><strong>${escapeHtml(name)}</strong>${s.name ? '<span class="pill subagent-pill">subagent</span>' : ''}${time(e.timestamp)}</div>
+        <details class="subagent-card"${open ? ' open' : ''}>
+          <summary>
+            <i class="codicon codicon-chevron-right"></i>
+            <span class="subagent-desc">${escapeHtml(s.description ?? 'Prompt and reply')}</span>
+            <span class="subagent-preview">${escapeHtml(preview)}</span>
+          </summary>
+          ${prompt}${body}
+        </details>
+      </div>
+    </div>`;
+}
+
 function renderEntry(e: TranscriptEntry, showThinking: boolean, source: SourceInfo, index: number): string {
+  if (e.role === 'subagent') {
+    return renderSubagent(e);
+  }
   if (e.role === 'system') {
     const text = e.parts.map((p) => ('text' in p ? p.text : '')).join(' ');
     return `<div class="divider system"><span><i class="codicon codicon-fold"></i>${escapeHtml(text)}</span></div>`;

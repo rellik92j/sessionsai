@@ -420,7 +420,10 @@
     current = (current + delta + hits.length) % hits.length;
     const mark = hits[current];
     mark.classList.add('current');
-    mark.closest('details:not([open])')?.setAttribute('open', '');
+    // A match in a subagent's prompt sits in two collapsed blocks; open every one around it.
+    for (let d = mark.closest('details:not([open])'); d; d = d.parentElement?.closest('details:not([open])')) {
+      d.setAttribute('open', '');
+    }
     mark.scrollIntoView({ block: 'center' });
     findBar.querySelector('.find-count').textContent = `${current + 1} of ${hits.length}`;
   }

@@ -83,11 +83,31 @@ export interface TurnStats {
 }
 
 export interface TranscriptEntry {
-  role: 'user' | 'assistant' | 'tool' | 'system' | 'peer';
+  role: 'user' | 'assistant' | 'tool' | 'system' | 'peer' | 'subagent';
   timestamp?: string;
+  /** On a subagent entry: the reply, as text parts. */
   parts: TranscriptPart[];
   /** On a user prompt: what the reply to it cost (Claude Code only). */
   turn?: TurnStats;
+  /** On a subagent entry: who ran and what it was asked (Claude Code only). */
+  subagent?: { name?: string; description?: string; prompt?: string; toolUseId?: string };
+}
+
+/** One subagent run, read from `<sessionId>/subagents/agent-<id>.jsonl` and the `.meta.json` beside it. */
+export interface SubagentRun {
+  agentId?: string;
+  /** The session it answered, from its records' sessionId. */
+  sessionId?: string;
+  /** The Agent/Task tool call that started it, from the meta file. */
+  toolUseId?: string;
+  /** subagent_type: a named agent ("release-manager") or a built-in one ("general-purpose"). */
+  agentType?: string;
+  isBuiltIn?: boolean;
+  description?: string;
+  prompt?: string;
+  reply?: string;
+  /** When the reply was written. */
+  timestamp?: string;
 }
 
 const MAX_TITLE = 120;
@@ -385,6 +405,11 @@ export function parseSession(
         usage.add(r, true);
       }
     }
+    // The transcript shows each subagent's reply, so a search for it should find the session.
+    const run = parseSubagentRun(log);
+    if (run.reply && (!run.sessionId || run.sessionId === id)) {
+      searchParts.push(run.reply);
+    }
   }
   info.usage = usage.summary();
   info.assistantCount = assistantIds.size;
@@ -484,11 +509,120 @@ export function truncate(text: string, max = MAX_TOOL_TEXT): string {
   return text.length > max ? text.slice(0, max) + `\n… (${text.length - max} more characters)` : text;
 }
 
-/** Builds a readable transcript of the main conversation thread. */
-export function parseTranscript(text: string): TranscriptEntry[] {
+const str = (v: unknown): string | undefined => (typeof v === 'string' && v.trim() ? v : undefined);
+
+/**
+ * Reads one subagent log and its meta file (JSON text, if any) into the prompt it was given and the reply it sent
+ * back. The reply is its SubagentHandback message, or else the text of its last message.
+ */
+export function parseSubagentRun(log: string, metaText?: string): SubagentRun {
+  let meta: any;
+  try {
+    meta = metaText ? JSON.parse(metaText) : undefined;
+  } catch {
+    // A meta file being written, or a shape we don't know; the log alone still gives prompt and reply.
+  }
+  const run: SubagentRun = {};
+  if (meta && typeof meta === 'object') {
+    run.toolUseId = str(meta.toolUseId);
+    run.agentType = str(meta.agentType);
+    run.isBuiltIn = typeof meta.isBuiltIn === 'boolean' ? meta.isBuiltIn : undefined;
+    run.description = str(meta.description);
+  }
+  let handback: string | undefined;
+  let lastId: unknown;
+  let lastText: string[] = [];
+  for (const r of records(log)) {
+    if (!r || typeof r !== 'object') {
+      continue;
+    }
+    run.agentId ??= str(r.agentId);
+    run.sessionId ??= str(r.sessionId);
+    if (r.type === 'user' && run.prompt === undefined && !r.isMeta) {
+      const content = r.message?.content;
+      const raw =
+        typeof content === 'string'
+          ? content
+          : Array.isArray(content) && !content.some((p) => p?.type === 'tool_result')
+            ? content.filter((p) => p?.type === 'text' && typeof p.text === 'string').map((p) => p.text).join('\n')
+            : '';
+      const prompt = raw.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
+      if (prompt) {
+        run.prompt = prompt;
+      }
+      continue;
+    }
+    if (r.type !== 'assistant' || !Array.isArray(r.message?.content)) {
+      continue;
+    }
+    const texts: string[] = [];
+    for (const p of r.message.content) {
+      if (p?.type === 'text' && typeof p.text === 'string' && p.text.trim()) {
+        texts.push(p.text);
+      } else if (p?.type === 'tool_use' && p.name === 'SubagentHandback' && typeof p.input?.message === 'string') {
+        handback = p.input.message;
+        run.timestamp = str(r.timestamp) ?? run.timestamp;
+      }
+    }
+    if (texts.length) {
+      // One message is logged as one line per content block; keep the blocks of the last message together.
+      const id = r.message.id ?? r.uuid;
+      lastText = id !== undefined && id === lastId ? [...lastText, ...texts] : texts;
+      lastId = id;
+      if (handback === undefined) {
+        run.timestamp = str(r.timestamp) ?? run.timestamp;
+      }
+    }
+  }
+  const reply = handback ?? lastText.join('\n\n');
+  if (reply.trim()) {
+    run.reply = reply;
+  }
+  return run;
+}
+
+const AGENT_ID = /\bagentId: ([\w-]+)/;
+const isAgentTool = (name: string) => name === 'Agent' || name === 'Task';
+
+/** Options for parseTranscript. */
+export interface TranscriptOptions {
+  /** The session's own id; subagent runs that answered a different session are left out. */
+  sessionId?: string;
+  /** The session's subagent runs, shown after the tool call that started each one. */
+  subagents?: SubagentRun[];
+}
+
+/** Builds a readable transcript of the main conversation thread, with its subagents' prompts and replies. */
+export function parseTranscript(text: string, options: TranscriptOptions = {}): TranscriptEntry[] {
   const entries: TranscriptEntry[] = [];
+  // Only runs that answered this session; a run with no session id is still tied to it by its tool call below.
+  const runs = (options.subagents ?? []).filter(
+    (s) => (s.prompt || s.reply) && !(options.sessionId && s.sessionId && s.sessionId !== options.sessionId),
+  );
+  const placed = new Set<SubagentRun>();
+  /** The tool call's run, by the meta file's toolUseId or the agentId its result names. */
+  const runFor = (callId: string | undefined, agentId: string | undefined) =>
+    runs.find((s) => !placed.has(s) && ((callId && s.toolUseId === callId) || (agentId && !s.toolUseId && s.agentId === agentId)));
+  const subagentEntry = (run: SubagentRun, call: Extract<TranscriptPart, { kind: 'tool_use' }> | undefined, ts?: string): TranscriptEntry => {
+    placed.add(run);
+    const type = run.agentType ?? call?.args?.subagent_type;
+    const builtIn = run.isBuiltIn ?? (!type || type === 'general-purpose');
+    return {
+      role: 'subagent',
+      timestamp: run.timestamp ?? ts,
+      parts: run.reply ? [{ kind: 'text', text: run.reply }] : [],
+      subagent: {
+        name: builtIn ? undefined : type,
+        description: run.description ?? call?.args?.description,
+        prompt: run.prompt ?? call?.args?.prompt,
+        toolUseId: call?.id,
+      },
+    };
+  };
   // tool_use parts by id, so results (logged later as user messages) can be attached to their call.
   const toolUses = new Map<string, Extract<TranscriptPart, { kind: 'tool_use' }>>();
+  // The entry each tool call went into, for runs whose call never got a result.
+  const callEntries = new Map<string, TranscriptEntry>();
   // The prompt being answered, with the requests made since it, to give each prompt its cost.
   let turn: { entry: TranscriptEntry; usage: UsageCollector; last?: number } | undefined;
   const endTurn = () => {
@@ -554,11 +688,20 @@ export function parseTranscript(text: string): TranscriptEntry[] {
       }
       // Claude Code writes one line per content block and one message per tool round trip;
       // merge everything Claude does between two user prompts into a single turn.
-      const prev = entries[entries.length - 1];
-      if (prev?.role === 'assistant') {
-        prev.parts.push(...parts);
+      // A subagent's reply in between starts a new one, so the conversation reads main AI, subagent, main AI.
+      let target = entries[entries.length - 1];
+      if (target?.role === 'assistant') {
+        target.parts.push(...parts);
       } else {
-        entries.push({ role: 'assistant', timestamp: r.timestamp, parts });
+        target = { role: 'assistant', timestamp: r.timestamp, parts };
+        entries.push(target);
+      }
+      if (runs.length) {
+        for (const p of parts) {
+          if (p.kind === 'tool_use' && p.id) {
+            callEntries.set(p.id, target);
+          }
+        }
       }
       continue;
     }
@@ -576,21 +719,30 @@ export function parseTranscript(text: string): TranscriptEntry[] {
     const content = r.message?.content;
     if (Array.isArray(content) && content.some((p) => p?.type === 'tool_result')) {
       const orphans: TranscriptPart[] = [];
+      const answered: TranscriptEntry[] = [];
       for (const p of content) {
         if (p?.type !== 'tool_result') {
           continue;
         }
-        const result = { text: truncate(stringifyToolContent(p.content)), isError: !!p.is_error };
+        const full = stringifyToolContent(p.content);
+        const result = { text: truncate(full), isError: !!p.is_error };
         const call = typeof p.tool_use_id === 'string' ? toolUses.get(p.tool_use_id) : undefined;
         if (call) {
           call.result = result;
         } else {
           orphans.push({ kind: 'tool_result', ...result });
         }
+        // A subagent's run goes where its call returned: when it finished, or when it was launched in the background.
+        const spawned = !call || isAgentTool(call.name) ? str(r.toolUseResult?.agentId) ?? AGENT_ID.exec(full)?.[1] : undefined;
+        const run = runs.length ? runFor(p.tool_use_id, spawned) : undefined;
+        if (run) {
+          answered.push(subagentEntry(run, call, r.timestamp));
+        }
       }
       if (orphans.length) {
         entries.push({ role: 'tool', timestamp: r.timestamp, parts: orphans });
       }
+      entries.push(...answered);
       continue;
     }
 
@@ -607,6 +759,17 @@ export function parseTranscript(text: string): TranscriptEntry[] {
     turn = { entry, usage: new UsageCollector() };
   }
   endTurn();
+  // A call whose result was never logged (interrupted): its run goes right after the call.
+  for (const [id, entry] of callEntries) {
+    const run = runFor(id, undefined);
+    if (run) {
+      let at = entries.indexOf(entry) + 1;
+      while (entries[at]?.role === 'subagent') {
+        at++;
+      }
+      entries.splice(at, 0, subagentEntry(run, toolUses.get(id)));
+    }
+  }
   return entries;
 }
 

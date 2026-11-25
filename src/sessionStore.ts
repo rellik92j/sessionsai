@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
 import { parseCopilotSession } from './copilotCliParser';
-import { parseSession, SessionInfo, SessionSource } from './sessionParser';
+import { parseSession, parseSubagentRun, SessionInfo, SessionSource, SubagentRun } from './sessionParser';
 import { parseChatSession } from './vscodeChatParser';
 
 export function defaultProjectsDir(): string {
@@ -75,6 +75,23 @@ async function subagentLogs(dir: string): Promise<{ files: string[]; signature: 
     }
   }
   return { files, signature: parts.join('|') };
+}
+
+/**
+ * The subagent runs of a Claude Code session, from `<sessionId>/subagents/` beside its log. Only this session's
+ * folder is read, and the transcript also drops any run whose records name another session.
+ */
+export async function readSubagentRuns(sessionFile: string, id: string): Promise<SubagentRun[]> {
+  const { files } = await subagentLogs(path.join(path.dirname(sessionFile), id, 'subagents'));
+  return Promise.all(
+    files.map(async (f) => {
+      const [log, meta] = await Promise.all([
+        fs.readFile(f, 'utf8').catch(() => ''),
+        fs.readFile(f.replace(/\.jsonl$/, '.meta.json'), 'utf8').catch(() => undefined),
+      ]);
+      return parseSubagentRun(log, meta);
+    }),
+  );
 }
 
 async function readdirSafe(dir: string) {

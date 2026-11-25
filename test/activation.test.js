@@ -745,3 +745,58 @@ test('Claude Code agents: an agent step after effort for a new Claude Code CLI s
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('subagent runs render as their own collapsible speakers in the transcript', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-sessions-subagents-'));
+  const projectsDir = path.join(root, 'claude');
+  try {
+    fs.cpSync(path.join(__dirname, 'fixtures', 'claude-subagents'), projectsDir, { recursive: true });
+    const state = {
+      projectsDir,
+      config: { copilotDir: path.join(root, 'none'), vscodeUserDir: path.join(root, 'none') },
+      providers: {},
+      commands: {},
+      panels: [],
+      panelPosts: [],
+      errors: [],
+      terminals: [],
+      infos: [],
+    };
+    const { send, last } = await activateWithSidebar(state);
+    await state.commands['claudeSessions.openTranscript']({ sessionKey: 'claude:5e1f0c2a-1111-4222-8333-944455556666' });
+    const html = state.panels[0].webview.html;
+    const blocks = [...html.matchAll(/<div class="msg subagent">[\s\S]*?<\/details>\s*<\/div>\s*<\/div>/g)].map((m) => m[0]);
+    assert.equal(blocks.length, 2);
+    assert.match(blocks[0], /<strong>release-checker<\/strong><span class="pill subagent-pill">subagent<\/span>/);
+    assert.match(blocks[0], /<span class="subagent-desc">Check release 1\.2\.0<\/span>/);
+    assert.match(blocks[0], /class="subagent-prompt" open><summary>.*Prompt/, 'a short prompt is shown open');
+    assert.match(blocks[0], /Check that release 1\.2\.0 is ready to ship/);
+    assert.match(blocks[0], /88 of 88 pass/);
+    assert.match(blocks[0], /<details class="subagent-card" open>/, 'a short reply is shown open');
+    assert.match(blocks[1], /<strong>Subagent<\/strong><time/, 'a one-off agent: generic label, no pill');
+    assert.match(blocks[1], /Faster search/);
+    assert.doesNotMatch(html, /FOREIGN REPLY|OTHER SESSION REPLY/);
+    // Order: the main reply is split around each run, so it doesn't read as one block.
+    const order = ['have the release checker look first', 'release-checker</strong>', 'While that runs', '<strong>Subagent</strong>', 'Both agents are done', 'Docs Lead'].map((s) => html.indexOf(s));
+    assert.ok(order.every((i) => i > 0), `all found: ${order}`);
+    assert.deepEqual([...order].sort((a, b) => a - b), order);
+    assert.equal((html.match(/<div class="msg assistant">/g) ?? []).length, 3);
+
+    // A long reply starts collapsed, with a one-line preview in its header.
+    const sub = path.join(projectsDir, 'C--repo', '5e1f0c2a-1111-4222-8333-944455556666', 'subagents');
+    const longLog = fs
+      .readFileSync(path.join(sub, 'agent-a2222222222222222.jsonl'), 'utf8')
+      .replace('- Faster search', `- Faster search${'\\n- more'.repeat(40)}`);
+    fs.writeFileSync(path.join(sub, 'agent-a2222222222222222.jsonl'), longLog);
+    await state.commands['claudeSessions.openTranscript']({ sessionKey: 'claude:5e1f0c2a-1111-4222-8333-944455556666' });
+    const again = state.panels[0].webview.html;
+    assert.match(again, /<details class="subagent-card">\s*<summary>[\s\S]*?<span class="subagent-preview">## Notes for 1\.2\.0 - Faster search - more/);
+
+    // Searching for a subagent's reply finds the session.
+    send({ type: 'search', query: '"88 of 88"' });
+    assert.deepEqual(last('searchResults').ids, ['claude:5e1f0c2a-1111-4222-8333-944455556666']);
+    assert.deepEqual(state.errors, []);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
