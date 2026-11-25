@@ -275,16 +275,40 @@ export interface AgentMessage {
   /** Its agent type as Claude Code recorded it ("reviewer", "general-purpose"), if it did. */
   name?: string;
   text: string;
-  /** Identifies this delivery, so one logged twice (as a record and as a queued command) shows once. */
+  /** Names this delivery in one string: its tool-use id, or else its sender and words. */
   key: string;
+  /** The SubagentHandback call that sent it, when Claude Code recorded one. */
+  toolUseId?: string;
 }
 
-const AGENT_MESSAGE = /<agent-message\b([^>]*)>([\s\S]*?)(?:<\/agent-message>|$)/;
+/**
+ * The tag that opens a hand-back, only at the very start of the message (after the line Claude Code puts before it
+ * on a user record), so a record that merely mentions the tag is not taken for one.
+ */
+const AGENT_MESSAGE_OPEN = /^\s*(?:Another Claude session sent a message:[ \t]*\r?\n)?<agent-message\b([^>]*)>/;
+/**
+ * The closing tag at the start of a line. Claude Code indents every line of a framed report, so a report that quotes
+ * the tag does not end there.
+ */
+const AGENT_MESSAGE_CLOSE = /(?:^|\n)<\/agent-message>/;
 /** The frame Claude Code puts around a hand-back; the report after it is indented two spaces. */
 const HANDBACK_FRAME = /^\[Subagent hand-back\][\s\S]*?The report follows:[ \t]*\r?\n/;
 
+/** The tag and body of a hand-back's message, or undefined if the message does not open with the tag. */
+function agentMessageBody(raw: string): { attrs: string; body: string } | undefined {
+  const open = AGENT_MESSAGE_OPEN.exec(raw);
+  if (!open) {
+    return undefined;
+  }
+  const rest = raw.slice(open[0].length);
+  const close = AGENT_MESSAGE_CLOSE.exec(rest);
+  // No closing tag on a line of its own: a record cut off mid-write, or one written on a single line.
+  const body = close ? rest.slice(0, close.index) : rest.replace(/<\/agent-message>\s*$/, '');
+  return { attrs: open[1], body };
+}
+
 /**
- * Extracts a message an agent sent to this session, from a meta user record whose content holds an
+ * Extracts a message an agent sent to this session, from a meta user record whose content opens with an
  * `<agent-message from="<agentId>">`, or from a `queued_command` attachment carrying one (delivered mid-turn).
  */
 export function parseAgentMessage(r: any): AgentMessage | undefined {
@@ -297,22 +321,63 @@ export function parseAgentMessage(r: any): AgentMessage | undefined {
     raw = r.attachment.prompt;
     origin = r.attachment.origin;
   }
-  const m = typeof raw === 'string' ? AGENT_MESSAGE.exec(raw) : null;
+  const m = typeof raw === 'string' ? agentMessageBody(raw) : undefined;
   if (!m) {
     return undefined;
   }
   origin = origin && typeof origin === 'object' ? origin : {};
-  const from = /from="([^"]*)"/.exec(m[1])?.[1] || str(origin.from) || '';
+  const from = /from="([^"]*)"/.exec(m.attrs)?.[1] || str(origin.from) || '';
   let text = str(origin.handbackReportText)?.trim();
   if (!text) {
-    const body = m[2].replace(/^\r?\n/, '');
+    const body = m.body.replace(/^\r?\n/, '');
     const frame = HANDBACK_FRAME.exec(body);
     text = (frame ? body.slice(frame[0].length).replace(/^ {2}/gm, '') : body).trim();
   }
   if (!text) {
     return undefined;
   }
-  return { from, name: str(origin.name), text, key: str(origin.handbackToolUseId) ?? `${from}\n${text}` };
+  const toolUseId = str(origin.handbackToolUseId);
+  const msg: AgentMessage = { from, name: str(origin.name), text, key: toolUseId ?? `${from}\n${text}` };
+  if (toolUseId) {
+    msg.toolUseId = toolUseId;
+  }
+  return msg;
+}
+
+/**
+ * Tells repeat deliveries of a hand-back from new ones. A tool-use id names one delivery, however many times it is
+ * logged. A log of it without the id (only the framed text, say) has the same sender and words, so it pairs with
+ * one delivery of those words not yet paired. Two logs without an id and with the same words are one delivery.
+ */
+export class HandbackDeliveries {
+  private readonly ids = new Set<string>();
+  /** Sender and words of every delivery seen. */
+  private readonly seen = new Set<string>();
+  /** Sender and words of a delivery without an id, not yet paired with one that has it. */
+  private readonly bare = new Set<string>();
+
+  /** Records the delivery and returns true if it repeats one already seen. */
+  isRepeat(msg: AgentMessage): boolean {
+    // The clean report text and the one read from the framed body can differ in line endings and trailing spaces.
+    const words = `${msg.from}\n${msg.text.replace(/\r\n?/g, '\n').replace(/[ \t]+$/gm, '').trim()}`;
+    if (msg.toolUseId) {
+      if (this.ids.has(msg.toolUseId)) {
+        return true;
+      }
+      this.ids.add(msg.toolUseId);
+      if (this.bare.delete(words)) {
+        return true;
+      }
+      this.seen.add(words);
+      return false;
+    }
+    if (this.seen.has(words)) {
+      return true;
+    }
+    this.seen.add(words);
+    this.bare.add(words);
+    return false;
+  }
 }
 
 /**
@@ -412,7 +477,7 @@ export function parseSession(
   let commitCount = 0;
   const usage = new UsageCollector();
   /** Hand-backs already added to the search text, by delivery. */
-  const handbacks = new Set<string>();
+  const handbacks = new HandbackDeliveries();
   /** Prompts queued mid-turn since the last typed prompt, so a user record repeating one is not counted twice. */
   const queuedPrompts = new Set<string>();
   const countPrompt = (text: string) => {
@@ -478,8 +543,7 @@ export function parseSession(
       case 'attachment': {
         // A subagent's hand-back delivered while Claude was mid-turn; the transcript shows it, so search finds it.
         const handback = !r.isSidechain ? parseAgentMessage(r) : undefined;
-        if (handback && !handbacks.has(handback.key)) {
-          handbacks.add(handback.key);
+        if (handback && !handbacks.isRepeat(handback)) {
           searchParts.push(handback.text);
         }
         // A message from another session that arrived mid-turn counts like one that arrived between turns.
@@ -573,8 +637,7 @@ export function parseSession(
     if (r.isMeta) {
       const handback = parseAgentMessage(r);
       if (handback) {
-        if (!handbacks.has(handback.key)) {
-          handbacks.add(handback.key);
+        if (!handbacks.isRepeat(handback)) {
           searchParts.push(handback.text);
         }
         continue;
@@ -856,12 +919,11 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
   const launches = new Map<string, { entry?: TranscriptEntry; run?: SubagentRun; call?: ToolUsePart }>();
   /** Agents whose hand-back reached the main session, and the deliveries already shown. */
   const handedBack = new Set<string>();
-  const shownHandbacks = new Set<string>();
+  const shownHandbacks = new HandbackDeliveries();
   const handbackEntry = (msg: AgentMessage, ts?: string): TranscriptEntry | undefined => {
-    if (shownHandbacks.has(msg.key)) {
+    if (shownHandbacks.isRepeat(msg)) {
       return undefined;
     }
-    shownHandbacks.add(msg.key);
     handedBack.add(msg.from);
     const launch = msg.from ? launches.get(msg.from) : undefined;
     const run = launch?.run ?? (msg.from ? runs.find((s) => s.agentId === msg.from) : undefined);
