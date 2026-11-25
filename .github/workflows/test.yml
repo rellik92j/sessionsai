@@ -24,8 +24,9 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # v7 of both run on Node 24; v4 ran on Node 20, which GitHub now forces onto 24 with a deprecation warning.
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           # npm runs scripts with cmd on Windows, so `node --test test/*.test.js` needs Node 22+ to expand the glob.
           node-version: 24
