@@ -408,6 +408,49 @@ async function activateWithSidebar(state) {
   return { vscode, posted, send: handler, last: (type) => posted.filter((m) => m.type === type).pop() };
 }
 
+test('the --agent agent is a label on the sidebar card, the transcript header and the Overview rows', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-sessions-agent-label-'));
+  const projectsDir = path.join(root, 'claude');
+  const noSources = path.join(root, 'none');
+  try {
+    const dir = path.join(projectsDir, 'C--work-demo');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.copyFileSync(path.join(__dirname, 'fixtures', 'claude-code', 'agent-setting.jsonl'), path.join(dir, 'agent-0001.jsonl'));
+    // Renamed but started without --agent: agent-name holds its name, which is no agent.
+    writeSession(dir, 'plain-0002', [
+      { type: 'custom-title', customTitle: 'Tidy the docs' },
+      { type: 'agent-name', agentName: 'Tidy the docs' },
+      { type: 'user', message: { content: 'Tidy the README' }, cwd: 'C:\\work\\demo', timestamp: '2026-11-19T09:00:00.000Z' },
+    ]);
+    const state = { projectsDir, config: { copilotDir: noSources, vscodeUserDir: noSources }, providers: {}, commands: {}, panels: [], panelPosts: [], errors: [], terminals: [] };
+    const { send, last } = await activateWithSidebar(state);
+    const cards = last('state').groups.flatMap((g) => g.sessions);
+    const card = (id) => cards.find((c) => c.id === `claude:${id}`);
+    assert.equal(card('agent-0001').agent, 'planner');
+    // The session's name stays in the title now that it is not shown as the agent chip.
+    assert.equal(card('agent-0001').title, 'Plan the release — Draft the release checklist');
+    assert.equal(card('plain-0002').agent, undefined, 'no agent, no label');
+    assert.equal(card('plain-0002').title, 'Tidy the docs — Tidy the README');
+    send({ type: 'search', query: 'planner' });
+    assert.deepEqual(last('searchResults').ids, ['claude:agent-0001'], 'the label is searchable');
+
+    const chip = /<span class="chip agent" title="Agent"><i class="codicon codicon-hubot"><\/i>planner<\/span>/;
+    await state.commands['claudeSessions.openTranscript']({ sessionKey: 'claude:agent-0001' });
+    assert.match(state.panels[0].webview.html, chip);
+    await state.commands['claudeSessions.openTranscript']({ sessionKey: 'claude:plain-0002' });
+    assert.doesNotMatch(state.panels[0].webview.html, /chip agent/);
+
+    await state.commands['claudeSessions.openOverview']();
+    const overview = state.panels[state.panels.length - 1];
+    overview.onMessage({ type: 'ready', range: 0, scope: 'all' });
+    const ov = state.panelPosts.filter((m) => m.type === 'state').pop().overview;
+    assert.deepEqual(ov.recentSessions.map((s) => [s.id, s.agent]), [['claude:agent-0001', 'planner'], ['claude:plain-0002', undefined]]);
+    assert.deepEqual(state.errors, []);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('Copilot CLI and VS Code Chat sessions: source chips, filters, search, transcripts and actions', async () => {
   const fixtures = path.join(__dirname, 'fixtures');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-sessions-sources-'));

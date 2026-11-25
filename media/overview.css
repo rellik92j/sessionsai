@@ -405,6 +405,7 @@ body.vscode-dark .c-o, body.vscode-high-contrast:not(.vscode-high-contrast-light
 .session-cost { grid-area: cost; font-weight: 600; font-variant-numeric: tabular-nums; }
 .tag { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 11px; white-space: nowrap; }
 .tag .codicon { font-size: 12px; }
+.tag.agent { color: var(--vscode-charts-orange, var(--claude)); }
 
 .empty-state { padding: 48px 0; text-align: center; }
 

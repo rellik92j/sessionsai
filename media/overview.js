@@ -311,6 +311,7 @@
           <span class="session-title">${esc(s.title)}</span>
           <span class="session-meta">
             <span class="tag"><span class="swatch ${colorOf('project', s.projectKey)}"></span>${esc(s.project)}</span>
+            ${s.agent ? `<span class="tag agent" title="Agent"><i class="codicon codicon-hubot"></i>${esc(s.agent)}</span>` : ''}
             <span class="tag"><i class="codicon codicon-comment"></i>${count(s.prompts)}</span>
             <span class="tag muted">${relative(s.lastTime)}</span>
           </span>

@@ -37,11 +37,8 @@ export interface CardData {
 
 export function toCard(s: SessionInfo): CardData {
   const p = projectPath(s);
-  let title = s.title;
-  // Agent-team titles are "<agent> — <topic>"; the card shows the agent as a chip instead.
-  if (s.agentName && title.startsWith(`${s.agentName} — `)) {
-    title = title.slice(s.agentName.length + 3);
-  }
+  // A "<session name> — <topic>" title keeps its name: the agent chip is the `--agent` definition, not that name.
+  const title = s.title;
   // Show the latest prompt under the title, unless the title already is that prompt.
   const flat = (t: string) => t.replace(/<\/?pasted_content\b[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
   const titleStem = flat(title).replace(/…$/, '');
@@ -50,7 +47,7 @@ export function toCard(s: SessionInfo): CardData {
     id: sessionKey(s),
     source: sourceOf(s),
     title,
-    agent: s.agentName,
+    agent: s.agent,
     excerpt: excerpt ? flat(excerpt).slice(0, 240) : undefined,
     project: projectName(p),
     projectPath: p,

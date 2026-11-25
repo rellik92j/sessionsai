@@ -43,6 +43,8 @@ export interface OverviewSession {
   /** The session key. */
   id: string;
   title: string;
+  /** The `--agent` definition it ran under, if any. */
+  agent?: string;
   project: string;
   projectKey: string;
   hue: number;
@@ -233,7 +235,7 @@ export function buildOverview(sessions: SessionInfo[], range: OverviewRange, now
     proj.cost += sCost;
     proj.lastTime = Math.max(proj.lastTime, sessionTime(s));
 
-    listed.push({ id: sessionKey(s), title: s.title, project: proj.name, projectKey: proj.key, hue: proj.hue, prompts: s.promptCount, cost: sCost, lastTime: sessionTime(s) });
+    listed.push({ id: sessionKey(s), title: s.title, agent: s.agent, project: proj.name, projectKey: proj.key, hue: proj.hue, prompts: s.promptCount, cost: sCost, lastTime: sessionTime(s) });
   }
 
   return {

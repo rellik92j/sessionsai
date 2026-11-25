@@ -964,7 +964,7 @@ export function buildHtml(session: SessionInfo, entries: TranscriptEntry[], o: H
     claude ? '' : `<span class="chip"><i class="codicon codicon-${source.icon}"></i>${escapeHtml(source.label)}</span>`,
     `<span class="chip" title="${escapeHtml(proj || NO_FOLDER)}"><i class="codicon codicon-folder"></i>${escapeHtml(projectName(proj))}</span>`,
     session.gitBranch ? `<span class="chip"><i class="codicon codicon-git-branch"></i>${escapeHtml(session.gitBranch)}</span>` : '',
-    session.agentName ? `<span class="chip agent"><i class="codicon codicon-hubot"></i>${escapeHtml(session.agentName)}</span>` : '',
+    session.agent ? `<span class="chip agent" title="Agent"><i class="codicon codicon-hubot"></i>${escapeHtml(session.agent)}</span>` : '',
     `<span class="chip" title="Started ${escapeHtml(formatDateTime(session.startTime))}"><i class="codicon codicon-calendar"></i>${escapeHtml(formatDateTime(session.lastTime))}</span>`,
     `<span class="chip"><i class="codicon codicon-comment"></i>${session.promptCount} prompt${session.promptCount === 1 ? '' : 's'}</span>`,
     session.model

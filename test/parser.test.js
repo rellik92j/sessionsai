@@ -1,5 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const { parseSession, parseTranscript, classifyUserContent, decodeProjectDir, oneLine } = require('../out/sessionParser');
 const { formatRelative, dateBucket, isInside, normalizePath, escapeHtml } = require('../out/format');
 const { renderMarkdown } = require('../out/markdown');
@@ -77,6 +79,21 @@ test('agent-team sessions: peer messages counted, title disambiguated, shown in 
   assert.equal(parseSession(jsonl(peer), 'f', 'p', 'id').title, 'Overseer: Research the auth flow');
   // A custom title that differs from the agent name is kept verbatim.
   assert.equal(parseSession(jsonl(peer, { type: 'agent-name', agentName: 'A' }, { type: 'custom-title', customTitle: 'Mine' }), 'f', 'p', 'id').title, 'Mine');
+});
+
+test('claude --agent: the agent comes from the agent-setting record, not agent-name', () => {
+  // Shaped like a real `claude --agent planner` log: a rename writes custom-title and an equal agent-name, and
+  // agent-setting carries the agent. Repeated records are normal; one of an unknown shape is skipped.
+  const text = fs.readFileSync(path.join(__dirname, 'fixtures', 'claude-code', 'agent-setting.jsonl'), 'utf8');
+  const s = parseSession(text, 'f', 'p', 'id');
+  assert.equal(s.agent, 'planner');
+  assert.equal(s.agentName, 'Plan the release');
+  assert.equal(s.promptCount, 1);
+  // A renamed session started without --agent has a name but no agent.
+  const plain = parseSession(jsonl({ type: 'custom-title', customTitle: 'Plan' }, { type: 'agent-name', agentName: 'Plan' }, user('hi')), 'f', 'p', 'id');
+  assert.equal(plain.agent, undefined);
+  assert.equal(plain.agentName, 'Plan');
+  assert.equal(parseSession(jsonl({ type: 'agent-setting', agentSetting: '  ' }, user('hi')), 'f', 'p', 'id').agent, undefined);
 });
 
 test('searchText holds prompts, peer messages, replies and tool file paths, but not other tool I/O or thinking', () => {
