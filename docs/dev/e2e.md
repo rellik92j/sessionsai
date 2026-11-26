@@ -15,8 +15,16 @@ npm run test:e2e -- stop permission   # only scenarios whose name contains one o
 ```
 
 It bundles `dist/extension.js` first, so it tests the working tree as it is. A VS Code window opens on the desktop
-while it runs; leave it alone until it closes. The first run downloads VS Code (stable) into `.vscode-test/`,
-about 1 GB on disk once unpacked; later runs reuse it. `E2E_VSCODE_VERSION=1.148.0` pins a version.
+while it runs; leave it alone until it closes. The first run downloads VS Code (stable), about 1 GB on disk once
+unpacked, into one folder shared by every checkout and worktree; later runs reuse it. `E2E_VSCODE_VERSION=1.148.0`
+pins a version.
+
+The shared folder is `%LOCALAPPDATA%\sessionsai-e2e\vscode` on Windows and `~/.cache/sessionsai-e2e/vscode`
+elsewhere. Set `SESSIONSAI_E2E_CACHE` to use another folder. To clear it, delete that folder (nothing is running
+while no e2e run is open); the next run downloads again. It is kept outside the checkout because its deep paths break
+`git worktree remove` on Windows. Runs started at the same time take a `.lock` folder in it, so only one downloads;
+a lock not refreshed for a minute is taken over. Old checkouts may still have an unused `.vscode-test/`, which is
+safe to delete.
 
 The output ends with one line per scenario and a count, and the command exits 1 if any scenario failed. For each
 failure, `.e2e-out/` holds `<scenario>.png`, a screenshot of the window at the moment it failed (an agent can Read
@@ -27,7 +35,7 @@ Windows is where it has been run. The harness has a POSIX terminal stub too, but
 
 ## What keeps it isolated
 
-- **VS Code** is the copy in `.vscode-test/`, started with a throwaway `--user-data-dir` and `--extensions-dir` in a
+- **VS Code** is the copy in the shared cache folder above, started with a throwaway `--user-data-dir` and `--extensions-dir` in a
   temp folder (`sessionsai-e2e-*`), so the user's own VS Code, settings and extensions are never touched. Environment
   variables starting `VSCODE_` or `ELECTRON_` are dropped, so it cannot attach to a VS Code that is already running.
 - **Sessions** come from a temp `CLAUDE_CONFIG_DIR` holding one synthetic session per scenario. The settings point
@@ -143,7 +151,7 @@ npm ci
 npm run test:e2e
 ```
 
-`npm ci` is needed when the branch changed `package-lock.json`; the VS Code download in `.vscode-test/` is per
-worktree, so the first run in a new worktree downloads it. Report the pass count from the last line. For a failure,
+`npm ci` is needed when the branch changed `package-lock.json`; the VS Code download is shared, so a new worktree
+reuses it. Report the pass count from the last line. For a failure,
 Read `.e2e-out/<scenario>.png` and `.e2e-out/<scenario>.events.json`, and say which step timed out (the message
 names it). A PR that changes the chat's behaviour on purpose may need its scenario changed in the same PR.
