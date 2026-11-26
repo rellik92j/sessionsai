@@ -69,6 +69,16 @@
     }
   });
 
+  // The session went live in another Claude Code process or stopped being, or a subagent or shell it runs ended.
+  window.addEventListener('message', (e) => {
+    if (e.data?.type !== 'liveElsewhere') return;
+    const notice = document.getElementById('live-elsewhere');
+    if (!notice) return;
+    const html = typeof e.data.html === 'string' ? e.data.html : '';
+    notice.innerHTML = html;
+    notice.hidden = !html;
+  });
+
   // ---------- message box ----------
 
   // Type the next message at the bottom of the transcript; it goes to this session or, when that isn't wise or

@@ -2200,3 +2200,84 @@ setInterval(() => {}, 1000);
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('a session live in another Claude Code process: shown on its card and transcript, and every action asks first', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-sessions-live-'));
+  const projectsDir = path.join(root, 'claude');
+  const registry = path.join(root, 'sessions');
+  const noSources = path.join(root, 'none');
+  const id = 'b7000000-1111-4222-8333-944455556666';
+  try {
+    const dir = path.join(projectsDir, 'C--repo');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.copyFileSync(path.join(__dirname, 'fixtures', 'claude-code', 'background-tasks.jsonl'), path.join(dir, `${id}.jsonl`));
+    relocate(dir, 'C:\\repo', path.join(root, 'repo'));
+    // This test's own process stands in for the terminal's Claude Code: its pid is alive. Started before the launches.
+    fs.mkdirSync(registry, { recursive: true });
+    const entry = { pid: process.pid, sessionId: id, cwd: path.join(root, 'repo'), startedAt: Date.parse('2026-11-20T09:00:00.000Z'), kind: 'interactive', entrypoint: 'cli', status: 'idle' };
+    fs.writeFileSync(path.join(registry, `${process.pid}.json`), JSON.stringify(entry));
+    const state = {
+      projectsDir,
+      config: { copilotDir: noSources, vscodeUserDir: noSources },
+      extensions: { 'anthropic.claude-code': { extensionUri: { fsPath: noSources } } },
+      providers: {},
+      commands: {},
+      panels: [],
+      panelPosts: [],
+      errors: [],
+      terminals: [],
+      warnings: [],
+    };
+    const { vscode, last } = await activateWithSidebar(state);
+    // Modal warnings are recorded; state.answer picks the button.
+    vscode.window.showWarningMessage = async (message, ...items) => (state.warnings.push(message), state.answer?.(message, items));
+    const card = () => last('state').groups.flatMap((g) => g.sessions).find((c) => c.id === `claude:${id}`);
+    await waitFor(() => card()?.live, 'the card to show the session live');
+    assert.deepEqual(card().live, { label: 'Live in a terminal · idle', busy: false });
+
+    await state.commands['claudeSessions.openTranscript']({ sessionKey: `claude:${id}` });
+    const html = state.panels[0].webview.html;
+    const notice = /<div class="live-elsewhere" id="live-elsewhere" role="status">([\s\S]*?)<\/ul><\/div>/.exec(html)?.[1] ?? '';
+    assert.match(notice, /Live in a terminal · idle/);
+    assert.match(notice, /reviewer &quot;Review the pull request&quot;/);
+    assert.match(notice, /ext-worker &quot;Build the feature&quot;.*waiting on its own background work/);
+    assert.match(notice, /background shell &quot;Run the tests in watch mode&quot;/);
+    assert.doesNotMatch(notice, /Draft the notes|Check the release|npm run build|Wait a while/, 'what finished, handed back, failed or was stopped is not listed');
+
+    const named = /^"Start the review, the notes and the tests in the background\." is live in a terminal \(idle\), with 2 subagents and 1 background shell still running: reviewer "Review the pull request"/;
+    // Resume (the sidebar's hover button, right-click and Ctrl+Enter, the top bar and the palette all run this command):
+    // asks, and nothing starts.
+    const session = { sessionKey: `claude:${id}` };
+    assert.equal(await state.commands['claudeSessions.resume'](session), false);
+    assert.match(state.warnings.pop(), named);
+    assert.equal(state.terminals.length, 0);
+    // Open in Claude Code Chat asks the same way.
+    assert.equal(await state.commands['claudeSessions.openInClaudeCode'](session), false);
+    assert.match(state.warnings.pop(), /Opening it in the Claude Code chat as well would put a second Claude Code process/);
+    // The message box's Send to the CLI.
+    assert.equal(await state.commands['claudeSessions.sendMessage'](session, 'Carry on', 'claude', 'same', false), false);
+    assert.match(state.warnings.pop(), /Sending your message to it from here would/);
+    assert.equal(state.terminals.length, 0);
+    // Chat here refuses unless told to go ahead, and the message stays in the box.
+    state.panelPosts.length = 0;
+    await state.panels[0].onMessage({ command: 'chatSend', text: 'hello' });
+    assert.match(state.warnings.pop(), /Chatting here as well would put a second Claude Code process/);
+    assert.deepEqual(state.panelPosts.map((m) => m.type), ['sendFailed']);
+    // Going ahead anyway resumes.
+    state.answer = (_m, items) => items.find((i) => i === 'Resume Anyway');
+    assert.equal(await state.commands['claudeSessions.resume'](session), true);
+    assert.equal(state.terminals.length, 1);
+    state.answer = undefined;
+
+    // The process exits (cleanly: its file goes): the card and the open transcript stop saying so.
+    fs.rmSync(path.join(registry, `${process.pid}.json`));
+    const watcher = state.watchers.find((w) => !w.disposed && w.pattern.base.fsPath === registry);
+    assert.ok(watcher, 'the registry folder is watched');
+    watcher.change.forEach((f) => f());
+    await waitFor(() => !card().live, 'the card to stop showing the session live');
+    await waitFor(() => state.panelPosts.some((m) => m.type === 'liveElsewhere' && m.html === ''), 'the transcript to drop its notice');
+    assert.deepEqual(state.errors, []);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

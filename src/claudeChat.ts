@@ -742,6 +742,11 @@ export class ClaudeChat {
     return this.busy && !!this.child;
   }
 
+  /** The running process's pid, so its entry in Claude Code's registry of live sessions is known to be this chat. */
+  get pid(): number | undefined {
+    return this.child?.pid;
+  }
+
   /** A process is up or a turn is pending: the session has a writer. */
   get active(): boolean {
     return !!this.child || this.busy || this.queue.length > 0;

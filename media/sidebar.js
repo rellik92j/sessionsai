@@ -175,6 +175,10 @@
       preventDefaultContextMenuItems: true,
     });
     const meta = [
+      // Open in another Claude Code process right now: resuming or chatting would put a second one on it.
+      s.live
+        ? `<span class="tag live-elsewhere${s.live.busy ? ' busy' : ''}" title="${esc(s.live.label)}. Another Claude Code process has this session open; resuming it here as well asks first."><i class="codicon codicon-broadcast"></i>${esc(s.live.label)}</span>`
+        : '',
       // Which tool the session is from, once there is more than one to tell apart.
       state.sources.length ? `<span class="tag source ${esc(s.source)}" title="${esc(info.label)}"><i class="codicon codicon-${esc(info.icon)}"></i>${esc(info.short)}</span>` : '',
       showProject ? `<span class="tag project" style="--hue:${s.hue}"><span class="swatch"></span>${hl(s.project, toks)}</span>` : '',
