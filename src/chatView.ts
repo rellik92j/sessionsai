@@ -2,21 +2,69 @@
 // No VS Code imports here, so it can be unit-tested with plain Node.
 
 import { ChatStatus, LivePiece, PERMISSION_MODES, PermissionMode, PermissionPiece } from './claudeChat';
+import { COPILOT_MODES, CopilotMode } from './copilotChat';
+import type { SessionSource } from './sessionParser';
 import { escapeHtml, formatUsd } from './format';
 import { renderMarkdown } from './markdown';
 
 const CLAUDE_MARK = `<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><g stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M12 3.5v17M3.5 12h17M6 6l12 12M18 6L6 18"/></g></svg>`;
 
-/** The permission modes as the chat's picker shows them. */
-export const MODE_LABELS: Record<PermissionMode, { label: string; title: string }> = {
-  ask: { label: 'Ask me', title: 'Edits and commands that need approval show a card here, to allow or deny.' },
-  acceptEdits: { label: 'Accept edits', title: 'File edits and file-system commands in the session folder run without asking; anything else asks you here.' },
-  plan: { label: 'Plan', title: 'Claude only plans, then asks you here to approve the plan.' },
-  auto: { label: 'Auto', title: "Claude Code's own classifier decides what runs; nothing is asked." },
-  deny: { label: 'Decline prompts', title: 'Anything that needs approval is declined without asking, and Claude carries on without it.' },
+/**
+ * The permission modes as the chat's picker shows them. `note` ends the message box's line "Chats with this session
+ * in this tab. <tool> runs in the background; <note>".
+ */
+export const MODE_LABELS: Record<PermissionMode, { label: string; title: string; note: string }> = {
+  ask: { label: 'Ask me', title: 'Edits and commands that need approval show a card here, to allow or deny.', note: 'tools that need approval ask you here first.' },
+  acceptEdits: {
+    label: 'Accept edits',
+    title: 'File edits and file-system commands in the session folder run without asking; anything else asks you here.',
+    note: 'tools that need approval ask you here first.',
+  },
+  plan: { label: 'Plan', title: 'Claude only plans, then asks you here to approve the plan.', note: 'tools that need approval ask you here first.' },
+  auto: { label: 'Auto', title: "Claude Code's own classifier decides what runs; nothing is asked.", note: 'tools that need approval ask you here first.' },
+  deny: { label: 'Decline prompts', title: 'Anything that needs approval is declined without asking, and Claude carries on without it.', note: 'tools that need approval are declined.' },
 };
 
-export const chatModes = () => PERMISSION_MODES.map((id) => ({ id, ...MODE_LABELS[id] }));
+/**
+ * Copilot CLI cannot ask for approval in a chat run from here, so its modes say up front what runs (copilotChat.ts).
+ * A change applies from the next message.
+ */
+export const COPILOT_MODE_LABELS: Record<CopilotMode, { label: string; title: string; note: string }> = {
+  read: {
+    label: 'Read only',
+    title: 'Copilot can read and search files in the session folder. File edits and shell commands are declined (Copilot CLI cannot ask here).',
+    note: 'it can read files, and edits and commands are declined.',
+  },
+  edits: {
+    label: 'Allow edits',
+    title: 'Copilot can also edit files (--allow-tool=write). Shell commands are still declined.',
+    note: 'it can read and edit files, and commands are declined.',
+  },
+  all: {
+    label: 'Allow all tools',
+    title: 'Every tool runs without asking, shell commands included (--allow-all-tools). Paths stay limited to the session folder.',
+    note: 'every tool runs without asking, shell commands included.',
+  },
+};
+
+/** The picker's modes for a session's tool. */
+export const chatModes = (source: SessionSource = 'claude') =>
+  source === 'copilot-cli'
+    ? COPILOT_MODES.map((id) => ({ id, ...COPILOT_MODE_LABELS[id] }))
+    : PERMISSION_MODES.map((id) => ({ id, ...MODE_LABELS[id] }));
+
+/** Who replies in the chat's pending part: the name over the reply, and its avatar. */
+export interface ChatSpeaker {
+  name: string;
+  /** The avatar's class and inner HTML. */
+  avatarClass: string;
+  mark: string;
+}
+
+export const CLAUDE_SPEAKER: ChatSpeaker = { name: 'Claude', avatarClass: 'claude-avatar', mark: CLAUDE_MARK };
+export const COPILOT_SPEAKER: ChatSpeaker = { name: 'Copilot', avatarClass: 'source-avatar', mark: '<i class="codicon codicon-copilot"></i>' };
+
+export const chatSpeaker = (source: SessionSource): ChatSpeaker => (source === 'copilot-cli' ? COPILOT_SPEAKER : CLAUDE_SPEAKER);
 
 const TOOL_STATUS: Record<'running' | 'ok' | 'failed' | 'denied', { icon: string; title: string; cls: string }> = {
   running: { icon: 'loading codicon-modifier-spin', title: 'Running', cls: 'pending' },
@@ -153,7 +201,7 @@ function renderPiece(p: LivePiece, activeRequest?: string): string {
  * streams in, with what the log will not show (declined tools, errors). While Claude has said nothing yet, a typing
  * indicator. Last, the messages `waiting` for an ended chat to finish its reply and exit, which start a new chat.
  */
-export function renderLive(pieces: LivePiece[], busy: boolean, waiting: readonly string[] = []): string {
+export function renderLive(pieces: LivePiece[], busy: boolean, waiting: readonly string[] = [], speaker: ChatSpeaker = CLAUDE_SPEAKER): string {
   const out: string[] = [];
   let reply: string[] = [];
   // Requests are answered in order: only the oldest open card has its buttons.
@@ -162,7 +210,7 @@ export function renderLive(pieces: LivePiece[], busy: boolean, waiting: readonly
     const body = reply.filter(Boolean).join('');
     if (body) {
       out.push(
-        `<div class="msg assistant chat-pending"><div class="avatar claude-avatar">${CLAUDE_MARK}</div><div class="msg-main"><div class="msg-meta"><strong>Claude</strong></div>${body}</div></div>`,
+        `<div class="msg assistant chat-pending"><div class="avatar ${speaker.avatarClass}">${speaker.mark}</div><div class="msg-main"><div class="msg-meta"><strong>${escapeHtml(speaker.name)}</strong></div>${body}</div></div>`,
       );
     }
     reply = [];
@@ -180,7 +228,7 @@ export function renderLive(pieces: LivePiece[], busy: boolean, waiting: readonly
   }
   // Waiting for the first word: nothing of the reply shows yet.
   if (busy && !pieces.some((p) => p.kind !== 'user' && p.kind !== 'notice' && renderPiece(p))) {
-    reply.push('<div class="chat-typing" aria-label="Claude is working"><span></span><span></span><span></span></div>');
+    reply.push(`<div class="chat-typing" aria-label="${escapeHtml(speaker.name)} is working"><span></span><span></span><span></span></div>`);
   }
   flush();
   for (const text of waiting) {
@@ -192,7 +240,7 @@ export function renderLive(pieces: LivePiece[], busy: boolean, waiting: readonly
 }
 
 /** The chat bar's state, as the page gets it. `waiting`: messages held until an ended chat has exited. */
-export function chatStateMessage(status: ChatStatus | undefined, mode: PermissionMode, waiting = 0) {
+export function chatStateMessage(status: ChatStatus | undefined, mode: string, waiting = 0) {
   const t = status?.lastTurn;
   const last = t
     ? t.interrupted

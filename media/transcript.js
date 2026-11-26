@@ -99,7 +99,7 @@
     let sending = false;
 
     const info = () => cfg.targets.find((t) => t.id === target) || cfg.targets[0];
-    // "Chat here" (Claude Code sessions): the reply streams into this tab from a Claude Code process in the background.
+    // "Chat here" (Claude Code and Copilot CLI sessions): the reply streams into this tab from the CLI in the background.
     const chat = cfg.chat;
     const chatBar = document.getElementById('chat-bar');
     const chatMode = document.getElementById('chat-mode');
@@ -129,9 +129,10 @@
       if (target === 'here') {
         // A full context or a cold cache is worth knowing, but chatting here is still this session.
         const why = reason();
-        const approval =
-          chatMode && chatMode.value === 'deny' ? 'tools that need approval are declined.' : 'tools that need approval ask you here first.';
-        status.innerHTML = `<i class="codicon codicon-${t.icon}"></i><span>${esc(`Chats with this session in this tab. Claude Code runs in the background; ${approval}`)}</span>${why ? `<span class="why">${esc(why)}</span>` : ''}`;
+        const picked = chat && chatMode ? chat.modes.find((m) => m.id === chatMode.value) : null;
+        const approval = (picked && picked.note) || 'tools that need approval ask you here first.';
+        const tool = (chat && chat.tool) || 'Claude Code';
+        status.innerHTML = `<i class="codicon codicon-${t.icon}"></i><span>${esc(`Chats with this session in this tab. ${tool} runs in the background; ${approval}`)}</span>${why ? `<span class="why">${esc(why)}</span>` : ''}`;
         renderChat();
         return;
       }
@@ -154,16 +155,17 @@
       chatBar.hidden = !(target === 'here' || s.running || s.busy || s.waiting);
       if (chatMode.value !== s.mode) chatMode.value = s.mode;
       const yours = s.waiting > 1 ? `Your ${s.waiting} messages start` : 'Your message starts';
+      const who = chat.assistant || 'Claude';
       chatState.textContent = s.finishing
         ? s.waiting
-          ? `Chat ended: Claude is finishing its reply. ${yours} a new chat after it.`
-          : 'Chat ended: Claude is finishing its reply, then it stops.'
+          ? `Chat ended: ${who} is finishing its reply. ${yours} a new chat after it.`
+          : `Chat ended: ${who} is finishing its reply, then it stops.`
         : s.waiting
         ? `${yours} a new chat once the ended one has stopped…`
         : s.awaiting
         ? `Waiting for your answer${s.awaiting > 1 ? ` (${s.awaiting} requests)` : ''}…${s.queued ? ` ${s.queued} queued.` : ''}`
         : s.busy
-        ? `Claude is working…${s.queued ? ` ${s.queued} queued.` : ''}`
+        ? `${who} is working…${s.queued ? ` ${s.queued} queued.` : ''}`
         : s.running
           ? `Ready${s.last ? ` · ${s.last}` : ''}`
           : s.last || '';

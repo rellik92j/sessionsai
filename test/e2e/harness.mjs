@@ -14,6 +14,8 @@ import { fileURLToPath } from 'node:url';
 export const ROOT = path.resolve(fileURLToPath(new URL('../..', import.meta.url)));
 export const OUT = path.join(ROOT, '.e2e-out');
 const STAND_IN = path.join(ROOT, 'test', 'e2e', 'stand-in-claude.mjs');
+/** Stands in for one Copilot CLI turn in Chat here (SESSIONSAI_E2E_COPILOT). */
+const STAND_IN_COPILOT = path.join(ROOT, 'test', 'e2e', 'stand-in-copilot.mjs');
 /** Stands in for the Claude Code extension, so "Open in Claude Code Chat" is offered; it only records being asked. */
 const CLAUDE_CODE_STUB = path.join(ROOT, 'test', 'e2e', 'claude-code-stub');
 
@@ -29,7 +31,8 @@ export const sessionIdFor = (n) => `e2e00000-0000-4000-8000-${String(n).padStart
  * The sandbox: folders, synthetic sessions, the terminal stub and the VS Code settings. `sessions` is a list of
  * { id, prompt, log?, files? } and each becomes a two-record log (the prompt and a short reply) dated a day ago, so the
  * chat's "written moments ago" guard does not fire. A session with `log` ({ id, cwd }) => text gets that log instead,
- * and `files` ({ id, cwd }) => { 'path/relative/to/the/project/folder': text } adds files beside it.
+ * and `files` ({ id, cwd }) => { 'path/relative/to/the/project/folder': text } adds files beside it. A session with
+ * `source: 'copilot-cli'` is a GitHub Copilot CLI session instead, in the sandbox's COPILOT_HOME.
  */
 export function makeSandbox(sessions) {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'sessionsai-e2e-'));
@@ -53,7 +56,23 @@ export function makeSandbox(sessions) {
   const projectDir = path.join(s.claudeConfig, 'projects', projectDirName(s.work));
   mkdirSync(projectDir, { recursive: true });
   const dayAgo = Date.now() - 24 * 3600 * 1000;
-  for (const { id, prompt, log, files } of sessions) {
+  for (const { id, prompt, log, files, source } of sessions) {
+    if (source === 'copilot-cli') {
+      // A GitHub Copilot CLI session: session-state/<id>/events.jsonl with workspace.yaml beside it.
+      const dir = path.join(s.copilot, 'session-state', id);
+      mkdirSync(dir, { recursive: true });
+      const at = (ms) => new Date(dayAgo + ms).toISOString();
+      const records = [
+        { type: 'session.start', data: { sessionId: id, version: 1, producer: 'copilot-agent', copilotVersion: '1.0.0', context: { cwd: s.work } }, id: `${id.slice(0, 8)}-c1`, timestamp: at(0), parentId: null },
+        { type: 'user.message', data: { content: prompt, transformedContent: prompt }, id: `${id.slice(0, 8)}-c2`, timestamp: at(1000), parentId: `${id.slice(0, 8)}-c1` },
+        { type: 'assistant.message', data: { messageId: `${id.slice(0, 8)}-m1`, model: 'copilot-stand-in', content: 'Ready when you are.', toolRequests: [] }, id: `${id.slice(0, 8)}-c3`, timestamp: at(2000), parentId: `${id.slice(0, 8)}-c2` },
+      ];
+      const file = path.join(dir, 'events.jsonl');
+      writeFileSync(file, records.map((r) => JSON.stringify(r)).join('\n') + '\n');
+      writeFileSync(path.join(dir, 'workspace.yaml'), `id: ${id}\ncwd: ${s.work}\ncreated_at: ${at(0)}\nupdated_at: ${at(2000)}\n`);
+      utimesSync(file, new Date(dayAgo), new Date(dayAgo));
+      continue;
+    }
     if (log) {
       // A scenario that needs a log of its own shape builds it; `files` are more files next to it (subagent runs).
       const file = path.join(projectDir, `${id}.jsonl`);
@@ -111,10 +130,13 @@ export function makeSandbox(sessions) {
     'terminal.integrated.defaultProfile.windows': 'Command Prompt',
     // Every source of sessions points into the sandbox.
     'claudeSessions.projectsDir': path.join(s.claudeConfig, 'projects'),
-    'claudeSessions.sources': ['claude'],
+    // Copilot CLI sessions are listed only when a scenario has one, so the others see the sidebar as before.
+    'claudeSessions.sources': sessions.some((x) => x.source === 'copilot-cli') ? ['claude', 'copilot-cli'] : ['claude'],
     'claudeSessions.copilotDir': s.copilot,
     'claudeSessions.vscodeUserDir': s.vscodeUser,
     'claudeSessions.claudeCommand': s.terminalStub,
+    // Resume of a Copilot CLI session runs `<copilotCommand> --resume <id>`: the same recording stub.
+    'claudeSessions.copilotCommand': s.terminalStub,
     // The transcript's Resume and Open in chat buttons keep the tab open, so a scenario can see what is left in it.
     'claudeSessions.closeTranscriptOnResume': false,
   };
@@ -134,6 +156,7 @@ function vscodeEnv(s) {
     CLAUDE_CONFIG_DIR: s.claudeConfig,
     COPILOT_HOME: s.copilot,
     SESSIONSAI_E2E_CLAUDE: STAND_IN,
+    SESSIONSAI_E2E_COPILOT: STAND_IN_COPILOT,
     SESSIONSAI_E2E_EVENTS: s.events,
   };
 }
@@ -285,14 +308,16 @@ export function waitEvent(s, sessionId, name, match = () => true, timeout = 20_0
   return waitFor(`the stand-in to record "${name}" for ${sessionId}`, () => events(s, sessionId).find((e) => e.event === name && match(e)), timeout);
 }
 
-/** The session's log file. */
-export function logPath(s, sessionId) {
-  return path.join(s.claudeConfig, 'projects', projectDirName(s.work), `${sessionId}.jsonl`);
+/** The session's log file: a Claude Code session's, or with `source` 'copilot-cli' a Copilot CLI session's. */
+export function logPath(s, sessionId, source = 'claude') {
+  return source === 'copilot-cli'
+    ? path.join(s.copilot, 'session-state', sessionId, 'events.jsonl')
+    : path.join(s.claudeConfig, 'projects', projectDirName(s.work), `${sessionId}.jsonl`);
 }
 
 /** The session's log text. */
-export function logText(s, sessionId) {
-  return readFileSync(logPath(s, sessionId), 'utf8');
+export function logText(s, sessionId, source = 'claude') {
+  return readFileSync(logPath(s, sessionId, source), 'utf8');
 }
 
 /** Removes the sandbox; Windows may hold a file a moment after VS Code exits, so it retries. */

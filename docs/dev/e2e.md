@@ -51,14 +51,17 @@ Windows is where it has been run. The harness has a POSIX terminal stub too, but
   temp folder (`sessionsai-e2e-*`), so the user's own VS Code, settings and extensions are never touched. Environment
   variables starting `VSCODE_` or `ELECTRON_` are dropped, so it cannot attach to a VS Code that is already running.
 - **Sessions** come from a temp `CLAUDE_CONFIG_DIR` holding one synthetic session per scenario. The settings point
-  `claudeSessions.projectsDir`, `copilotDir` and `vscodeUserDir` into the sandbox and show only Claude Code sessions,
+  `claudeSessions.projectsDir`, `copilotDir` and `vscodeUserDir` into the sandbox and show only Claude Code sessions (Copilot CLI ones too when a scenario has one),
   so the real `~/.claude`, `~/.copilot` and VS Code chat folders are never read.
 - **The chat's `claude`** is `test/e2e/stand-in-claude.mjs`. The extension runs it instead of `claude.exe` only when
   the environment variable `SESSIONSAI_E2E_CLAUDE` names it (see `chatLaunch` and `spawnChat` in
   `src/transcriptPanel.ts`); it runs on VS Code's own Node (`ELECTRON_RUN_AS_NODE`). Nobody else sets that variable,
   and there is no setting for it.
-- **Resume's terminal** runs `claudeSessions.claudeCommand`, which the sandbox sets to a stub script that only appends
-  a `terminal-resume` line to the events file.
+- **The chat's `copilot`**, for a GitHub Copilot CLI session, is `test/e2e/stand-in-copilot.mjs`, run the same way
+  when `SESSIONSAI_E2E_COPILOT` names it (see `copilotLaunch` and `spawnCopilot`). Copilot CLI sessions are written to
+  the sandbox's `COPILOT_HOME` (`copilotDir`), and the `sources` setting lists them only when a scenario has one.
+- **Resume's terminal** runs `claudeSessions.claudeCommand` (or `copilotCommand` for a Copilot CLI session), which the
+  sandbox sets to a stub script that only appends a `terminal-resume` line to the events file.
 - **The Claude Code extension** is `test/e2e/claude-code-stub/`, loaded as a second `--extensionDevelopmentPath` with
   the id `anthropic.claude-code`, so SessionsAI offers Open in Claude Code Chat (sidebar menu and the transcript's
   "Open in chat" button). Its `claude-vscode.editor.open` command only appends a `claude-code-open` line (with the
@@ -93,6 +96,19 @@ It writes what happened to it to the events file (`SESSIONSAI_E2E_EVENTS`), one 
 (`how`: `completed` or `interrupted`), `stdin-end`, `exit`. The terminal stub adds `terminal-resume` and the Claude
 Code stub `claude-code-open`. Scenarios assert on these, because they show what the process actually saw, which the
 page alone cannot.
+
+## The stand-in copilot
+
+Copilot CLI runs one process per message (`copilot --resume=<id> --output-format json --stream on`, the message on
+stdin), so the stand-in plays one turn and exits. It writes Copilot CLI's JSON lines to stdout and appends the same
+records, with the same `id`s, to the session's `events.jsonl` (shapes from `test/fixtures/copilot-stream/`, synthetic
+text). Every message streams the same 12-line reply as the stand-in claude; one containing the word `edit` first makes
+an `apply_patch` call, which runs when the arguments allow writes (`--allow-tool=write` or `--allow-all-tools`) and is
+declined otherwise, as Copilot CLI declines what it cannot ask about.
+
+Its events: `start` (with `args`), `turn-start` (`text`: the message exactly as it came on stdin), `tool` (`allowed`),
+`turn-end`, `exit`. Stop kills the process, so a stopped turn records neither `turn-end` nor `exit`; scenarios check
+that its `pid` is gone instead.
 
 ## Areas
 
@@ -134,7 +150,8 @@ over every area, so a scenario's session does not change with the areas chosen.
 
 ## The scenarios
 
-Area `chat`, `test/e2e/scenarios/chat.mjs`, each on its own session:
+Area `chat`, `test/e2e/scenarios/chat.mjs`, each on its own session (a Claude Code session, or a Copilot CLI one for
+the `copilot-` scenarios, which set `source: 'copilot-cli'`):
 
 | Name | What it checks |
 |---|---|
@@ -158,6 +175,13 @@ Area `chat`, `test/e2e/scenarios/chat.mjs`, each on its own session:
 | `live-sidebar-resume` | The same live session: Resume Session and Open in Claude Code Chat from the sidebar's right-click menu each show the modal that names the subagent and the shell; Cancel opens nothing. |
 | `live-topbar-resume` | The same from the transcript's top bar (Open in chat, Resume), then Resume Anyway does start the terminal. |
 | `live-chat-here` | Chat here on the live session: the modal shows, Cancel starts no chat process, and the message stays in the box. |
+| `copilot-stream` | A Copilot CLI session: Chat here starts `--resume=<id> --output-format json --stream on` with no allowances, the reply streams in (the bar says Copilot is working), lands in the logged conversation, and the bar shows the last turn. |
+| `copilot-second-message` | A second message is a new process resuming the same session id, and the session log has both prompts. |
+| `copilot-stop` | Stop kills the turn's process (its pid is gone, no `turn-end`), the bar says "Last turn stopped", the reply never finishes in the log, and the next message starts a new turn. |
+| `copilot-message-intact` | A message with quotes, a newline, `%`, `$`, backticks, `^`, a pipe and `<b>` reaches the stand-in's stdin and the log exactly as typed, and none of it is on the command line. |
+| `copilot-modes` | The picker offers Read only (the default), Allow edits and Allow all tools; Allow edits passes `--allow-tool=write` and the edit runs; Read only passes nothing, the edit is declined, and the tab notes that Allow edits would let it run. |
+| `copilot-resume-while-replying` | Resume Session from the sidebar during a Copilot reply: the "Copilot is still replying" modal names two GitHub Copilot CLI processes; Stop It Now kills the turn's process, and then the terminal starts. |
+| `copilot-terminal-guard` | Resume Session from the sidebar opens the terminal; then Chat here refuses with a warning naming two GitHub Copilot CLI processes, starts nothing, and the message stays in the box. |
 
 Area `transcript`, `test/e2e/scenarios/transcript.mjs`, reading a session as a chat, each on a synthetic log built for it:
 

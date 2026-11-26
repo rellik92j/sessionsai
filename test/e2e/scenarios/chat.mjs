@@ -296,6 +296,169 @@ const LIVE_SCENARIOS = [
   },
 ];
 
+// ---------- Chat here with a GitHub Copilot CLI session (stand-in-copilot.mjs) ----------
+
+const COPILOT = 'copilot-cli';
+/** True once no process has the pid any more: Stop kills a Copilot turn, so its stand-in records no exit. */
+const pidGone = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (err) {
+    return err.code === 'ESRCH';
+  }
+};
+/** The user messages in a Copilot session's log, in order. */
+const copilotUsers = (ctx) =>
+  logText(ctx.s, ctx.id, COPILOT)
+    .split('\n')
+    .filter((l) => l.includes('"type":"user.message"'))
+    .map((l) => JSON.parse(l).data.content);
+const starts = (ctx) => events(ctx.s, ctx.id).filter((e) => e.event === 'start');
+const toastText = (ctx) => ctx.page.locator('.notifications-toasts .notification-toast').allTextContents().then((t) => t.join('\n'));
+
+const COPILOT_SCENARIOS = [
+  {
+    name: 'copilot-stream',
+    source: COPILOT,
+    prompt: 'E2E Copilot stream a reply',
+    async run(ctx) {
+      const frame = await openTranscript(ctx);
+      await chatHere(frame);
+      await send(frame, 'Tell me twelve lines.');
+      const start = await waitEvent(ctx.s, ctx.id, 'start');
+      assert(JSON.stringify(start.args) === JSON.stringify([`--resume=${ctx.id}`, '--output-format', 'json', '--stream', 'on']), `started with ${JSON.stringify(start.args)}`);
+      await midReply(ctx);
+      assert(!(await liveText(ctx)).includes(LAST_LINE), 'the whole reply showed at once instead of streaming in');
+      assert(/Copilot is working/.test(await chatState(ctx)), `the chat bar says "${await chatState(ctx)}"`);
+      await waitFor('the finished reply in the logged conversation', () => logged(ctx, LAST_LINE), 30_000);
+      await waitFor('the chat bar to show the last turn', async () => /^Last turn \d/.test(await chatState(ctx)));
+      await waitFor('the pending part to empty', async () => !(await liveText(ctx)).includes(LAST_LINE));
+    },
+  },
+  {
+    name: 'copilot-second-message',
+    source: COPILOT,
+    prompt: 'E2E Copilot second message continues the session',
+    async run(ctx) {
+      const frame = await openTranscript(ctx);
+      await chatHere(frame);
+      await send(frame, 'Tell me twelve lines.');
+      await waitEvent(ctx.s, ctx.id, 'turn-end', undefined, 30_000);
+      await send(await transcript(ctx), 'And twelve more.');
+      await waitFor('the second turn to end', () => events(ctx.s, ctx.id).filter((e) => e.event === 'turn-end').length === 2, 30_000);
+      const [a, b] = starts(ctx);
+      assert(a && b && a.pid !== b.pid, 'each message was not its own process');
+      assert(a.args[0] === `--resume=${ctx.id}` && b.args[0] === a.args[0], `the turns resumed ${a.args[0]} and ${b?.args[0]}`);
+      const users = copilotUsers(ctx);
+      assert(JSON.stringify(users.slice(-2)) === JSON.stringify(['Tell me twelve lines.', 'And twelve more.']), `the session log has ${JSON.stringify(users)}`);
+      await waitFor('both prompts in the logged conversation', async () => (await logged(ctx, 'Tell me twelve lines.')) && (await logged(ctx, 'And twelve more.')), 15_000);
+    },
+  },
+  {
+    name: 'copilot-stop',
+    source: COPILOT,
+    prompt: 'E2E Copilot stop the reply',
+    async run(ctx) {
+      const frame = await openTranscript(ctx);
+      await chatHere(frame);
+      await send(frame, 'Tell me twelve lines.');
+      await midReply(ctx);
+      const { pid } = starts(ctx)[0];
+      await click(ctx, '#chat-stop');
+      await waitFor('the chat bar to say the turn stopped', async () => /Last turn stopped/.test(await chatState(ctx)), 10_000);
+      await waitFor("the turn's process to be gone", () => pidGone(pid), 10_000);
+      assert(!events(ctx.s, ctx.id).some((e) => e.event === 'turn-end'), 'the turn ran to its end after Stop');
+      assert(!logText(ctx.s, ctx.id, COPILOT).includes(LAST_LINE), 'the reply ran to the end after Stop');
+      // The chat goes on: the next message is a new turn.
+      await send(await transcript(ctx), 'Tell me twelve lines again.');
+      await waitFor('a new turn to start', () => starts(ctx).length === 2, 10_000);
+    },
+  },
+  {
+    name: 'copilot-message-intact',
+    source: COPILOT,
+    prompt: 'E2E Copilot message arrives intact',
+    async run(ctx) {
+      const text = 'He said "hi" & \'yo\'\nline 2: %PATH% $HOME `tick` ^caret | pipe <b>';
+      const frame = await openTranscript(ctx);
+      await chatHere(frame);
+      await send(frame, text);
+      const got = await waitEvent(ctx.s, ctx.id, 'turn-start');
+      assert(got.text === text, `the stand-in got ${JSON.stringify(got.text)}`);
+      await waitEvent(ctx.s, ctx.id, 'turn-end', undefined, 30_000);
+      assert(copilotUsers(ctx).at(-1) === text, `the log has ${JSON.stringify(copilotUsers(ctx).at(-1))}`);
+      assert(!starts(ctx)[0].args.some((a) => a.includes('PATH') || a.includes('tick')), 'the message was on the command line');
+    },
+  },
+  {
+    name: 'copilot-modes',
+    source: COPILOT,
+    prompt: 'E2E Copilot tool modes',
+    async run(ctx) {
+      const frame = await openTranscript(ctx);
+      await chatHere(frame);
+      const modes = await frame.$$eval('#chat-mode option', (els) => els.map((o) => o.textContent));
+      assert(JSON.stringify(modes) === JSON.stringify(['Read only', 'Allow edits', 'Allow all tools']), `the picker offers ${JSON.stringify(modes)}`);
+      assert((await frame.$eval('#chat-mode', (el) => el.value)) === 'read', 'read only is not the default');
+      // Allow edits: the call runs.
+      await frame.selectOption('#chat-mode', 'edits');
+      await send(frame, 'Make an edit.');
+      const first = await waitEvent(ctx.s, ctx.id, 'start');
+      assert(first.args.includes('--allow-tool=write') && !first.args.includes('--allow-all-tools'), `started with ${JSON.stringify(first.args)}`);
+      const allowed = await waitEvent(ctx.s, ctx.id, 'tool');
+      assert(allowed.allowed === true, 'the edit was declined with Allow edits');
+      await waitEvent(ctx.s, ctx.id, 'turn-end', undefined, 30_000);
+      // Read only: the same call is declined, and the tab says what would let it run.
+      await (await transcript(ctx)).selectOption('#chat-mode', 'read');
+      await send(await transcript(ctx), 'Make an edit again.');
+      await waitFor('a second turn', () => starts(ctx).length === 2, 10_000);
+      assert(!starts(ctx)[1].args.some((a) => a.startsWith('--allow')), `read only started with ${JSON.stringify(starts(ctx)[1].args)}`);
+      await waitFor('the declined call to be noted in the tab', async () => /Declined apply_patch.*"Allow edits"/.test(await liveText(ctx)), 10_000);
+      assert(events(ctx.s, ctx.id).filter((e) => e.event === 'tool')[1]?.allowed === false, 'the edit ran in read only');
+    },
+  },
+  {
+    name: 'copilot-resume-while-replying',
+    source: COPILOT,
+    prompt: 'E2E Copilot resume while replying',
+    async run(ctx) {
+      const frame = await openTranscript(ctx);
+      await chatHere(frame);
+      await send(frame, 'Tell me twelve lines.');
+      await midReply(ctx);
+      const { pid } = starts(ctx)[0];
+      await sidebarMenu(ctx, 'Resume Session');
+      const box = await modal(ctx, 'Copilot is still replying');
+      const text = (await box.textContent()) || '';
+      assert(/two GitHub Copilot CLI processes/.test(text), `the modal says: ${text}`);
+      await box.locator('.monaco-button', { hasText: 'Stop It Now' }).click();
+      await waitFor("the turn's process to be gone", () => pidGone(pid), 10_000);
+      const term = await waitEvent(ctx.s, ctx.id, 'terminal-resume', undefined, 20_000);
+      assert(!events(ctx.s, ctx.id).some((e) => e.event === 'turn-end'), 'Stop It Now let the turn finish');
+      assert(String(term.args).includes(ctx.id), `the terminal resumed ${term.args}`);
+    },
+  },
+  {
+    name: 'copilot-terminal-guard',
+    source: COPILOT,
+    prompt: 'E2E Copilot open in a terminal',
+    async run(ctx) {
+      const text = 'Not while the terminal has it.';
+      await sidebarMenu(ctx, 'Resume Session');
+      await waitEvent(ctx.s, ctx.id, 'terminal-resume', undefined, 20_000);
+      const frame = await openTranscript(ctx);
+      await chatHere(frame);
+      await send(frame, text);
+      await waitFor('the warning that the session is open in a terminal', async () => /open in a terminal.*GitHub Copilot CLI/s.test(await toastText(ctx)), 10_000);
+      await new Promise((r) => setTimeout(r, 2_500));
+      assert(!starts(ctx).length, 'a chat turn started anyway');
+      await waitFor('the message to stay in the box', async () => (await composerText(ctx)) === text, 5_000);
+      await ctx.page.keyboard.press('Escape');
+    },
+  },
+];
+
 // ---------- the scenarios ----------
 const SCENARIOS = [
   {
@@ -596,6 +759,7 @@ const SCENARIOS = [
     },
   },
   ...LIVE_SCENARIOS,
+  ...COPILOT_SCENARIOS,
 ];
 /** The area: every scenario above has its own synthetic session, titled by its `prompt`. */
 export default { name: 'chat', scenarios: SCENARIOS };

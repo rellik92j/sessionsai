@@ -630,11 +630,23 @@ test('Copilot CLI and VS Code Chat sessions: source chips, filters, search, tran
     html = state.panels[0].webview.html;
     assert.match(html, /GitHub Copilot CLI/);
     assert.match(html, /Create Chat Session/);
-    // "Chat here" is for Claude Code sessions only: not offered, and refused if asked for.
-    assert.doesNotMatch(html, /id="chat-live"|id="chat-bar"|&quot;here&quot;/);
+    // "Chat here" is offered for a Copilot CLI session too, with Copilot's own modes, read only first.
+    assert.match(html, /id="chat-live"/);
+    assert.match(html, /id="chat-bar"/);
+    const copilotBox = JSON.parse(/data-composer="([^"]*)"/.exec(html)[1].replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>'));
+    assert.equal(copilotBox.target, 'here');
+    assert.deepEqual(copilotBox.targets.map((x) => x.id).slice(0, 2), ['here', 'copilot-cli']);
+    assert.equal(copilotBox.chat.mode, 'read');
+    assert.deepEqual(copilotBox.chat.modes.map((m) => m.id), ['read', 'edits', 'all']);
+    assert.equal(copilotBox.chat.tool, 'GitHub Copilot CLI');
+    assert.equal(copilotBox.chat.assistant, 'Copilot');
+    // A VS Code chat has no CLI to run here: not offered, and refused if asked for.
+    await state.commands['claudeSessions.openTranscript']({ sessionKey: chat.id });
+    assert.doesNotMatch(state.panels[0].webview.html, /id="chat-live"|id="chat-bar"|&quot;here&quot;/);
     state.panelPosts.length = 0;
     await state.panels[0].onMessage({ command: 'chatSend', text: 'hello' });
     assert.deepEqual(state.panelPosts.map((m) => m.type), ['sendFailed']);
+    await state.commands['claudeSessions.openTranscript']({ sessionKey: `copilot-cli:${shared}` });
 
     // Open in Claude Code Chat refuses other sources; resuming Copilot runs its CLI in the session's folder.
     const copilotSession = { sessionKey: `copilot-cli:${shared}` };
@@ -1501,6 +1513,165 @@ test('Chat here: refuses a second writer, shows start errors in the tab, and spa
     await require(path.join(process.env.EXT_DIR || path.join(__dirname, '..'), 'dist', 'extension.js')).deactivate();
     assert.deepEqual(state.errors, []);
   } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Chat here with a Copilot CLI session: one process per message on the same session, the message on stdin, Stop kills the turn', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-sessions-copilot-chat-'));
+  const repo = path.join(root, 'repo');
+  const copilotDir = path.join(root, 'copilot');
+  const ID = 'c0c0c0c0-1111-4222-8333-944455556666';
+  const sessionDir = path.join(copilotDir, 'session-state', ID);
+  const log = path.join(sessionDir, 'events.jsonl');
+  // A stand-in for copilot: records its arguments and stdin, appends the turn to the session log as Copilot CLI does
+  // (the same record ids on stdout and in the log), and replies; a "slow" message streams one delta and then hangs
+  // until killed.
+  const standIn = path.join(root, 'stand-in.js');
+  fs.writeFileSync(
+    standIn,
+    `const fs = require('fs');
+const n = Date.now() + '-' + process.pid;
+let input = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (d) => (input += d));
+process.stdin.on('end', () => {
+  fs.writeFileSync(${JSON.stringify(root)} + '/turn-' + n + '.json', JSON.stringify({ args: process.argv.slice(2), input, cwd: process.cwd() }));
+  const rec = (type, data, id) => ({ type, data, id, timestamp: new Date().toISOString(), parentId: null });
+  const out = (r, logIt = true) => {
+    if (logIt) fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(r) + '\\n');
+    process.stdout.write(JSON.stringify(r) + '\\n');
+  };
+  out(rec('user.message', { content: input }, 'u-' + n));
+  out(rec('assistant.message_start', { messageId: 'm-' + n }, 's-' + n), false);
+  out(rec('assistant.message_delta', { messageId: 'm-' + n, deltaContent: 'Stand-in reply ' }, 'd-' + n), false);
+  if (input.includes('slow')) {
+    setInterval(() => {}, 1000);
+    return;
+  }
+  out(rec('assistant.message', { messageId: 'm-' + n, content: 'Stand-in reply done.', toolRequests: [] }, 'a-' + n));
+  process.stdout.write(JSON.stringify({ type: 'result', sessionId: ${JSON.stringify(ID)}, exitCode: 0 }) + '\\n');
+  process.exit(0);
+});
+`,
+  );
+  const cp = require('child_process');
+  const realSpawn = cp.spawn;
+  const spawned = [];
+  cp.spawn = (exe, args, opts) => {
+    if (exe !== process.execPath || !args.some((a) => String(a).startsWith('--resume='))) {
+      return realSpawn(exe, args, opts);
+    }
+    const child = realSpawn(process.execPath, [standIn, ...args], opts);
+    spawned.push({ args, opts, child });
+    return child;
+  };
+  const alive = (child) => child.exitCode === null && child.signalCode === null;
+  try {
+    fs.mkdirSync(repo);
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(path.join(sessionDir, 'workspace.yaml'), `id: ${ID}\ncwd: ${repo}\nsummary: "Copilot chat test"\n`);
+    const t0 = new Date(Date.now() - 120_000).toISOString();
+    fs.writeFileSync(
+      log,
+      [
+        { type: 'session.start', data: { sessionId: ID, version: 1, producer: 'copilot-agent', copilotVersion: '1.0.0', context: { cwd: repo } }, id: 'e-1', timestamp: t0 },
+        { type: 'user.message', data: { content: 'Start the Copilot chat test' }, id: 'e-2', timestamp: t0 },
+        { type: 'assistant.message', data: { messageId: 'm0', content: 'Ready.', toolRequests: [] }, id: 'e-3', timestamp: t0 },
+      ]
+        .map((r) => JSON.stringify(r))
+        .join('\n') + '\n',
+    );
+    const old = new Date(Date.now() - 60_000);
+    fs.utimesSync(log, old, old);
+    const state = {
+      projectsDir: path.join(root, 'claude'),
+      config: { copilotDir, vscodeUserDir: path.join(root, 'none'), copilotCommand: process.execPath },
+      providers: {},
+      commands: {},
+      panels: [],
+      panelPosts: [],
+      errors: [],
+      terminals: [],
+      infos: [],
+    };
+    const { vscode } = await activateWithSidebar(state);
+    const warnings = [];
+    vscode.window.showWarningMessage = async (m) => (warnings.push(m), undefined);
+    const session = { sessionKey: `copilot-cli:${ID}` };
+    await state.commands['claudeSessions.openTranscript'](session);
+    const panel = state.panels[0];
+    assert.match(panel.webview.html, /id="chat-bar"/);
+    const posted = (type) => state.panelPosts.filter((m) => m.type === type);
+    const chatSend = async (text, permissionMode) => {
+      state.panelPosts.length = 0;
+      await panel.onMessage({ command: 'chatSend', text, permissionMode });
+      return state.panelPosts.find((m) => m.type === 'sent' || m.type === 'sendFailed')?.type;
+    };
+    const turns = () =>
+      fs
+        .readdirSync(root)
+        .filter((f) => f.startsWith('turn-'))
+        .sort()
+        .map((f) => JSON.parse(fs.readFileSync(path.join(root, f), 'utf8')));
+    const turnDone = (n) => waitFor(() => spawned.length >= n && !alive(spawned[n - 1].child) && posted('chatState').at(-1)?.busy === false, `turn ${n} to end`);
+
+    // The message arrives intact on stdin; the command line has only the session and the output flags, no shell.
+    const text = 'He said "hi" & \'yo\'\nline 2: %PATH% $HOME `tick` ^caret | pipe';
+    assert.equal(await chatSend(text, 'read'), 'sent');
+    await turnDone(1);
+    assert.deepEqual(spawned[0].args, [`--resume=${ID}`, '--output-format', 'json', '--stream', 'on']);
+    assert.equal(spawned[0].opts.shell, false);
+    assert.equal(spawned[0].opts.cwd, repo);
+    assert.equal(turns()[0].input, text);
+    assert.ok(posted('chatLive').some((m) => /Stand-in reply/.test(m.html) && /<strong>Copilot<\/strong>/.test(m.html)), 'the reply streamed into the tab');
+    assert.equal(posted('chatState').at(-1).running, false, 'no process between turns');
+    assert.equal(posted('chatState').at(-1).mode, 'read');
+
+    // A Copilot mode applies from the next message; a Claude Code mode is not one.
+    state.panelPosts.length = 0;
+    await panel.onMessage({ command: 'chatMode', mode: 'all' });
+    assert.equal(posted('chatState').at(-1).mode, 'all');
+    await panel.onMessage({ command: 'chatMode', mode: 'ask' });
+    assert.equal(posted('chatState').length, 1, 'a Claude Code mode is ignored');
+
+    // The next message is a new process on the same session, and the log has both turns.
+    assert.equal(await chatSend('second', 'all'), 'sent');
+    await turnDone(2);
+    assert.deepEqual(spawned[1].args, [`--resume=${ID}`, '--output-format', 'json', '--stream', 'on', '--allow-all-tools']);
+    const users = fs
+      .readFileSync(log, 'utf8')
+      .split('\n')
+      .filter((l) => l.includes('"type":"user.message"'))
+      .map((l) => JSON.parse(l).data.content);
+    assert.deepEqual(users, ['Start the Copilot chat test', text, 'second']);
+    assert.deepEqual(warnings, [], "the chat's own log writes are no other writer's");
+
+    // Stop kills that turn's process.
+    assert.equal(await chatSend('slow one', 'all'), 'sent');
+    await waitFor(() => spawned.length === 3 && posted('chatState').at(-1)?.busy, 'the slow turn to start');
+    await waitFor(() => turns().length === 3, 'the slow turn to take its message');
+    await panel.onMessage({ command: 'chatStop' });
+    await waitFor(() => !alive(spawned[2].child), 'the turn to be killed', 15000);
+    await waitFor(() => posted('chatState').at(-1)?.busy === false && posted('chatState').at(-1)?.last === 'Last turn stopped', 'the stop to show');
+
+    // Resume in a terminal: Chat here then refuses, naming the forked log.
+    fs.utimesSync(log, old, old);
+    await state.commands['claudeSessions.resume'](session);
+    assert.equal(state.terminals.length, 1);
+    assert.equal(state.terminals[0].sent, `${process.execPath} --resume ${ID}`);
+    assert.equal(await chatSend('hello', 'all'), 'sendFailed');
+    assert.match(warnings.pop(), /open in a terminal.*two GitHub Copilot CLI processes.*fork its log/);
+    assert.equal(spawned.length, 3);
+
+    await require(path.join(process.env.EXT_DIR || path.join(__dirname, '..'), 'dist', 'extension.js')).deactivate();
+    assert.ok(spawned.every((s) => !alive(s.child)), 'no chat process outlives the window');
+    assert.deepEqual(state.errors, []);
+  } finally {
+    cp.spawn = realSpawn;
+    for (const s of spawned) {
+      if (alive(s.child)) s.child.kill();
+    }
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
