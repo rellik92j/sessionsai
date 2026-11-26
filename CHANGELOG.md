@@ -4,6 +4,16 @@ All notable changes to SessionsAI (published as Claude Sessions before 0.4.0) ar
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 Numbers in parentheses are the pull requests that made each change. Each version heading links to its GitHub release, which has the release notes and the `.vsix` for installing that version with **Install from VSIX…**.
 
+## [0.4.10](https://github.com/rellik92j/sessionsai/releases/tag/v0.4.10) - 2026-11-25
+
+### Added
+- **Messages you sent while Claude was still working.** A message typed while Claude was mid-turn now shows in the transcript where Claude read it, marked **sent mid-turn**. It counts toward the prompt count on the session's sidebar card, can be the card's latest prompt, and sidebar search finds it. It has no cost of its own: its cost stays with the prompt Claude was answering. (#62)
+
+### Fixed
+- **Messages from other sessions that arrived mid-turn now show.** In agent-team sessions, a message from another session that reached Claude while it was working shows as a "session message" card where Claude read it, counts toward the message count on the session's sidebar card, and is found by sidebar search. A message logged twice shows once. A session whose only such messages arrived mid-turn now gets the "Name — topic" title too. (#64)
+- **Cost and token totals count only the session's own subagents.** A subagent log saved in a session's folder but belonging to another session no longer adds to that session's cost, requests and tokens. It counts for the session it answered, matching what the transcript already showed. (#60)
+- **Each subagent reply shows once.** A reply logged twice in different forms now appears as a single entry, and a message that only mentions a subagent reply no longer shows up as a stray "Subagent" block. (#67)
+
 ## [0.4.9](https://github.com/rellik92j/sessionsai/releases/tag/v0.4.9) - 2026-11-25
 
 ### Added
