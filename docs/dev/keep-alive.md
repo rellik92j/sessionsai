@@ -215,6 +215,11 @@ terminal, exit, run one no-persist ping with `scripts/trial-keep-warm.mjs` (with
 in the terminal again and ask one question, then read that request's `cache_read_input_tokens` in the log. A read of
 nearly the whole context means the ping works for terminal resumes.
 
+[`scripts/prepare-keep-warm-check.mjs`](../../scripts/prepare-keep-warm-check.mjs) sets this up: it writes a scratch
+folder with two sessions' worth of synthetic files (one to ping, one as the unpinged control) and a `README.txt` with
+every command to type. [`scripts/show-session-cache.mjs`](../../scripts/show-session-cache.mjs) prints each API
+request's cache read and write from a session's `.jsonl`, so the result can be read without opening the log.
+
 The build should also report this live: after a kept-warm session's next real turn, compare its cache read with the
 context size and say "Kept warm: the next turn read 198k of 200k tokens from the cache", or that it did not.
 
