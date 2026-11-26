@@ -1,7 +1,9 @@
 // The end-to-end scenarios. Each gets its own synthetic session, titled by its `prompt`, so one scenario's chat or
 // terminal never gets in another's way. See docs/dev/e2e.md for how to add one.
 
-import { events, frameWith, logText, waitEvent, waitFor } from './harness.mjs';
+import { appendFileSync, rmSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { events, frameWith, logPath, logText, waitEvent, waitFor } from './harness.mjs';
 
 const FIRST_LINE = 'Line 2 of the stand-in reply.';
 const LAST_LINE = 'Line 12 of the stand-in reply. Done.';
@@ -196,6 +198,178 @@ function letGoWhileWaiting({ name, prompt, from, open, choice }) {
     },
   };
 }
+
+// ---------- a session live in another Claude Code process ----------
+
+const LIVE_LABEL = 'Live in a terminal · idle';
+const SUBAGENT = 'Review the pull request';
+const SHELL = 'Run the tests in watch mode';
+
+/**
+ * Makes the session look open in a terminal's Claude Code, idle at its prompt, with a background subagent and a
+ * background shell still running: a registry entry under this runner's own pid (alive for as long as the scenario
+ * runs) and the launches appended to the log. Returns a function that ends the subagent in the log, and one that
+ * makes the process exit (its registry file goes).
+ */
+function goLive(ctx) {
+  const now = Date.now();
+  const at = (s) => new Date(now - s * 1000).toISOString();
+  const file = path.join(ctx.s.registry, `${process.pid}.json`);
+  const entry = { pid: process.pid, sessionId: ctx.id, cwd: ctx.s.work, startedAt: now - 60_000, kind: 'interactive', entrypoint: 'cli', status: 'idle', updatedAt: now };
+  const common = { isSidechain: false, sessionId: ctx.id, cwd: ctx.s.work, version: '2.1.332' };
+  const records = [
+    { ...common, type: 'user', message: { role: 'user', content: 'Start the review and the tests in the background.' }, uuid: `${ctx.id}-l1`, timestamp: at(40) },
+    {
+      ...common,
+      type: 'assistant',
+      message: {
+        id: `msg_live_${ctx.id.slice(-4)}`,
+        role: 'assistant',
+        model: 'claude-stand-in',
+        content: [
+          { type: 'tool_use', id: 'toolu_live_agent', name: 'Agent', input: { subagent_type: 'reviewer', description: SUBAGENT, prompt: 'Review it.' } },
+          { type: 'tool_use', id: 'toolu_live_shell', name: 'Bash', input: { command: 'npm test -- --watch', description: SHELL, run_in_background: true } },
+        ],
+        usage: { input_tokens: 3, output_tokens: 5 },
+      },
+      uuid: `${ctx.id}-l2`,
+      timestamp: at(39),
+    },
+    {
+      ...common,
+      type: 'user',
+      message: { role: 'user', content: [{ tool_use_id: 'toolu_live_agent', type: 'tool_result', content: 'Async agent launched successfully.\nagentId: ae2e0000000000001' }] },
+      toolUseResult: { isAsync: true, status: 'async_launched', agentId: 'ae2e0000000000001', description: SUBAGENT },
+      uuid: `${ctx.id}-l3`,
+      timestamp: at(38),
+    },
+    {
+      ...common,
+      type: 'user',
+      message: { role: 'user', content: [{ tool_use_id: 'toolu_live_shell', type: 'tool_result', content: 'Command running in background with ID: be2e00001.' }] },
+      toolUseResult: { stdout: '', stderr: '', backgroundTaskId: 'be2e00001' },
+      uuid: `${ctx.id}-l4`,
+      timestamp: at(38),
+    },
+  ];
+  appendFileSync(logPath(ctx.s, ctx.id), records.map((r) => JSON.stringify(r)).join('\n') + '\n');
+  writeFileSync(file, JSON.stringify(entry));
+  return {
+    endSubagent: () => {
+      const note = `<task-notification>\n<task-id>ae2e0000000000001</task-id>\n<tool-use-id>toolu_live_agent</tool-use-id>\n<status>completed</status>\n<summary>Agent "${SUBAGENT}" finished</summary>\n</task-notification>`;
+      appendFileSync(logPath(ctx.s, ctx.id), JSON.stringify({ ...common, type: 'user', message: { role: 'user', content: note }, origin: { kind: 'task-notification' }, uuid: `${ctx.id}-l5`, timestamp: new Date().toISOString() }) + '\n');
+    },
+    exit: () => rmSync(file, { force: true }),
+  };
+}
+
+const noticeText = async (ctx) => (await transcript(ctx)).$eval('#live-elsewhere', (el) => (el.hidden ? '' : el.textContent || ''));
+const cardLive = async (ctx) => (await sidebar(ctx)).$eval(`.card[data-id$=":${ctx.id}"]`, (el) => el.querySelector('.tag.live-elsewhere')?.textContent || '');
+
+/** Waits for the "live elsewhere" modal, checks it names what runs, and closes it with Cancel or `button`. */
+async function liveModal(ctx, doing, button = 'Cancel') {
+  const box = await modal(ctx, 'is live in a terminal');
+  const text = (await box.textContent()) || '';
+  assert(text.includes(doing), `the warning does not say "${doing}": ${text}`);
+  assert(text.includes(`reviewer "${SUBAGENT}"`) && text.includes(`background shell "${SHELL}"`), `the warning does not name what is running: ${text}`);
+  assert(/idle at its prompt/.test(text), `the warning does not say it is idle: ${text}`);
+  await box.locator('.monaco-button', { hasText: button }).first().click();
+}
+
+/** Nothing opened the session: no terminal resume and no Claude Code chat, given time for one to show up. */
+async function nothingOpened(ctx) {
+  await new Promise((r) => setTimeout(r, 2_500));
+  const ev = events(ctx.s, ctx.id);
+  assert(!ev.some((e) => e.event === 'terminal-resume' || e.event === 'claude-code-open' || e.event === 'start'), `the session was opened anyway: ${JSON.stringify(ev)}`);
+}
+
+const LIVE_SCENARIOS = [
+  {
+    name: 'live-indicator',
+    prompt: 'E2E live elsewhere, indicator',
+    async run(ctx) {
+      const live = goLive(ctx);
+      try {
+        await waitFor('the sidebar card to say the session is live', async () => (await cardLive(ctx)).includes(LIVE_LABEL), 20_000);
+        await openTranscript(ctx);
+        await waitFor('the transcript notice to show where it is live and what runs', async () => {
+          const t = await noticeText(ctx);
+          return t.includes(LIVE_LABEL) && t.includes(SUBAGENT) && t.includes(SHELL);
+        });
+        // The subagent finishes: its line goes, the shell's stays.
+        live.endSubagent();
+        await waitFor('the finished subagent to leave the notice', async () => {
+          const t = await noticeText(ctx);
+          return !t.includes(SUBAGENT) && t.includes(SHELL);
+        }, 20_000);
+        // The process exits: the notice and the card's tag go.
+        live.exit();
+        await waitFor('the notice to go once the process has exited', async () => (await noticeText(ctx)) === '', 20_000);
+        await waitFor('the card tag to go once the process has exited', async () => !(await cardLive(ctx)), 20_000);
+      } finally {
+        live.exit();
+      }
+    },
+  },
+  {
+    name: 'live-sidebar-resume',
+    prompt: 'E2E live elsewhere, sidebar Resume',
+    async run(ctx) {
+      const live = goLive(ctx);
+      try {
+        await waitFor('the sidebar card to say the session is live', async () => (await cardLive(ctx)).includes(LIVE_LABEL), 20_000);
+        await sidebarMenu(ctx, 'Resume Session');
+        await liveModal(ctx, 'Resuming it here as well');
+        await sidebarMenu(ctx, 'Open in Claude Code Chat');
+        await liveModal(ctx, 'Opening it in the Claude Code chat as well');
+        await nothingOpened(ctx);
+      } finally {
+        live.exit();
+      }
+    },
+  },
+  {
+    name: 'live-topbar-resume',
+    prompt: 'E2E live elsewhere, top bar Resume',
+    async run(ctx) {
+      const live = goLive(ctx);
+      try {
+        await openTranscript(ctx);
+        await waitFor('the transcript notice', async () => (await noticeText(ctx)).includes(LIVE_LABEL), 20_000);
+        await click(ctx, '[data-cmd="openInClaudeCode"]');
+        await liveModal(ctx, 'Opening it in the Claude Code chat as well');
+        await click(ctx, '[data-cmd="resume"]');
+        await liveModal(ctx, 'Resuming it here as well');
+        await nothingOpened(ctx);
+        // Resume Anyway goes ahead.
+        await click(ctx, '[data-cmd="resume"]');
+        await liveModal(ctx, 'Resuming it here as well', 'Resume Anyway');
+        await waitEvent(ctx.s, ctx.id, 'terminal-resume', undefined, 20_000);
+      } finally {
+        live.exit();
+      }
+    },
+  },
+  {
+    name: 'live-chat-here',
+    prompt: 'E2E live elsewhere, Chat here',
+    async run(ctx) {
+      const live = goLive(ctx);
+      const text = 'Not while the terminal has it.';
+      try {
+        const frame = await openTranscript(ctx);
+        await waitFor('the transcript notice', async () => (await noticeText(ctx)).includes(LIVE_LABEL), 20_000);
+        await chatHere(frame);
+        await send(await transcript(ctx), text);
+        await liveModal(ctx, 'Chatting here as well');
+        await nothingOpened(ctx);
+        await waitFor('the message to stay in the box', async () => (await composerText(ctx)) === text, 5_000);
+      } finally {
+        live.exit();
+      }
+    },
+  },
+];
 
 // ---------- the scenarios ----------
 
@@ -464,4 +638,5 @@ export const SCENARIOS = [
       assert(events(ctx.s, ctx.id).filter((e) => e.event === 'start').length === 1, 'the queued message started a new chat');
     },
   },
+  ...LIVE_SCENARIOS,
 ];

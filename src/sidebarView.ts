@@ -33,9 +33,16 @@ export interface CardData {
   context?: number;
   /** When the prompt cache expires (ms since epoch). */
   cacheExpires?: number;
+  /** Open in another Claude Code process right now: "Live in a terminal · idle", and whether a turn runs. */
+  live?: LiveCard;
 }
 
-export function toCard(s: SessionInfo): CardData {
+export interface LiveCard {
+  label: string;
+  busy: boolean;
+}
+
+export function toCard(s: SessionInfo, live?: LiveCard): CardData {
   const p = projectPath(s);
   // The title is shown whole: the agent chip is the `--agent` definition, not the session's name.
   const title = s.title;
@@ -63,6 +70,7 @@ export function toCard(s: SessionInfo): CardData {
     cost: s.usage?.cost,
     context: s.usage?.context && s.usage.context.tokens / s.usage.context.limit,
     cacheExpires: s.usage?.cache && s.usage.cache.lastRequest + s.usage.cache.ttlMs,
+    ...(live ? { live } : {}),
   };
 }
 
@@ -96,6 +104,8 @@ export class SidebarView implements vscode.WebviewViewProvider {
     private readonly model: SessionModel,
     private readonly setOption: (key: 'groupBy' | 'currentWorkspaceOnly', value: unknown) => Thenable<void>,
     private readonly hasClaudeCode: () => boolean,
+    /** Whether the session is open in another Claude Code process right now. */
+    private readonly liveFor: (s: SessionInfo) => LiveCard | undefined = () => undefined,
   ) {
     model.onDidChange(() => this.postState());
   }
@@ -153,7 +163,7 @@ export class SidebarView implements vscode.WebviewViewProvider {
       path: g.path,
       hue: g.path ? hueFor(g.path) : 0,
       expanded: g.expanded,
-      sessions: g.sessions.map(toCard),
+      sessions: g.sessions.map((s) => toCard(s, this.liveFor(s))),
     }));
     const total = groups.reduce((n, g) => n + g.sessions.length, 0);
     this.view.description = total ? String(total) : undefined;

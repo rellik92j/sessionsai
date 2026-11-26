@@ -7,6 +7,7 @@ import * as vscode from 'vscode';
 import { AgentInfo, claudeNewSessionArgs, claudeResumeArgs, claudeStartArgs, listAgents, Overrides, userAgentsDir } from './agents';
 import { formatRelative, isInside } from './format';
 import { buildHandoff, collectHandoffFacts, collectTranscriptFacts } from './handoff';
+import { liveLabel, LiveSessions, liveWarning, registryDirFor, runningTasks, tasksOf } from './liveSessions';
 import { GroupBy, projectName, projectPath, SessionModel, workspaceFolderPaths } from './model';
 import { isEmptyQuery, parseQuery } from './query';
 import { SessionInfo, SessionSource } from './sessionParser';
@@ -21,6 +22,8 @@ const CONFIG = 'claudeSessions';
 const CLAUDE_CODE_EXTENSION = 'anthropic.claude-code';
 /** A session written to this recently counts as active (matches the sidebar's live dot). */
 const LIVE_MS = 3 * 60 * 1000;
+/** How often Claude Code's registry of running sessions is re-read, to notice a process that has gone without a trace. */
+const LIVE_POLL_MS = 10_000;
 
 function config() {
   return vscode.workspace.getConfiguration(CONFIG);
@@ -108,9 +111,12 @@ export function activate(context: vscode.ExtensionContext): void {
     const t = sessionTerminals.get(sessionKey(session));
     return t && t.exitStatus === undefined ? t : undefined;
   };
+  // Claude Code's registry of running processes, beside the projects folder: which sessions are open where.
+  const live = new LiveSessions(() => registryDirFor(store.projectsDir));
   const transcripts = new TranscriptPanels(context.extensionUri, hasClaudeCode, model, composerTarget, {
     rememberTarget: (s, target) => void context.globalState?.update(composerKey(s), target),
     terminalFor: openTerminal,
+    live,
   });
   disposeChats = () => transcripts.dispose();
   const overview = new OverviewPanel(context.extensionUri, model);
@@ -170,6 +176,31 @@ export function activate(context: vscode.ExtensionContext): void {
   };
 
   /**
+   * A session open in another Claude Code process (a terminal, even one idle at its prompt with subagents still
+   * running) would get a second writer, and its log forks (doc section 8). Asks first, naming what runs there; `verb`
+   * is the button ("Resume" gives "Resume Anyway") and `doing` what the action does ("Resuming it here as well"). True
+   * when the session is not live elsewhere, or the user goes ahead anyway.
+   */
+  const notLiveElsewhere = async (session: SessionInfo, verb: string, doing: string): Promise<boolean> => {
+    if (!isClaude(session)) {
+      return true;
+    }
+    await live.refresh();
+    const elsewhere = transcripts.liveElsewhere(session);
+    if (!elsewhere.length) {
+      return true;
+    }
+    const log = await fs.readFile(session.filePath, 'utf8').catch(() => '');
+    const anyway = `${verb} Anyway`;
+    const choice = await vscode.window.showWarningMessage(
+      liveWarning(session.title, elsewhere[0], tasksOf(runningTasks(log), elsewhere[0]), doing),
+      { modal: true },
+      anyway,
+    );
+    return choice === anyway;
+  };
+
+  /**
    * Commands receive a SessionInfo (from the transcript page or quick pick), a webview context
    * object with a sessionId (right-click in the sidebar), or nothing (command palette).
    */
@@ -191,11 +222,40 @@ export function activate(context: vscode.ExtensionContext): void {
   const setConfig = (key: string, value: unknown) =>
     config().update(key, value, vscode.ConfigurationTarget.Global);
 
-  const sidebar = new SidebarView(context.extensionUri, model, setConfig, hasClaudeCode);
+  const sidebar = new SidebarView(context.extensionUri, model, setConfig, hasClaudeCode, (s) => {
+    const p = transcripts.liveElsewhere(s)[0];
+    return p && { label: liveLabel(p), busy: p.status === 'busy' };
+  });
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(SidebarView.viewId, sidebar, {
       webviewOptions: { retainContextWhenHidden: true },
     }),
+  );
+
+  // The registry changes when a process starts, exits cleanly, or goes busy or idle; a crashed process leaves its file
+  // behind, which only the timer's pid check notices.
+  let liveWatcher: vscode.FileSystemWatcher | undefined;
+  let liveDebounce: NodeJS.Timeout | undefined;
+  const refreshLive = () => {
+    clearTimeout(liveDebounce);
+    liveDebounce = setTimeout(() => void live.refresh(), 300);
+  };
+  const watchLive = () => {
+    liveWatcher?.dispose();
+    liveWatcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(vscode.Uri.file(registryDirFor(store.projectsDir)), '*.json'));
+    liveWatcher.onDidCreate(refreshLive);
+    liveWatcher.onDidChange(refreshLive);
+    liveWatcher.onDidDelete(refreshLive);
+    void live.refresh();
+  };
+  watchLive();
+  const liveTimer = setInterval(() => void live.refresh(), LIVE_POLL_MS);
+  liveTimer.unref?.();
+  context.subscriptions.push(
+    { dispose: () => liveWatcher?.dispose() },
+    { dispose: () => clearTimeout(liveDebounce) },
+    { dispose: () => clearInterval(liveTimer) },
+    live.onDidChange(() => sidebar.postState()),
   );
 
   const applyConfig = () => {
@@ -272,6 +332,7 @@ export function activate(context: vscode.ExtensionContext): void {
         store.setProjectsDir(projectsDir());
         store.setRoots(sourceRoots());
         watch();
+        watchLive();
         model.reload();
       } else {
         model.refreshView();
@@ -328,7 +389,7 @@ export function activate(context: vscode.ExtensionContext): void {
    * Resumes the session in its own tool. This and the other actions below resolve to true once the session (or its
    * continuation) has opened, so the transcript it was started from can close; false when cancelled or refused.
    */
-  const resume = async (session: SessionInfo, message?: string): Promise<boolean> => {
+  const resume = async (session: SessionInfo, message?: string, liveChecked = false): Promise<boolean> => {
     if (sourceOf(session) === 'vscode-chat') {
       return openChat(session);
     }
@@ -345,6 +406,9 @@ export function activate(context: vscode.ExtensionContext): void {
         vscode.window.showInformationMessage('This session is already open in a terminal. Your message is on the clipboard: paste it there.');
       }
       return true;
+    }
+    if (!liveChecked && !(await notLiveElsewhere(session, 'Resume', 'Resuming it here as well'))) {
+      return false;
     }
     const tool = SOURCES[sourceOf(session)].label;
     const cwd = projectPath(session);
@@ -372,7 +436,7 @@ export function activate(context: vscode.ExtensionContext): void {
    * process so the message arrives as one argument, as in continueInNewSession; Copilot CLI is often a shell shim
    * (see continueInCopilot), so a message that won't survive shell quoting goes in a file its prompt points at.
    */
-  const resumeWithMessage = async (session: SessionInfo, message: string, overrides: Overrides): Promise<boolean> => {
+  const resumeWithMessage = async (session: SessionInfo, message: string, overrides: Overrides, liveChecked = false): Promise<boolean> => {
     if (!(await freeFromChat(session))) {
       return false;
     }
@@ -380,6 +444,9 @@ export function activate(context: vscode.ExtensionContext): void {
     const existing = sessionTerminals.get(key);
     if (existing && existing.exitStatus === undefined) {
       return resume(session, message);
+    }
+    if (!liveChecked && !(await notLiveElsewhere(session, 'Send', 'Sending your message to it from here'))) {
+      return false;
     }
     const tool = SOURCES[sourceOf(session)].label;
     const cwd = projectPath(session);
@@ -635,6 +702,9 @@ export function activate(context: vscode.ExtensionContext): void {
     if (!(await freeFromChat(session))) {
       return false;
     }
+    if (!(await notLiveElsewhere(session, 'Open', 'Opening it in the Claude Code chat as well'))) {
+      return false;
+    }
     const folders = vscode.workspace.workspaceFolders?.map((f) => f.uri.fsPath) ?? [];
     if (!folders.some((f) => isInside(projectPath(session), f))) {
       const choice = await vscode.window.showWarningMessage(
@@ -643,7 +713,8 @@ export function activate(context: vscode.ExtensionContext): void {
         'Try Anyway',
       );
       if (choice === 'Resume in Terminal Instead') {
-        return message ? resumeWithMessage(session, message, {}) : resume(session);
+        // Already asked above whether to go ahead while it is live elsewhere.
+        return message ? resumeWithMessage(session, message, {}, true) : resume(session, undefined, true);
       }
       if (choice !== 'Try Anyway') {
         return false;

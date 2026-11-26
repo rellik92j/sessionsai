@@ -43,7 +43,9 @@ export function makeSandbox(sessions) {
     bin: path.join(dir, 'bin'),
     events: path.join(dir, 'events.jsonl'),
   };
-  for (const d of [s.userData, s.extensions, s.claudeConfig, s.copilot, s.vscodeUser, s.work, s.bin]) {
+  // Claude Code's registry of running processes, one <pid>.json each; scenarios write synthetic ones here.
+  s.registry = path.join(s.claudeConfig, 'sessions');
+  for (const d of [s.userData, s.extensions, s.claudeConfig, s.copilot, s.vscodeUser, s.work, s.bin, s.registry]) {
     mkdirSync(d, { recursive: true });
   }
   writeFileSync(s.events, '');
@@ -217,10 +219,14 @@ export function waitEvent(s, sessionId, name, match = () => true, timeout = 20_0
   return waitFor(`the stand-in to record "${name}" for ${sessionId}`, () => events(s, sessionId).find((e) => e.event === name && match(e)), timeout);
 }
 
+/** The session's log file. */
+export function logPath(s, sessionId) {
+  return path.join(s.claudeConfig, 'projects', projectDirName(s.work), `${sessionId}.jsonl`);
+}
+
 /** The session's log text. */
 export function logText(s, sessionId) {
-  const projectDir = path.join(s.claudeConfig, 'projects', projectDirName(s.work));
-  return readFileSync(path.join(projectDir, `${sessionId}.jsonl`), 'utf8');
+  return readFileSync(logPath(s, sessionId), 'utf8');
 }
 
 /** Removes the sandbox; Windows may hold a file a moment after VS Code exits, so it retries. */

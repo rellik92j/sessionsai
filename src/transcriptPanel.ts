@@ -9,6 +9,7 @@ import { ClaudeChat, isPermissionMode, PermissionMode, resolveClaudeExecutable }
 import { chatModes, chatStateMessage, renderLive } from './chatView';
 import { escapeHtml, formatDateTime, formatTokens, formatUsd } from './format';
 import { collectInsights, editsAsDiff, FileTouch, SessionInsights, TodoStatus } from './insights';
+import { LiveProcess, LiveSessions, liveWarning, renderLiveNotice, RunningTask, runningTasks, tasksOf } from './liveSessions';
 import { renderMarkdown } from './markdown';
 import { projectName, projectPath, SessionModel } from './model';
 import { parseTranscript, SessionInfo, SubagentRun, TranscriptEntry, TranscriptPart, TurnStats } from './sessionParser';
@@ -53,6 +54,10 @@ interface TranscriptTab {
   chatMode: PermissionMode;
   /** Streamed text arrives many times a second; the page is redrawn at most this often. */
   liveTimer?: NodeJS.Timeout;
+  /** The background subagents and shells the log has no end for, as last read. */
+  tasks?: RunningTask[];
+  /** The "live elsewhere" notice as the page last got it. */
+  liveHtml?: string;
 }
 
 /** How long a subagent run's log must be quiet before its tab updates; runs write in bursts. */
@@ -88,6 +93,8 @@ export interface ChatHooks {
   rememberTarget?: (source: SessionSource, target: ComposerTarget) => void;
   /** The terminal this extension resumed the session in, if one is still open. */
   terminalFor?: (session: SessionInfo) => vscode.Terminal | undefined;
+  /** Claude Code's processes with a session open, from its registry of live sessions. */
+  live?: LiveSessions;
 }
 
 let chatLog: vscode.OutputChannel | undefined;
@@ -144,6 +151,45 @@ export class TranscriptPanels {
         this.update(tab);
       }
     });
+    // A process that opens, closes, goes busy or idle changes the notice without touching the log.
+    hooks.live?.onDidChange(() => {
+      for (const tab of this.tabs()) {
+        this.postLive(tab);
+      }
+    });
+  }
+
+  /** The pids of this extension's own chat processes, whose registry entries are not "somewhere else". */
+  chatPids(): number[] {
+    const chats = [...this.tabs().flatMap((t) => [t.chat, t.ending]), ...this.closing.keys()];
+    return [...new Set(chats.map((c) => c?.pid).filter((p): p is number => typeof p === 'number'))];
+  }
+
+  /** Other Claude Code processes that have the session open, and what each still runs. */
+  liveElsewhere(session: SessionInfo): LiveProcess[] {
+    return isClaude(session) ? this.hooks.live?.forSession(session.id, this.chatPids()) ?? [] : [];
+  }
+
+  /** The notice for the tab: where else the session is live and what it still runs, or what this tab's chat runs. */
+  private liveHtml(tab: TranscriptTab): string {
+    if (tab.run || !isClaude(tab.session) || !this.hooks.live) {
+      return '';
+    }
+    const elsewhere = this.liveElsewhere(tab.session);
+    const own = elsewhere.length ? undefined : this.hooks.live.ownFor(tab.session.id, this.chatPids());
+    return renderLiveNotice(elsewhere, own, tab.tasks ?? []);
+  }
+
+  /** Sends the page the notice, when it has changed since the page last got it. */
+  private postLive(tab: TranscriptTab): void {
+    if (tab.disposed || tab.run || !tab.shown) {
+      return;
+    }
+    const html = this.liveHtml(tab);
+    if (html !== tab.liveHtml) {
+      tab.liveHtml = html;
+      panelPost(tab, { type: 'liveElsewhere', html });
+    }
   }
 
   private tabs(): TranscriptTab[] {
@@ -481,6 +527,20 @@ export class TranscriptPanels {
       }
       return false;
     }
+    // Another Claude Code process has the session open, even one idle at its prompt that has not written for minutes.
+    if (this.hooks.live) {
+      await this.hooks.live.refresh();
+      const elsewhere = this.liveElsewhere(session);
+      if (elsewhere.length) {
+        const log = await fs.readFile(session.filePath, 'utf8').catch(() => '');
+        const choice = await vscode.window.showWarningMessage(
+          liveWarning(session.title, elsewhere[0], tasksOf(runningTasks(log), elsewhere[0]), 'Chatting here as well'),
+          { modal: true },
+          'Chat Anyway',
+        );
+        return choice === 'Chat Anyway';
+      }
+    }
     const mtime = statSync(session.filePath, { throwIfNoEntry: false })?.mtimeMs ?? 0;
     const ownWrite = Math.max(tab.chat?.lastActivity ?? 0, this.ownActivity.get(sessionKey(session)) ?? 0) + 3000;
     if (Date.now() - mtime < RECENT_WRITE_MS && mtime > ownWrite) {
@@ -700,6 +760,7 @@ export class TranscriptPanels {
         const subagents = isClaude(session) ? await readSubagentRuns(session.filePath, session.id) : [];
         logText = await fs.readFile(session.filePath, 'utf8');
         entries = parseTranscriptFor(session, logText, subagents);
+        tab.tasks = isClaude(session) ? runningTasks(logText) : undefined;
       }
     } catch (err) {
       // A live update that cannot read the log (moved, mid-rewrite) keeps the page as it is.
@@ -738,6 +799,7 @@ export class TranscriptPanels {
               state: chatStateMessage(shownChat?.status, tab.chatMode, tab.waiting?.length),
             }
           : undefined,
+      liveNotice: run ? undefined : this.liveHtml(tab),
       highlight: tab.highlight,
       preview: tab.preview,
       insights,
@@ -753,7 +815,12 @@ export class TranscriptPanels {
       webview.html = buildPage(session, options, parts);
     } else {
       webview.postMessage(liveUpdate(shown.blocks, parts));
+      if (options.liveNotice !== undefined && options.liveNotice !== tab.liveHtml) {
+        // A subagent or shell finished (or started) in the log just read.
+        webview.postMessage({ type: 'liveElsewhere', html: options.liveNotice });
+      }
     }
+    tab.liveHtml = options.liveNotice;
     tab.shown = { file, sig, blocks: parts.blocks, shape: parts.shape };
     this.watchRun(tab);
     if (forgot && !full && shown && shown.shape === parts.shape) {
@@ -1008,6 +1075,8 @@ interface HtmlOptions {
    * as they stand.
    */
   chat?: { mode: PermissionMode; live: string; state: ReturnType<typeof chatStateMessage> };
+  /** The notice above the message box that the session is live in another process (renderLiveNotice); empty for none. */
+  liveNotice?: string;
   /** What the session did, for the side panel; collected from `entries` when omitted. */
   insights?: SessionInsights;
   /** Search words for transcript.js to mark. */
@@ -1364,7 +1433,9 @@ function renderComposer(session: SessionInfo, o: HtmlOptions): string {
     <button class="btn" id="chat-end" title="End the chat: closes the Claude Code process behind it" hidden><i class="codicon codicon-close"></i><span>End chat</span></button>
   </div>`
     : '';
+  const notice = o.liveNotice ?? '';
   return `<footer class="composer" id="composer" data-composer="${escapeHtml(JSON.stringify(data))}">
+  <div class="live-elsewhere" id="live-elsewhere" role="status"${notice ? '' : ' hidden'}>${notice}</div>
   ${chatBar}
   <div class="composer-box">
     <textarea id="composer-input" rows="1" placeholder="Message to continue this session" aria-label="Message to continue this session" aria-describedby="composer-status"></textarea>
