@@ -60,8 +60,11 @@ Windows is where it has been run. The harness has a POSIX terminal stub too, but
 - **The chat's `copilot`**, for a GitHub Copilot CLI session, is `test/e2e/stand-in-copilot.mjs`, run the same way
   when `SESSIONSAI_E2E_COPILOT` names it (see `copilotLaunch` and `spawnCopilot`). Copilot CLI sessions are written to
   the sandbox's `COPILOT_HOME` (`copilotDir`), and the `sources` setting lists them only when a scenario has one.
-- **Resume's terminal** runs `claudeSessions.claudeCommand` (or `copilotCommand` for a Copilot CLI session), which the
-  sandbox sets to a stub script that only appends a `terminal-resume` line to the events file.
+- **The terminals** Resume, Continue, Send and New Claude Code Session open run `claudeSessions.claudeCommand` (or
+  `copilotCommand` for a Copilot CLI session), which the sandbox sets to a stub (`terminal-stub.mjs`, run by a copy of
+  Node's own executable, since a `.cmd` file cannot take a multi-line argument). It appends a `terminal-resume` line to
+  the events file with `argv` (each argument, so a multi-line handoff arrives whole), `args` (the same joined by
+  spaces) and `cwd` (the folder it started in), and does nothing else. The sandbox path must contain no space.
 - **The Claude Code extension** is `test/e2e/claude-code-stub/`, loaded as a second `--extensionDevelopmentPath` with
   the id `anthropic.claude-code`, so SessionsAI offers Open in Claude Code Chat (sidebar menu and the transcript's
   "Open in chat" button). Its `claude-vscode.editor.open` command only appends a `claude-code-open` line (with the
@@ -112,8 +115,8 @@ that its `pid` is gone instead.
 
 ## Areas
 
-Scenarios are grouped by what they exercise, one module per area in `test/e2e/scenarios/`: `chat`, `transcript` and
-`sidebar` today, with `resume`, `overview` and `other-tools` to come. The runner finds areas by file name, so an
+Scenarios are grouped by what they exercise, one module per area in `test/e2e/scenarios/`: `chat`, `transcript`,
+`sidebar` and `resume` today, with `overview` and `other-tools` to come. The runner finds areas by file name, so an
 area's name is its file name and no list needs editing. Two people adding scenarios to different areas never touch the
 same file. Shared steps (`openTranscript`, `chatHere`, `send`, `click`, `sidebarMenu`, `modal`, `assert`, `waitFor`,
 `waitEvent`, ...) live in `harness.mjs`; a helper only one area uses stays in that area's module.
@@ -215,6 +218,33 @@ cost; `beta-web`, three and forty days old) and one Copilot CLI session in `beta
 | `sidebar-click-opens-preview-tab` | A click opens a transcript in the preview tab (which offers Keep open) and the next click replaces it. |
 | `sidebar-double-click-keeps-tab` | A double-click gives the session a tab of its own; the next clicks use one preview tab beside it. |
 | `sidebar-keep-open-button` | Keep open in the transcript does the same. |
+
+Area `resume`, `test/e2e/scenarios/resume.mjs`: resuming, continuing and starting sessions, on the harness's plain
+two-record sessions, one per scenario. `seed` adds a project agent (`e2e-reviewer`) and a user agent (`e2e-planner`) for
+the pickers' agent step. Each scenario reads the terminal stub's `argv` and `cwd` (or the Claude Code stub's
+`claude-code-open`) recorded since its own action. The pickers are the workbench's quick picks, clicked by their exact
+labels (`choose`, `typeIn`, `cancelStep` in the module). Resume Session and the Continue commands are hidden from the
+command palette (`when: false` in `package.json`), so the palette's entries here are New Claude Code Session… and
+Search Sessions… (whose rows have a Resume button).
+
+| Name | What it checks |
+|---|---|
+| `resume-sidebar-menu`, `resume-sidebar-card-button`, `resume-sidebar-ctrl-enter`, `resume-topbar`, `resume-search-quick-pick` | Resume Session from the sidebar's right-click menu, the card's play button, Ctrl+Enter on a card, the transcript's top bar and the Search Sessions… picker's Resume button: the terminal runs the stub with `--resume <id>` and starts in the session's folder. |
+| `resume-closes-transcript-setting` | With `closeTranscriptOnResume` on, Resume in the top bar closes the transcript tab after the terminal starts. The setting is put back. |
+| `continue-sidebar-menu`, `continue-card-button`, `continue-topbar` | Continue in New Session: `--name "Continued: <title>"` and the handoff (the session's title, last prompt and reply) as one argument, with no option flags. |
+| `continue-with-model-sidebar-menu` | Continue in New Session with Tool or Model…: the tool, model, effort and agent pickers list what they should (the session's own model, the project and user agents), and the choices become `--model`, `--effort` and `--agent` before `--name`. |
+| `continue-with-model-topbar-chevron` | The top bar's ⌄: a typed model name, effort left on Default (no `--effort`), an empty agent name goes back to the list, a typed agent name is passed. |
+| `continue-with-model-defaults` | Every step on Default leaves all three flags out. |
+| `continue-with-model-cancel` | Escape at the tool, model, effort, agent and typed-model steps opens nothing. |
+| `continue-with-model-other-tools` | Claude Code Chat gets the handoff as a new chat (no further steps); GitHub Copilot CLI has two steps and gets `--model`, `--reasoning-effort`, `--name` and a prompt pointing at a handoff file that holds the handoff. |
+| `send-to-cli-resumes-session`, `send-to-cli-with-handoff` | The message box's Send menu to the Claude Code CLI: `--resume <id> <message>`, or with "A new session, with a handoff" a handoff that ends with the message. |
+| `send-with-model-and-effort`, `send-with-model-effort-and-agent` | Send with a model and effort…: two steps for the same session (no agent), three for a handoff, and the flags come before the message. |
+| `send-with-model-cancel` | Cancelling either step opens nothing and leaves the message in the box. |
+| `send-to-claude-code-chat` | Send to the Claude Code chat: this session with the message in its input box, then a new chat with a handoff ending in it; the box empties each time. |
+| `new-session-palette`, `new-session-sidebar-plus` | New Claude Code Session… from the palette and the sidebar's +: the folder, model, effort and agent pickers (a blank session is not offered a session model), the flags only (no prompt, no name), the folder; all defaults pass no arguments. |
+| `new-session-cancel` | Escape at the folder, model, effort and agent steps opens nothing. |
+
+The folder picker's "Choose a folder…" opens the operating system's dialog, which Playwright cannot drive, so it is not covered.
 
 ## Writing a scenario
 
