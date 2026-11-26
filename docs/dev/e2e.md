@@ -94,8 +94,8 @@ page alone cannot.
 
 ## Areas
 
-Scenarios are grouped by what they exercise, one module per area in `test/e2e/scenarios/`: `chat` today, with
-`sidebar`, `transcript`, `resume`, `overview` and `other-tools` to come. The runner finds areas by file name, so an
+Scenarios are grouped by what they exercise, one module per area in `test/e2e/scenarios/`: `chat` and `transcript` today, with
+`sidebar`, `resume`, `overview` and `other-tools` to come. The runner finds areas by file name, so an
 area's name is its file name and no list needs editing. Two people adding scenarios to different areas never touch the
 same file. Shared steps (`openTranscript`, `chatHere`, `send`, `click`, `sidebarMenu`, `modal`, `assert`, `waitFor`,
 `waitEvent`, ...) live in `harness.mjs`; a helper only one area uses stays in that area's module.
@@ -114,6 +114,11 @@ export default {
   scenarios: [{ name: 'sidebar-opens', prompt: 'E2E sidebar opens', async run(ctx) { /* ... */ } }],
 };
 ```
+
+A scenario (or an area session) that needs a log of its own shape gives `log: ({ id, cwd }) => jsonlText`, and
+`files: ({ id, cwd }) => ({ '<path relative to the project folder>': text })` for files beside it, such as a subagent's
+log. The sandbox writes them before VS Code starts. `transcript.mjs` builds its logs with a small `Log` class and keeps
+each one by session id, so a scenario can append records to the log of an open session.
 
 Scenario names stay unique across areas, since `--only` and the failure screenshots use them. Session ids are numbered
 over every area, so a scenario's session does not change with the areas chosen.
@@ -143,6 +148,21 @@ Area `chat`, `test/e2e/scenarios/chat.mjs`, each on its own session:
 | `live-sidebar-resume` | The same live session: Resume Session and Open in Claude Code Chat from the sidebar's right-click menu each show the modal that names the subagent and the shell; Cancel opens nothing. |
 | `live-topbar-resume` | The same from the transcript's top bar (Open in chat, Resume), then Resume Anyway does start the terminal. |
 | `live-chat-here` | Chat here on the live session: the modal shows, Cancel starts no chat process, and the message stays in the box. |
+
+Area `transcript`, `test/e2e/scenarios/transcript.mjs`, reading a session as a chat, each on a synthetic log built for it:
+
+| Name | What it checks |
+|---|---|
+| `transcript-tool-rows` | The tool group says "3 tool calls · 1 failed"; rows start closed, show a check or the failure mark; opening an edit shows its diff (removed and added sides), a command its input and output, a failed one its error; a click closes a row again. |
+| `transcript-hide-tool-calls` | The Tool calls switch hides every tool row, keeps the replies, and turns both the hero and the top bar switch off; it is put back at the end. |
+| `transcript-jump-to-latest` | A transcript opens at its bottom with no jump button; scrolled up, the button shows, and clicking it goes back to the bottom. |
+| `transcript-mid-turn-and-session-messages` | A prompt logged as a queued command shows with the "sent mid-turn" pill (a typed one does not); another session's message is a card with its sender, "session message" pill and text. |
+| `transcript-subagent-run` | A subagent block in the session has Open run; it opens the run's own log with no message box and a Back to session button, which returns to the session. |
+| `transcript-search-highlights` | Searching in the sidebar and opening the session marks every match in message text (not in a tool call), starts at the first ("1 of 3", in view), F3 and Shift+F3 move and wrap, Escape clears. |
+| `transcript-details-panel` | The panel's sections count and list changed files (with New), to-dos, skills and prompts; a section folds and opens; a folded one (Web) opens; clicking a prompt scrolls to it and flashes it. |
+| `transcript-prompt-cost` | Each prompt shows `$0.10 · 2m` style cost and duration beside it, and the details panel's prompts show the same figures. |
+| `transcript-live-update` | Records appended to an open session's log appear in the tab in place (the page is not rebuilt, the reader's scroll stays), the new-messages dot shows when scrolled up and clears on Jump to latest, and at the bottom the page follows along. |
+| `transcript-other-branch` | A reply appended to the log from a second writer, parented on the first answer, shows in place with the "other branch" pill, under the question it answers. |
 
 ## Writing a scenario
 
