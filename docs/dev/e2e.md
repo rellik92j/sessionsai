@@ -82,6 +82,8 @@ Each user message plays a script, picked by a word in it:
 | `permission` | A Bash call, then a `can_use_tool` control request. It waits for the answer: Allow logs a tool result and "The command ran…"; Deny logs the error result with the extension's deny message and "…carrying on without it." With `slowly` in the message as well, 12 more lines follow the answer, one every 450 ms, so a scenario can act while that reply runs. |
 | anything else | A slow reply: 12 lines, one every 450 ms, streamed as `text_delta`s. |
 
+With `lingering` in a message (either script), the process stays up for 2.5 s after its last turn has ended and its stdin has closed, before it exits. That holds open the gap where the reply is over but the process is still there. It must stay under the extension's 3 s grace, after which the extension kills the process.
+
 An `interrupt` control request stops either script where it is: the partial text and a `[Request interrupted by
 user]` record go to the log, and the turn ends with the interrupted `result`. Closing stdin does not interrupt; the
 running turn finishes and then the process exits, as the real CLI does.
@@ -137,9 +139,10 @@ Area `chat`, `test/e2e/scenarios/chat.mjs`, each on its own session:
 | `close-tab-mid-reply` | Closing the transcript tab during the reply lets it finish (no interrupt, whole reply in the log), then stdin closes and the process exits. |
 | `resume-while-replying-wait` | Right-click the session in the sidebar, Resume Session: the "still replying" modal shows; Wait for the Reply lets the reply finish, the process exits, and only then does the terminal start. |
 | `resume-while-replying-stop` | The same modal; Stop It Now interrupts the reply, the process exits, then the terminal starts. |
-| `waiting-message-enter` | End chat mid-reply, then send with Enter: the box empties, the message shows below the reply with the "waits for the previous reply to finish" pill, and the bar says it starts a new chat after it. A second message makes it "Your 2 messages…". Once the reply ends and the process exits, one new chat gets both, in order, and the pills go. |
+| `waiting-message-enter` | End chat mid-reply, then send with Enter: the box empties, the message shows below the reply (checked by DOM order) with the "waits for the previous reply to finish" pill, and the bar says it starts a new chat after it. A second message makes it "Your 2 messages…". Once the reply ends and the process exits, one new chat gets both, in order, and the pills go. |
 | `waiting-message-queue-button` | While the ended chat finishes, the Send button reads Queue; sending with it waits and goes to the new chat as above. |
-| `waiting-message-stop` | Stop on the finishing reply with a message waiting: the reply is interrupted and the message goes to a new chat at once. |
+| `waiting-message-stop` | Stop on the finishing reply with a message waiting: the reply is interrupted and the message goes to a new chat at once: its turn starts under 2.5 s after Stop, where waiting for the rest of the reply (about 4 s) would take longer. |
+| `waiting-message-after-reply-before-exit` | The stand-in lingers after its reply ends. In that gap the bar has stopped saying "finishing"; a message sent then shows as waiting, the bar says "Your message starts a new chat once the ended one has stopped…", the Send button reads Queue, and the message goes to a new chat once the process has exited. |
 | `waiting-message-below-denied-card` | End chat at an open permission card, then send: the card shows as denied with no Allow/Deny buttons, the waiting message sits below it, and it goes to a new chat after the reply. |
 | `waiting-message-tab-closed` | Close the tab with a message waiting: the reply finishes, and no new chat starts. |
 | `waiting-message-{sidebar,topbar}-{resume,open-chat}-{wait,stop}` | With a message waiting, Resume Session or Open in Claude Code Chat, from the sidebar's right-click menu or the transcript's top bar, then Wait for the Reply or Stop It Now in the modal: the message goes back to the box, no new chat starts, and the terminal (or the Claude Code chat stub) opens only after the process has exited. Eight scenarios. |

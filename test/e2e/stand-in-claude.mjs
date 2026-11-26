@@ -11,6 +11,8 @@
 //   "permission"  a Bash call that asks for permission (can_use_tool); the reply depends on Allow or Deny, and with
 //                 "slowly" in the message as well, it goes on for REPLY_LINES more lines after the answer
 //   anything else a slow reply: REPLY_LINES lines, one every LINE_MS
+// "lingering" in a message (either script) makes the process wait LINGER_MS after its last turn ends and stdin has
+// closed, before it exits: a window in which the reply is over but the process is still there.
 // An interrupt control request stops either script where it is, as Claude Code does.
 
 import { appendFileSync, readdirSync, readFileSync, existsSync } from 'node:fs';
@@ -19,6 +21,8 @@ import { randomUUID } from 'node:crypto';
 
 const REPLY_LINES = 12;
 const LINE_MS = 450;
+// Under the extension's 3 s grace for a process whose stdin has closed, after which it kills the process.
+const LINGER_MS = 2500;
 const MODEL = 'claude-stand-in';
 const VERSION = '2.1.332';
 
@@ -238,6 +242,9 @@ async function runTurn(text) {
   const started = Date.now();
   turn = { interrupted: false };
   note('turn-start', { text });
+  if (/lingering/i.test(text)) {
+    lingering = true;
+  }
   out({ type: 'system', subtype: 'init', session_id: sessionId, model: MODEL, permissionMode, tools: ['Bash', 'Edit', 'Read', 'Write'], claude_code_version: VERSION, cwd });
   const uuid = logRecord({ type: 'user', message: { role: 'user', content: text }, promptId: randomUUID(), permissionMode, origin: { kind: 'human' } });
   await sleep(150);
@@ -249,6 +256,9 @@ async function runTurn(text) {
   }
   turn = undefined;
 }
+
+/** Set by a message with "lingering" in it: once stdin has closed and the last turn has ended, exit is held back. */
+let lingering = false;
 
 // ---------- stdin ----------
 
@@ -266,6 +276,9 @@ async function pump() {
   }
   busy = false;
   if (stdinClosed) {
+    if (lingering) {
+      await sleep(LINGER_MS);
+    }
     note('exit', { code: 0 });
     process.exit(0);
   }
@@ -315,7 +328,9 @@ process.stdin.on('end', () => {
   stdinClosed = true;
   note('stdin-end');
   if (!busy) {
-    note('exit', { code: 0 });
-    process.exit(0);
+    void (lingering ? sleep(LINGER_MS) : Promise.resolve()).then(() => {
+      note('exit', { code: 0 });
+      process.exit(0);
+    });
   }
 });
