@@ -29,7 +29,7 @@ export const REQUIRED = [
 ];
 
 /** Sources, tests, tooling, local agent files and scratch output: none of it belongs in the .vsix. */
-export const FORBIDDEN = /^(src|test|scripts|out|docs|\.claude|\.github|\.vscode|\.tmp)\/|\.map$|\.ts$|\.vsix$/;
+export const FORBIDDEN = /^(src|test|scripts|out|docs|\.claude|\.github|\.vscode|\.tmp|releases)\/|\.map$|\.ts$|\.vsix$/;
 
 /** Gitignored paths that are meant to ship: the bundle and the runtime files kept from node_modules. */
 export const IGNORED_BUT_SHIPPED = /^(dist|node_modules)\//;
