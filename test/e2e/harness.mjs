@@ -27,8 +27,9 @@ export const sessionIdFor = (n) => `e2e00000-0000-4000-8000-${String(n).padStart
 
 /**
  * The sandbox: folders, synthetic sessions, the terminal stub and the VS Code settings. `sessions` is a list of
- * { id, prompt } and each becomes a two-record log (the prompt and a short reply) dated a day ago, so the chat's
- * "written moments ago" guard does not fire.
+ * { id, prompt, log?, files? } and each becomes a two-record log (the prompt and a short reply) dated a day ago, so the
+ * chat's "written moments ago" guard does not fire. A session with `log` ({ id, cwd }) => text gets that log instead,
+ * and `files` ({ id, cwd }) => { 'path/relative/to/the/project/folder': text } adds files beside it.
  */
 export function makeSandbox(sessions) {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'sessionsai-e2e-'));
@@ -52,7 +53,18 @@ export function makeSandbox(sessions) {
   const projectDir = path.join(s.claudeConfig, 'projects', projectDirName(s.work));
   mkdirSync(projectDir, { recursive: true });
   const dayAgo = Date.now() - 24 * 3600 * 1000;
-  for (const { id, prompt } of sessions) {
+  for (const { id, prompt, log, files } of sessions) {
+    if (log) {
+      // A scenario that needs a log of its own shape builds it; `files` are more files next to it (subagent runs).
+      const file = path.join(projectDir, `${id}.jsonl`);
+      writeFileSync(file, log({ id, cwd: s.work }));
+      utimesSync(file, new Date(dayAgo), new Date(dayAgo));
+      for (const [rel, text] of Object.entries(files ? files({ id, cwd: s.work }) : {})) {
+        mkdirSync(path.dirname(path.join(projectDir, rel)), { recursive: true });
+        writeFileSync(path.join(projectDir, rel), text);
+      }
+      continue;
+    }
     const common = { isSidechain: false, userType: 'external', entrypoint: 'cli', cwd: s.work, sessionId: id, version: '2.1.332', gitBranch: 'main' };
     const u1 = `${id.slice(0, 8)}-0000-4000-8000-000000000001`;
     const u2 = `${id.slice(0, 8)}-0000-4000-8000-000000000002`;

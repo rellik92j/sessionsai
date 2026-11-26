@@ -88,7 +88,7 @@ resetOut();
 const sandboxSessions = [
   ...chosenAreas.filter((p) => chosen.some((sc) => sc.area === p.area.name)).flatMap((p) => p.fixtureSessions),
   ...chosen,
-].map((x) => ({ id: x.id, prompt: x.prompt }));
+].map((x) => ({ id: x.id, prompt: x.prompt, log: x.log, files: x.files }));
 const s = makeSandbox(sandboxSessions);
 console.log(`Sandbox: ${s.dir}`);
 
