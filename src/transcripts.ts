@@ -2,6 +2,7 @@
 // No VS Code imports here so it can be unit-tested with plain Node.
 
 import { parseCopilotTranscript } from './copilotCliParser';
+import { RunningTask, trackTasks } from './liveSessions';
 import { parseTranscript, SessionInfo, SubagentRun, TranscriptEntry } from './sessionParser';
 import { sourceOf } from './sources';
 import { parseChatTranscript } from './vscodeChatParser';
@@ -15,5 +16,27 @@ export function parseTranscriptFor(session: SessionInfo, text: string, subagents
       return parseChatTranscript(text);
     default:
       return parseTranscript(text, { sessionId: session.id, subagents });
+  }
+}
+
+/**
+ * The transcript, and for a Claude Code session the background subagents and shells its log has no end for
+ * (`runningTasks`), both from one parse of the log: the transcript tab redraws on every write to a live session's log,
+ * and a second parse for the tasks doubled that work.
+ */
+export function parseTranscriptAndTasks(
+  session: SessionInfo,
+  text: string,
+  subagents: SubagentRun[] = [],
+): { entries: TranscriptEntry[]; tasks?: RunningTask[] } {
+  switch (sourceOf(session)) {
+    case 'copilot-cli':
+    case 'vscode-chat':
+      return { entries: parseTranscriptFor(session, text, subagents) };
+    default: {
+      const tracker = trackTasks();
+      const entries = parseTranscript(text, { sessionId: session.id, subagents, onRecord: tracker.add });
+      return { entries, tasks: tracker.tasks() };
+    }
   }
 }

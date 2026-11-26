@@ -166,30 +166,39 @@ function sameStart(a: string, b: string): boolean {
 }
 
 /**
- * What earlier start-time checks found, so a process is looked up once rather than on every refresh (on Windows a
- * lookup is a PowerShell spawn of about a second).
+ * What earlier start-time checks found, so a process is not looked up on every refresh (on Windows a lookup is a
+ * PowerShell spawn of about a second).
  */
 export interface StartCheckCache {
   /** pid -> the procStart found to be that running process's own. */
   verified: Map<number, string>;
+  /** pid -> when it was last found to be (ms since epoch); it is looked up again VERIFIED_RECHECK_MS later. */
+  verifiedAt: Map<number, number>;
   /** pid -> a procStart found not to be (the pid was reused after a crash). Kept until the pid dies. */
   rejected: Map<number, string>;
   /** After a failed lookup, no new one is tried before this time (ms since epoch). */
   retryAt?: number;
 }
 
-export const newStartCheckCache = (): StartCheckCache => ({ verified: new Map(), rejected: new Map() });
+export const newStartCheckCache = (): StartCheckCache => ({ verified: new Map(), verifiedAt: new Map(), rejected: new Map() });
 
 /** How long a failed start-time lookup is not retried. Entries count as live meanwhile, as they do on failure. */
 export const START_LOOKUP_BACKOFF_MS = 60_000;
 
 /**
+ * How long a verified pid is trusted before it is looked up again. Between two refreshes (10 s) the process can crash
+ * and Windows hand its pid to another one, which `isAlive` cannot tell from the writer; this bounds how long such a
+ * stale entry stays live.
+ */
+export const VERIFIED_RECHECK_MS = 5 * 60_000;
+
+/**
  * The entries whose process is still the one that wrote them. A dead pid is dropped; so is a live pid whose start
  * time differs from the entry's (the pid was reused after a crash). `cache` remembers both answers until the pid dies,
- * so each process is looked up once, and backs off after a failed lookup.
+ * looks a verified pid up again every VERIFIED_RECHECK_MS, and backs off after a failed lookup.
  */
 export async function liveOnly(entries: LiveProcess[], probe: ProcessProbe, cache = newStartCheckCache(), now = Date.now()): Promise<LiveProcess[]> {
-  const { verified, rejected } = cache;
+  const { verified, verifiedAt, rejected } = cache;
   const alive: LiveProcess[] = [];
   for (const e of entries) {
     // A registry folder shared with another system (a synced home folder, WSL) holds pids that mean nothing here.
@@ -202,14 +211,16 @@ export async function liveOnly(entries: LiveProcess[], probe: ProcessProbe, cach
   }
   // A pid that died, or whose file is gone, is forgotten: a later process may get it.
   const alivePids = new Set(alive.map((e) => e.pid));
-  for (const m of [verified, rejected]) {
+  for (const m of [verified, verifiedAt, rejected]) {
     for (const pid of m.keys()) {
       if (!alivePids.has(pid)) {
         m.delete(pid);
       }
     }
   }
-  const known = (e: LiveProcess) => !e.procStart || verified.get(e.pid) === e.procStart || rejected.get(e.pid) === e.procStart;
+  // Verified, and recently enough that a crash and a reused pid since are unlikely.
+  const fresh = (e: LiveProcess) => verified.get(e.pid) === e.procStart && now - (verifiedAt.get(e.pid) ?? -Infinity) < VERIFIED_RECHECK_MS;
+  const known = (e: LiveProcess) => !e.procStart || fresh(e) || rejected.get(e.pid) === e.procStart;
   const unchecked = alive.filter((e) => !known(e));
   let times: Map<number, string> | undefined;
   if (unchecked.length && probe.startTimes && !(cache.retryAt !== undefined && now < cache.retryAt)) {
@@ -217,14 +228,15 @@ export async function liveOnly(entries: LiveProcess[], probe: ProcessProbe, cach
     cache.retryAt = times ? undefined : now + START_LOOKUP_BACKOFF_MS;
   }
   return alive.filter((e) => {
-    if (!e.procStart || verified.get(e.pid) === e.procStart) {
+    if (!e.procStart || fresh(e)) {
       return true;
     }
     if (rejected.get(e.pid) === e.procStart) {
       return false;
     }
     if (!times) {
-      // Not checked (no lookup on this system, or it failed): counted rather than hidden.
+      // Not checked (no lookup on this system, it failed, or it is backing off): counted rather than hidden, as a
+      // verified pid due for its re-check is until the lookup works.
       return true;
     }
     const actual = times.get(e.pid);
@@ -234,8 +246,12 @@ export async function liveOnly(entries: LiveProcess[], probe: ProcessProbe, cach
     }
     if (sameStart(actual, e.procStart)) {
       verified.set(e.pid, e.procStart);
+      verifiedAt.set(e.pid, now);
       return true;
     }
+    // Verified before, perhaps, but the writer has since crashed and another process has its pid.
+    verified.delete(e.pid);
+    verifiedAt.delete(e.pid);
     rejected.set(e.pid, e.procStart);
     return false;
   });
@@ -255,6 +271,8 @@ export interface RunningTask {
   since?: number;
   /** The agent has stopped but waits on background work of its own. */
   waiting?: boolean;
+  /** When the main log was told it waits (ms since epoch). */
+  waitingSince?: number;
 }
 
 const AGENT_ID = /\bagentId: ([\w-]+)/;
@@ -266,7 +284,10 @@ const time = (ts: unknown): number | undefined => {
 };
 const tag = (text: string, name: string) => new RegExp(`<${name}>([\\s\\S]*?)</${name}>`).exec(text)?.[1]?.trim();
 
-/** The text of a record that may carry a task notification: a user message, or a prompt queued mid-turn. */
+/**
+ * The text of a record that may carry a task notification: a user message, or a prompt queued mid-turn. In a
+ * subagent's own log the notification follows a "[SYSTEM NOTIFICATION ...]" preamble, and the record's origin says so.
+ */
 function notificationText(r: any): string | undefined {
   let raw: unknown;
   if (r.type === 'user') {
@@ -275,15 +296,23 @@ function notificationText(r: any): string | undefined {
   } else if (r.type === 'attachment' && r.attachment?.type === 'queued_command') {
     raw = r.attachment.prompt;
   }
-  return typeof raw === 'string' && /^\s*<task-notification>/.test(raw) ? raw : undefined;
+  if (typeof raw !== 'string') {
+    return undefined;
+  }
+  return /^\s*<task-notification>/.test(raw) || (r.origin?.kind === 'task-notification' && raw.includes('<task-notification>')) ? raw : undefined;
 }
 
 /**
- * The background subagents and shells the main thread of a log launched and has no word of ending: no task
- * notification that they finished, failed or were stopped, no hand-back, no TaskStop. Whether they really still run
- * depends on the process that launched them being alive, which the log cannot say (see `tasksOf`).
+ * Follows a log record by record and keeps the background subagents and shells it launched and has no word of ending
+ * (see `runningTasks`), so a caller already reading the log for something else need not read it twice.
  */
-export function runningTasks(log: string): RunningTask[] {
+export interface TaskTracker {
+  add(record: any): void;
+  tasks(): RunningTask[];
+}
+
+/** `sidechain`: the log is a subagent's own, whose records are all sidechain records; otherwise those are skipped. */
+export function trackTasks(options: { sidechain?: boolean } = {}): TaskTracker {
   const calls = new Map<string, { name: unknown; input: any }>();
   const tasks = new Map<string, RunningTask & { toolUseId?: string }>();
   const end = (id: unknown) => {
@@ -291,9 +320,9 @@ export function runningTasks(log: string): RunningTask[] {
       tasks.delete(id);
     }
   };
-  for (const r of records(log)) {
-    if (!r || typeof r !== 'object' || r.isSidechain) {
-      continue;
+  const add = (r: any) => {
+    if (!r || typeof r !== 'object' || (r.isSidechain && !options.sidechain)) {
+      return;
     }
     const content = r.message?.content;
     if (r.type === 'assistant' && Array.isArray(content)) {
@@ -302,7 +331,7 @@ export function runningTasks(log: string): RunningTask[] {
           calls.set(p.id, { name: p.name, input: p.input && typeof p.input === 'object' ? p.input : {} });
         }
       }
-      continue;
+      return;
     }
     const note = notificationText(r);
     if (note) {
@@ -313,11 +342,12 @@ export function runningTasks(log: string): RunningTask[] {
         // "Agent "x" is waiting on its own background work": it stopped, but what it started still runs.
         if (/\bis waiting on\b/i.test(tag(note, 'summary') ?? '')) {
           task.waiting = true;
+          task.waitingSince = time(r.timestamp);
         } else {
           tasks.delete(task.id);
         }
       }
-      continue;
+      return;
     }
     if (r.type === 'attachment' || (r.type === 'user' && r.isMeta)) {
       const msg = parseAgentMessage(r);
@@ -325,10 +355,10 @@ export function runningTasks(log: string): RunningTask[] {
         // A hand-back is the agent's last act.
         end(msg.from);
       }
-      continue;
+      return;
     }
     if (r.type !== 'user' || !Array.isArray(content)) {
-      continue;
+      return;
     }
     const result = r.toolUseResult && typeof r.toolUseResult === 'object' ? r.toolUseResult : {};
     for (const p of content) {
@@ -358,8 +388,99 @@ export function runningTasks(log: string): RunningTask[] {
         end(str(result.task_id) ?? str(result.shell_id) ?? str(call!.input.task_id) ?? str(call!.input.shell_id));
       }
     }
+  };
+  return {
+    add: (r) => {
+      try {
+        add(r);
+      } catch {
+        // A record of a shape this does not know is skipped.
+      }
+    },
+    tasks: () => [...tasks.values()].map(({ toolUseId: _, ...t }) => t),
+  };
+}
+
+/**
+ * The background subagents and shells the main thread of a log launched and has no word of ending: no task
+ * notification that they finished, failed or were stopped, no hand-back, no TaskStop. Whether they really still run
+ * depends on the process that launched them being alive, which the log cannot say (see `tasksOf`). A subagent waiting
+ * on its own background work stays listed until the main log hears from it again; `settleWaiting` asks its own log.
+ */
+export function runningTasks(log: string | Iterable<any>, options: { sidechain?: boolean } = {}): RunningTask[] {
+  const tracker = trackTasks(options);
+  for (const r of typeof log === 'string' ? records(log) : log) {
+    tracker.add(r);
   }
-  return [...tasks.values()].map(({ toolUseId: _, ...t }) => t);
+  return tracker.tasks();
+}
+
+/** A tool call that is a subagent's last act; one after it does not mean it is working again. */
+const isLastAct = (name: unknown) => name === 'SubagentHandback';
+
+/**
+ * Where a subagent that stopped to wait on its own background work stands, from its own log
+ * (`subagents/agent-<id>.jsonl`): `working` when it has resumed since `since` and is mid-turn, `waiting` while
+ * background work it started has no word of ending, and `done` when all of that has ended and it is not working: it
+ * will not resume, or is about to stop, and the main log hears of it next.
+ */
+export function waitingState(ownLog: string, since: number | undefined): 'working' | 'waiting' | 'done' {
+  const tracker = trackTasks({ sidechain: true });
+  let last: any;
+  for (const r of records(ownLog)) {
+    tracker.add(r);
+    if (r?.type === 'assistant' && Array.isArray(r.message?.content) && r.message.content.length) {
+      last = r;
+    }
+  }
+  const lastAt = time(last?.timestamp);
+  const resumed = !!last && (since === undefined || (lastAt !== undefined && lastAt > since));
+  if (resumed && last.message.content.some((p: any) => p?.type === 'tool_use' && !isLastAct(p.name))) {
+    return 'working';
+  }
+  return tracker.tasks().length ? 'waiting' : 'done';
+}
+
+/**
+ * `tasks` with each subagent marked waiting checked against its own log (`ownLog(agentId)`, undefined when it cannot
+ * be read, which leaves the task as it is): dropped once its background work has all ended, and no longer marked
+ * waiting once it is working again.
+ */
+export function settleWaiting(tasks: RunningTask[], ownLog: (agentId: string) => string | undefined): RunningTask[] {
+  const out: RunningTask[] = [];
+  for (const t of tasks) {
+    const log = t.kind === 'agent' && t.waiting ? ownLog(t.id) : undefined;
+    if (log === undefined) {
+      out.push(t);
+      continue;
+    }
+    const state = waitingState(log, t.waitingSince);
+    if (state === 'working') {
+      const { waiting: _w, waitingSince: _s, ...running } = t;
+      out.push(running);
+    } else if (state === 'waiting') {
+      out.push(t);
+    }
+  }
+  return out;
+}
+
+/** `settleWaiting`, reading the waiting subagents' own logs from `<sessionId>/subagents/` beside the session's log. */
+export async function settleWaitingFromDisk(tasks: RunningTask[], sessionFile: string, sessionId: string): Promise<RunningTask[]> {
+  const waiting = tasks.filter((t) => t.kind === 'agent' && t.waiting && /^[\w-]+$/.test(t.id));
+  if (!waiting.length) {
+    return tasks;
+  }
+  const dir = path.join(path.dirname(sessionFile), sessionId, 'subagents');
+  const logs = new Map<string, string | undefined>(
+    await Promise.all(waiting.map(async (t) => [t.id, await fs.readFile(path.join(dir, `agent-${t.id}.jsonl`), 'utf8').catch(() => undefined)] as const)),
+  );
+  return settleWaiting(tasks, (id) => logs.get(id));
+}
+
+/** What a session's log says still runs in the background, waiting subagents checked against their own logs. */
+export function readRunningTasks(log: string, sessionFile: string, sessionId: string): Promise<RunningTask[]> {
+  return settleWaitingFromDisk(runningTasks(log), sessionFile, sessionId);
 }
 
 /**

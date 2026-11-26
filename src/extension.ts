@@ -7,7 +7,7 @@ import * as vscode from 'vscode';
 import { AgentInfo, claudeNewSessionArgs, claudeResumeArgs, claudeStartArgs, listAgents, Overrides, userAgentsDir } from './agents';
 import { formatRelative, isInside } from './format';
 import { buildHandoff, collectHandoffFacts, collectTranscriptFacts } from './handoff';
-import { liveLabel, LiveSessions, liveWarning, registryDirFor, runningTasks, tasksOf } from './liveSessions';
+import { liveLabel, LiveSessions, liveWarning, readRunningTasks, registryDirFor, tasksOf } from './liveSessions';
 import { GroupBy, projectName, projectPath, SessionModel, workspaceFolderPaths } from './model';
 import { isEmptyQuery, parseQuery } from './query';
 import { SessionInfo, SessionSource } from './sessionParser';
@@ -193,7 +193,7 @@ export function activate(context: vscode.ExtensionContext): void {
     const log = await fs.readFile(session.filePath, 'utf8').catch(() => '');
     const anyway = `${verb} Anyway`;
     const choice = await vscode.window.showWarningMessage(
-      liveWarning(session.title, elsewhere[0], tasksOf(runningTasks(log), elsewhere[0]), doing),
+      liveWarning(session.title, elsewhere[0], tasksOf(await readRunningTasks(log, session.filePath, session.id), elsewhere[0]), doing),
       { modal: true },
       anyway,
     );
