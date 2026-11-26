@@ -281,6 +281,12 @@ test('a can_use_tool request is answered with the deny on stdin', async () => {
   child.say({ type: 'control_request', request_id: 'r-9', request: { subtype: 'can_use_tool', tool_name: 'Bash', input: { command: 'mkdir out' }, tool_use_id: 'toolu_B' } });
   assert.deepEqual(child.controls(), [JSON.parse(denyLine('r-9'))]);
   assert.equal(chat.status.busy, true, 'the turn carries on');
+
+  // A request that names a subagent's tool call is still answered, though the subagent's own stream is skipped.
+  child.say({ type: 'control_request', parent_tool_use_id: 'toolu_Task', request_id: 'r-10', request: { subtype: 'can_use_tool', tool_name: 'Edit', input: {}, tool_use_id: 'toolu_E' } });
+  assert.deepEqual(child.controls().at(-1), JSON.parse(denyLine('r-10')));
+  child.say({ type: 'control_request', parent_tool_use_id: 'toolu_Task', request_id: 'r-11', request: { subtype: 'mcp_message' } });
+  assert.equal(child.controls().at(-1).response.subtype, 'error', 'an unknown request from a subagent gets an error reply');
 });
 
 test('Stop sends the interrupt control request and never kills; waiting messages come back', async () => {
@@ -361,6 +367,19 @@ test('ending the chat closes stdin, interrupts a running turn, and kills only a 
   assert.equal(b.spawns[0].child.killed, false);
   b.chat.send('after');
   assert.equal(b.spawns.length, 1, 'a disposed chat starts nothing');
+
+  // A kill whose exit is never reported: whoever waits (window close) is let go after a short wait.
+  const c = makeChat();
+  c.chat.send('hi');
+  await tick();
+  const stuck = c.spawns[0].child;
+  stuck.exitOnEnd = false;
+  stuck.kill = () => (stuck.killed = true);
+  const started = Date.now();
+  await c.chat.dispose(10);
+  assert.equal(stuck.killed, true);
+  assert.ok(Date.now() - started < 5000);
+  assert.ok(c.logs.some((l) => /No exit reported after the kill/.test(l)));
 });
 
 test('errors show in the tab: CLI not found, a spawn failure, a crash', async () => {

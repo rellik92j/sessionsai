@@ -265,6 +265,10 @@ export class LiveChat {
     if (!ev) {
       return none;
     }
+    // A permission request is answered whoever asks, a subagent included, or the turn hangs (doc section 6).
+    if (ev.type === 'control_request') {
+      return this.controlRequest(ev);
+    }
     // A subagent's own stream: its records go to its own log, not this session's.
     if (ev.parent_tool_use_id) {
       return none;
@@ -276,8 +280,6 @@ export class LiveChat {
         return { changed: this.assistant(ev) };
       case 'user':
         return { changed: this.user(ev) };
-      case 'control_request':
-        return this.controlRequest(ev);
       case 'result':
         return this.result(ev);
       case 'system': {
@@ -553,6 +555,8 @@ export interface ChatStatus {
 
 /** How long a closing process gets to exit after its stdin closes before it is killed. */
 const CLOSE_GRACE_MS = 3000;
+/** How long to wait for the exit after a kill before giving up on hearing it. */
+const KILL_WAIT_MS = 1000;
 
 /**
  * One chat: a `claude` process kept between turns, the messages waiting for it, and what the tab shows meanwhile.
@@ -815,6 +819,7 @@ export class ClaudeChat {
       this.write(interruptLine(`interrupt-${++this.requestSeq}`));
     }
     this.closing = new Promise<void>((resolve) => {
+      let fallback: ReturnType<typeof setTimeout> | undefined;
       const timer = setTimeout(() => {
         this.opts.log('Did not exit after stdin closed; killing it.');
         try {
@@ -822,9 +827,15 @@ export class ClaudeChat {
         } catch {
           // Already gone.
         }
+        // A kill whose exit is never reported must not hold up whoever waits for this (window close above all).
+        fallback = setTimeout(() => {
+          this.opts.log('No exit reported after the kill; no longer waiting for it.');
+          resolve();
+        }, KILL_WAIT_MS);
       }, graceMs);
       child.on('exit', () => {
         clearTimeout(timer);
+        clearTimeout(fallback);
         resolve();
       });
       try {

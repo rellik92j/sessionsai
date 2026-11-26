@@ -114,6 +114,13 @@ export class TranscriptPanels {
   /** Regular (kept) tabs by session key. */
   private readonly pinned = new Map<string, TranscriptTab>();
   private preview: TranscriptTab | undefined;
+  /**
+   * Chats let go of by End chat or a closed tab whose process has not exited yet, by session key. Until it has, the
+   * session still has that writer: the guards count it, and window close waits for it.
+   */
+  private readonly closing = new Map<ClaudeChat, { key: string; done: Promise<void> }>();
+  /** When a session's own ended chats last heard from their process, by session key: their log writes are not another writer's. */
+  private readonly ownActivity = new Map<string, number>();
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -204,7 +211,7 @@ export class TranscriptPanels {
       tab.watcher = undefined;
       // Closing the tab ends its chat: stdin closed, killed if it will not exit.
       clearTimeout(tab.liveTimer);
-      void tab.chat?.dispose();
+      void this.retire(tab);
       if (this.preview === tab) {
         this.preview = undefined;
       } else if (this.pinned.get(tabKey(tab.session, tab.run)) === tab) {
@@ -371,8 +378,12 @@ export class TranscriptPanels {
     if (isPermissionMode(mode)) {
       tab.chatMode = mode;
     }
-    if (!tab.chat?.active && !(await this.mayStartChat(tab))) {
-      return false;
+    if (!tab.chat?.active) {
+      // A chat with this session that is still shutting down (End chat a moment ago) exits before a new one starts.
+      await this.closed(sessionKey(session));
+      if (!(await this.mayStartChat(tab))) {
+        return false;
+      }
     }
     if (tab.disposed) {
       return false;
@@ -414,7 +425,7 @@ export class TranscriptPanels {
       return false;
     }
     const mtime = statSync(session.filePath, { throwIfNoEntry: false })?.mtimeMs ?? 0;
-    const ownWrite = (tab.chat?.lastActivity ?? 0) + 3000;
+    const ownWrite = Math.max(tab.chat?.lastActivity ?? 0, this.ownActivity.get(sessionKey(session)) ?? 0) + 3000;
     if (Date.now() - mtime < RECENT_WRITE_MS && mtime > ownWrite) {
       const choice = await vscode.window.showWarningMessage(
         `This session's log was written ${Math.max(1, Math.round((Date.now() - mtime) / 1000))}s ago, so it may be open somewhere else (a terminal or the Claude Code chat). Two Claude Code processes on one session fork its log.`,
@@ -448,32 +459,66 @@ export class TranscriptPanels {
   }
 
   private async endTabChat(tab: TranscriptTab): Promise<void> {
-    const chat = tab.chat;
-    if (!chat) {
+    if (!tab.chat) {
       return;
     }
-    tab.chat = undefined;
     clearTimeout(tab.liveTimer);
     tab.liveTimer = undefined;
-    await chat.dispose();
+    await this.retire(tab);
     this.postChat(tab);
   }
 
-  /** Whether a transcript tab is chatting with the session: it has a process up or a turn pending. */
-  chatHolds(session: SessionInfo): boolean {
-    const key = sessionKey(session);
-    return this.tabs().some((t) => !t.run && sessionKey(t.session) === key && !!t.chat?.active);
+  /**
+   * Takes the tab's chat off it and ends its process. Until the process has exited the chat stays in `closing`, so the
+   * session still counts as held and window close waits for it. Resolves once it has exited.
+   */
+  private retire(tab: TranscriptTab, graceMs?: number): Promise<void> {
+    const chat = tab.chat;
+    if (!chat) {
+      return Promise.resolve();
+    }
+    tab.chat = undefined;
+    const key = sessionKey(tab.session);
+    const done = chat.dispose(graceMs).finally(() => {
+      this.closing.delete(chat);
+      if (chat.lastActivity) {
+        this.ownActivity.set(key, Math.max(this.ownActivity.get(key) ?? 0, chat.lastActivity));
+      }
+    });
+    this.closing.set(chat, { key, done });
+    return done;
   }
 
-  /** Ends every chat with the session, so it can be resumed elsewhere. */
+  /** Resolves once every ended chat with the session (by key) has exited. */
+  private closed(key: string): Promise<void> {
+    return Promise.all([...this.closing.values()].filter((c) => c.key === key).map((c) => c.done)).then(() => undefined);
+  }
+
+  /** Whether the session has a chat writer: a tab with a process up or a turn pending, or an ended chat still exiting. */
+  chatHolds(session: SessionInfo): boolean {
+    const key = sessionKey(session);
+    return (
+      this.tabs().some((t) => !t.run && sessionKey(t.session) === key && !!t.chat?.active) ||
+      [...this.closing.values()].some((c) => c.key === key)
+    );
+  }
+
+  /** Ends every chat with the session, so it can be resumed elsewhere; resolves once every process has exited. */
   async endChat(session: SessionInfo): Promise<void> {
     const key = sessionKey(session);
     await Promise.all(this.tabs().filter((t) => !t.run && sessionKey(t.session) === key).map((t) => this.endTabChat(t)));
+    await this.closed(key);
   }
 
-  /** Ends every chat process (the window is closing): stdin closed, killed if not gone within `graceMs`. */
+  /**
+   * Ends every chat process (the window is closing): stdin closed, killed if not gone within `graceMs`. Also waits for
+   * the chats already shutting down, from tabs closed or chats ended just before.
+   */
   dispose(graceMs = 1500): Promise<void> {
-    return Promise.all(this.tabs().map((t) => t.chat?.dispose(graceMs))).then(() => undefined);
+    for (const t of this.tabs()) {
+      void this.retire(t, graceMs);
+    }
+    return Promise.all([...this.closing.values()].map((c) => c.done)).then(() => undefined);
   }
 
   private get codiconsUri() {
