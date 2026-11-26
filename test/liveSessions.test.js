@@ -230,8 +230,9 @@ test('a subagent waiting on its own background work drops off once its own log s
       ['aw00000000000001', true],
       ['aw00000000000002', true],
       ['aw00000000000003', true],
+      ['aw00000000000004', true],
     ],
-    'the main log alone says all three wait',
+    'the main log alone says all four wait',
   );
   assert.equal(tasks[0].waitingSince, Date.parse('2026-11-21T09:05:00.000Z'));
 
@@ -240,6 +241,8 @@ test('a subagent waiting on its own background work drops off once its own log s
   assert.equal(live.waitingState(ownLog('aw00000000000001'), tasks[0].waitingSince), 'done');
   assert.equal(live.waitingState(ownLog('aw00000000000002'), tasks[1].waitingSince), 'waiting');
   assert.equal(live.waitingState(ownLog('aw00000000000003'), tasks[2].waitingSince), 'working');
+  // 4: its background job's launch is of a shape not recognised, so no launch is seen to end: still waiting, not done.
+  assert.equal(live.waitingState(ownLog('aw00000000000004'), tasks[3].waitingSince), 'waiting');
 
   const settled = await live.readRunningTasks(fs.readFileSync(waitingFile, 'utf8'), waitingFile, WAIT_SESSION);
   assert.deepEqual(
@@ -247,14 +250,17 @@ test('a subagent waiting on its own background work drops off once its own log s
     [
       ['aw00000000000002', true],
       ['aw00000000000003', false],
+      ['aw00000000000004', true],
     ],
   );
   const html = renderLiveNotice([], { pid: 1, sessionId: WAIT_SESSION }, settled);
-  assert.equal((html.match(/waiting on its own background work/g) ?? []).length, 1);
+  assert.equal((html.match(/waiting on its own background work/g) ?? []).length, 2);
 
-  // A subagent log that cannot be read leaves the task as the main log has it; garbage is not a crash.
+  // A subagent log that cannot be read leaves the task as the main log has it; garbage is not a crash, and with no
+  // launch seen to end it is not evidence that the subagent is done.
   assert.deepEqual(live.settleWaiting(tasks, () => undefined), tasks);
-  assert.equal(live.waitingState('garbage\n{"type":"assistant","message":{"content":"x"}}\n', undefined), 'done');
+  assert.equal(live.waitingState('garbage\n{"type":"assistant","message":{"content":"x"}}\n', undefined), 'waiting');
+  assert.equal(live.waitingState('', undefined), 'waiting');
   // The background-tasks fixture's waiting agent has no log of its own beside it: kept.
   const bt = await live.readRunningTasks(log, path.join(__dirname, 'fixtures', 'claude-code', 'background-tasks.jsonl'), SESSION);
   assert.ok(bt.some((t) => t.id === 'a3000000000000003' && t.waiting));
@@ -290,4 +296,21 @@ test('the transcript and what still runs come from one parse of the log', () => 
   assert.deepEqual(both.tasks, live.runningTasks(log));
   assert.deepEqual(both.entries, parseTranscriptFor(session, log));
   assert.equal(parseTranscriptAndTasks({ ...session, source: 'copilot-cli' }, '').tasks, undefined);
+});
+
+test('an onRecord hook that throws does not stop or change the transcript', () => {
+  const { parseTranscript } = require('../out/sessionParser');
+  let parsed = 0;
+  const plain = parseTranscript(log, { sessionId: SESSION, onRecord: () => parsed++ });
+  let seen = 0;
+  const throwing = parseTranscript(log, {
+    sessionId: SESSION,
+    onRecord: () => {
+      seen++;
+      throw new Error('hook failed');
+    },
+  });
+  assert.ok(plain.length > 0);
+  assert.equal(seen, parsed, 'the hook still saw every record');
+  assert.deepEqual(throwing, plain);
 });

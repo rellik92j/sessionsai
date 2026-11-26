@@ -1024,7 +1024,11 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
   const handbackCalls = new Set<string>();
 
   for (const r of records(text)) {
-    options.onRecord?.(r);
+    try {
+      options.onRecord?.(r);
+    } catch {
+      // A caller's hook that throws must not stop the transcript.
+    }
     if (!r || typeof r !== 'object' || (r.isSidechain && !options.sidechain)) {
       continue;
     }

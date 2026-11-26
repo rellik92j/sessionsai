@@ -309,15 +309,18 @@ function notificationText(r: any): string | undefined {
 export interface TaskTracker {
   add(record: any): void;
   tasks(): RunningTask[];
+  /** How many launched tasks the log has seen end: by notification, hand-back or stop. */
+  ended(): number;
 }
 
 /** `sidechain`: the log is a subagent's own, whose records are all sidechain records; otherwise those are skipped. */
 export function trackTasks(options: { sidechain?: boolean } = {}): TaskTracker {
   const calls = new Map<string, { name: unknown; input: any }>();
   const tasks = new Map<string, RunningTask & { toolUseId?: string }>();
+  let ended = 0;
   const end = (id: unknown) => {
-    if (typeof id === 'string') {
-      tasks.delete(id);
+    if (typeof id === 'string' && tasks.delete(id)) {
+      ended++;
     }
   };
   const add = (r: any) => {
@@ -344,7 +347,7 @@ export function trackTasks(options: { sidechain?: boolean } = {}): TaskTracker {
           task.waiting = true;
           task.waitingSince = time(r.timestamp);
         } else {
-          tasks.delete(task.id);
+          end(task.id);
         }
       }
       return;
@@ -398,6 +401,7 @@ export function trackTasks(options: { sidechain?: boolean } = {}): TaskTracker {
       }
     },
     tasks: () => [...tasks.values()].map(({ toolUseId: _, ...t }) => t),
+    ended: () => ended,
   };
 }
 
@@ -421,8 +425,9 @@ const isLastAct = (name: unknown) => name === 'SubagentHandback';
 /**
  * Where a subagent that stopped to wait on its own background work stands, from its own log
  * (`subagents/agent-<id>.jsonl`): `working` when it has resumed since `since` and is mid-turn, `waiting` while
- * background work it started has no word of ending, and `done` when all of that has ended and it is not working: it
- * will not resume, or is about to stop, and the main log hears of it next.
+ * background work it started has no word of ending, or when no launch it started was seen to end at all, and `done`
+ * when all of that has ended and it is not working: it will not resume, or is about to stop, and the main log hears
+ * of it next.
  */
 export function waitingState(ownLog: string, since: number | undefined): 'working' | 'waiting' | 'done' {
   const tracker = trackTasks({ sidechain: true });
@@ -438,7 +443,9 @@ export function waitingState(ownLog: string, since: number | undefined): 'workin
   if (resumed && last.message.content.some((p: any) => p?.type === 'tool_use' && !isLastAct(p.name))) {
     return 'working';
   }
-  return tracker.tasks().length ? 'waiting' : 'done';
+  // Done only on evidence: a launch the log saw end. Background work of a kind not recognised here leaves no
+  // launch to see end, so the subagent stays waiting; dropping one that still waits would hide the fork warning.
+  return tracker.tasks().length || !tracker.ended() ? 'waiting' : 'done';
 }
 
 /**
