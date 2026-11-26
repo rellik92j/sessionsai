@@ -343,17 +343,108 @@ test('a new permission mode restarts the process between turns, never during one
   assert.equal(spawns[2].args[spawns[2].args.indexOf('--permission-mode') + 1], 'acceptEdits');
 });
 
-test('ending the chat closes stdin, interrupts a running turn, and kills only a process that will not exit', async () => {
+test('ending the chat during a turn lets the reply finish: no interrupt, stdin closes after its result, waiting messages come back', async () => {
+  const { chat, spawns, unsent } = makeChat();
+  chat.send('long job');
+  chat.send('queued behind it');
+  await tick();
+  const { child } = spawns[0];
+  let exited = false;
+  const done = chat.end().then(() => (exited = true));
+  assert.deepEqual(child.controls(), [], 'no interrupt line');
+  assert.equal(child.ended, false, 'stdin stays open while the turn runs');
+  assert.deepEqual(unsent, ['queued behind it']);
+  assert.equal(chat.status.busy, true);
+  assert.equal(chat.status.finishing, true);
+  assert.equal(chat.replying, true);
+  assert.equal(chatStateMessage(chat.status, 'default').finishing, true);
+
+  // The finishing turn still has its tool requests answered.
+  child.say({ type: 'control_request', request_id: 'r-1', request: { subtype: 'can_use_tool', tool_name: 'Bash', input: {}, tool_use_id: 'toolu_1' } });
+  assert.deepEqual(child.controls(), [JSON.parse(denyLine('r-1'))]);
+  await tick();
+  assert.equal(exited, false);
+
+  child.say(result());
+  await done;
+  assert.equal(child.ended, true);
+  assert.equal(child.killed, false);
+  assert.equal(chat.status.lastTurn.interrupted, undefined, 'the reply finished');
+  assert.deepEqual(child.users(), ['long job'], 'the waiting message was never sent');
+  assert.equal(chat.active, false);
+  chat.send('after');
+  assert.equal(spawns.length, 1, 'an ended chat starts nothing');
+
+  // No time limit on the finishing turn, but a process that has not exited some time after its result is killed.
+  const b = makeChat();
+  b.chat.send('long job');
+  await tick();
+  const bChild = b.spawns[0].child;
+  bChild.exitOnEnd = false;
+  const bDone = b.chat.end(20);
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal(bChild.killed, false, 'not killed while the turn runs');
+  bChild.say(result());
+  await bDone;
+  assert.equal(bChild.ended, true);
+  assert.equal(bChild.killed, true);
+});
+
+test('stop now interrupts a reply that is finishing after the chat ended', async () => {
+  const { chat, spawns } = makeChat();
+  chat.send('long job');
+  await tick();
+  const { child } = spawns[0];
+  const done = chat.end();
+  assert.equal(child.ended, false);
+  void chat.stopNow();
+  void chat.stopNow();
+  assert.deepEqual(child.controls().map((c) => c.request.subtype), ['interrupt'], 'one interrupt line');
+  assert.equal(child.ended, true);
+  await done;
+  assert.equal(chat.status.running, false);
+
+  // Stop in the chat bar works on a finishing chat too: the interrupt, then stdin closes after the result.
+  const b = makeChat();
+  b.chat.send('long job');
+  await tick();
+  const bChild = b.spawns[0].child;
+  const bDone = b.chat.end();
+  b.chat.interrupt();
+  assert.deepEqual(bChild.controls().map((c) => c.request.subtype), ['interrupt']);
+  assert.equal(bChild.ended, false);
+  bChild.say(result({ subtype: 'error_during_execution', is_error: true, stop_reason: null }));
+  await bDone;
+  assert.equal(bChild.ended, true);
+  assert.equal(b.chat.status.lastTurn.interrupted, true);
+});
+
+test('window close: a running turn gets a grace period, then the interrupt; a process that will not exit is killed', async () => {
+  // Finishes within the grace period: no interrupt.
+  const a = makeChat();
+  a.chat.send('quick');
+  await tick();
+  const aChild = a.spawns[0].child;
+  const aDone = a.chat.dispose(200, 1000);
+  await tick();
+  aChild.say(result());
+  await aDone;
+  assert.deepEqual(aChild.controls(), []);
+  assert.equal(aChild.killed, false);
+
   const { chat, spawns } = makeChat();
   chat.send('hi');
   await tick();
   const { child } = spawns[0];
   child.exitOnEnd = false;
-  const done = chat.dispose(30);
+  const done = chat.dispose(40, 30);
+  assert.deepEqual(child.controls(), [], 'not interrupted straight away');
+  assert.equal(child.ended, false);
+  await new Promise((r) => setTimeout(r, 60));
+  assert.deepEqual(child.controls().map((c) => c.request.subtype), ['interrupt'], 'interrupted after the grace period');
   assert.equal(child.ended, true);
-  assert.deepEqual(child.controls().map((c) => c.request.subtype), ['interrupt'], 'closing stdin alone would let the turn finish');
   await done;
-  assert.equal(child.killed, true);
+  assert.equal(child.killed, true, 'killed when it would not exit');
   assert.equal(chat.status.running, false);
   assert.equal(chat.active, false);
 
@@ -376,7 +467,7 @@ test('ending the chat closes stdin, interrupts a running turn, and kills only a 
   stuck.exitOnEnd = false;
   stuck.kill = () => (stuck.killed = true);
   const started = Date.now();
-  await c.chat.dispose(10);
+  await c.chat.dispose(10, 10);
   assert.equal(stuck.killed, true);
   assert.ok(Date.now() - started < 5000);
   assert.ok(c.logs.some((l) => /No exit reported after the kill/.test(l)));

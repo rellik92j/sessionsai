@@ -42,6 +42,8 @@ interface TranscriptTab {
   disposed?: boolean;
   /** "Chat here": the Claude Code process this tab talks to, once the first message is sent. */
   chat?: ClaudeChat;
+  /** A chat ended during a turn, still shown here while its reply finishes and its process exits. */
+  ending?: ClaudeChat;
   /** The permission mode the chat runs (or will run) in. */
   chatMode: PermissionMode;
   /** Streamed text arrives many times a second; the page is redrawn at most this often. */
@@ -278,7 +280,7 @@ export class TranscriptPanels {
           break;
         }
         case 'chatStop':
-          tab.chat?.interrupt();
+          (tab.chat ?? tab.ending)?.interrupt();
           break;
         case 'chatMode':
           if (isPermissionMode(msg.mode)) {
@@ -453,36 +455,45 @@ export class TranscriptPanels {
     if (tab.disposed || tab.run) {
       return;
     }
-    const status = tab.chat?.status;
-    panelPost(tab, { type: 'chatLive', html: tab.chat ? renderLive(tab.chat.live.pieces, !!status?.busy) : '' });
+    const chat = tab.chat ?? tab.ending;
+    const status = chat?.status;
+    panelPost(tab, { type: 'chatLive', html: chat ? renderLive(chat.live.pieces, !!status?.busy) : '' });
     panelPost(tab, chatStateMessage(status, tab.chatMode));
   }
 
-  private async endTabChat(tab: TranscriptTab): Promise<void> {
+  /** End chat: a running reply finishes (the tab shows it), then the process exits. Resolves once it has. */
+  private async endTabChat(tab: TranscriptTab, end?: (chat: ClaudeChat) => Promise<void>): Promise<void> {
     if (!tab.chat) {
       return;
     }
     clearTimeout(tab.liveTimer);
     tab.liveTimer = undefined;
-    await this.retire(tab);
+    const done = this.retire(tab, end);
     this.postChat(tab);
+    await done;
   }
 
   /**
-   * Takes the tab's chat off it and ends its process. Until the process has exited the chat stays in `closing`, so the
-   * session still counts as held and window close waits for it. Resolves once it has exited.
+   * Takes the tab's chat off it and ends its process, by default letting a running reply finish first (`end`). Until
+   * the process has exited the chat stays in `closing`, so the session still counts as held and window close waits for
+   * it; meanwhile the tab (if still open) keeps showing the finishing reply. Resolves once it has exited.
    */
-  private retire(tab: TranscriptTab, graceMs?: number): Promise<void> {
+  private retire(tab: TranscriptTab, end: (chat: ClaudeChat) => Promise<void> = (c) => c.end()): Promise<void> {
     const chat = tab.chat;
     if (!chat) {
       return Promise.resolve();
     }
     tab.chat = undefined;
+    tab.ending = chat;
     const key = sessionKey(tab.session);
-    const done = chat.dispose(graceMs).finally(() => {
+    const done = end(chat).finally(() => {
       this.closing.delete(chat);
       if (chat.lastActivity) {
         this.ownActivity.set(key, Math.max(this.ownActivity.get(key) ?? 0, chat.lastActivity));
+      }
+      if (tab.ending === chat) {
+        tab.ending = undefined;
+        this.postChat(tab);
       }
     });
     this.closing.set(chat, { key, done });
@@ -503,20 +514,47 @@ export class TranscriptPanels {
     );
   }
 
-  /** Ends every chat with the session, so it can be resumed elsewhere; resolves once every process has exited. */
-  async endChat(session: SessionInfo): Promise<void> {
+  /** Whether a chat with the session is in the middle of a reply: a tab's, or one ended and finishing its last turn. */
+  chatReplying(session: SessionInfo): boolean {
     const key = sessionKey(session);
-    await Promise.all(this.tabs().filter((t) => !t.run && sessionKey(t.session) === key).map((t) => this.endTabChat(t)));
+    return (
+      this.tabs().some((t) => !t.run && sessionKey(t.session) === key && !!t.chat?.replying) ||
+      [...this.closing].some(([chat, c]) => c.key === key && chat.replying)
+    );
+  }
+
+  /**
+   * Ends every chat with the session, so it can be resumed elsewhere; resolves once every process has exited. `stop`
+   * interrupts a running reply (also one already finishing); otherwise the reply finishes first.
+   */
+  async endChat(session: SessionInfo, stop = false): Promise<void> {
+    const key = sessionKey(session);
+    const end = stop ? (c: ClaudeChat) => c.stopNow() : undefined;
+    const ending = this.tabs()
+      .filter((t) => !t.run && sessionKey(t.session) === key)
+      .map((t) => this.endTabChat(t, end));
+    if (stop) {
+      for (const [chat, c] of this.closing) {
+        if (c.key === key) {
+          void chat.stopNow();
+        }
+      }
+    }
+    await Promise.all(ending);
     await this.closed(key);
   }
 
   /**
-   * Ends every chat process (the window is closing): stdin closed, killed if not gone within `graceMs`. Also waits for
-   * the chats already shutting down, from tabs closed or chats ended just before.
+   * Ends every chat process (the window is closing): a running reply gets `turnGraceMs` to finish and is then
+   * interrupted, and a process not gone `graceMs` after its stdin closed is killed. Also covers the chats already
+   * shutting down, from tabs closed or chats ended just before, and waits for all of them.
    */
-  dispose(graceMs = 1500): Promise<void> {
+  dispose(turnGraceMs = 1500, graceMs = 1500): Promise<void> {
+    for (const chat of [...this.closing.keys()]) {
+      void chat.dispose(turnGraceMs, graceMs);
+    }
     for (const t of this.tabs()) {
-      void this.retire(t, graceMs);
+      void this.retire(t, (c) => c.dispose(turnGraceMs, graceMs));
     }
     return Promise.all([...this.closing.values()].map((c) => c.done)).then(() => undefined);
   }
@@ -612,7 +650,8 @@ export class TranscriptPanels {
       return;
     }
     // What the log now records leaves the chat's pending part.
-    const forgot = !!tab.chat?.live.forget(logText);
+    const shownChat = tab.chat ?? tab.ending;
+    const forgot = !!shownChat?.live.forget(logText);
     tab.insights = insights;
     const showThinking = vscode.workspace.getConfiguration('claudeSessions').get<boolean>('showThinking', false);
     const webview = panel.webview;
@@ -628,8 +667,8 @@ export class TranscriptPanels {
         !run && isClaude(session)
           ? {
               mode: tab.chatMode,
-              live: tab.chat ? renderLive(tab.chat.live.pieces, tab.chat.status.busy) : '',
-              state: chatStateMessage(tab.chat?.status, tab.chatMode),
+              live: shownChat ? renderLive(shownChat.live.pieces, shownChat.status.busy) : '',
+              state: chatStateMessage(shownChat?.status, tab.chatMode),
             }
           : undefined,
       highlight: tab.highlight,

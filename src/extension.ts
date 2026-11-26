@@ -117,11 +117,45 @@ export function activate(context: vscode.ExtensionContext): void {
 
   /**
    * A session a transcript tab is chatting with has a writer already; resuming it elsewhere as well would fork its log
-   * (doc section 8). Asks to end the chat first. True when the session is free to resume.
+   * (doc section 8). Asks to end the chat first; while Claude is still replying there, offers to wait for the reply or
+   * to stop it now. True when the session is free to resume.
    */
   const freeFromChat = async (session: SessionInfo): Promise<boolean> => {
     if (!transcripts.chatHolds(session)) {
       return true;
+    }
+    if (transcripts.chatReplying(session)) {
+      const WAIT = 'Wait for the Reply';
+      const STOP = 'Stop It Now';
+      const choice = await vscode.window.showWarningMessage(
+        `Claude is still replying in the chat with "${session.title}". Resuming it somewhere else before the reply ends would put two Claude Code processes on one session, and they fork its log. Wait for the reply to finish, or stop it now (the reply ends where it is).`,
+        { modal: true },
+        WAIT,
+        STOP,
+      );
+      if (choice === STOP) {
+        await transcripts.endChat(session, true);
+        return true;
+      }
+      if (choice !== WAIT) {
+        return false;
+      }
+      const ending = transcripts.endChat(session);
+      // The reply may take a while: the action goes ahead once it has finished and the chat process has exited.
+      return vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: `Waiting for Claude to finish replying in "${session.title}"…`, cancellable: true },
+        (_progress, token) =>
+          new Promise<boolean>((resolve) => {
+            const sub = token.onCancellationRequested(() => {
+              sub.dispose();
+              resolve(false);
+            });
+            void ending.then(() => {
+              sub.dispose();
+              resolve(!token.isCancellationRequested);
+            });
+          }),
+      );
     }
     const choice = await vscode.window.showWarningMessage(
       `"${session.title}" is being chatted with in its transcript tab. Resuming it somewhere else at the same time would put two Claude Code processes on one session, and they fork its log.`,

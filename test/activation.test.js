@@ -58,6 +58,7 @@ function fakeVscode(state) {
     },
     ViewColumn: { Active: -1, Beside: -2 },
     TerminalLocation: { Panel: 1 },
+    ProgressLocation: { Notification: 15 },
     ConfigurationTarget: { Global: 1 },
     extensions: { getExtension: (id) => state.extensions?.[id], onDidChange: () => disposable },
     env: { clipboard: { writeText: async () => {} }, openExternal: async () => {} },
@@ -97,6 +98,19 @@ function fakeVscode(state) {
       showErrorMessage: (m) => state.errors.push(m),
       showWarningMessage: async () => undefined,
       showInformationMessage: async (m) => (state.infos?.push(m), undefined),
+      // A progress notification: kept in state.progress; state.cancelProgress cancels it as soon as it shows.
+      withProgress: (options, task) => {
+        const listeners = [];
+        const token = { isCancellationRequested: false, onCancellationRequested: (f) => (listeners.push(f), disposable) };
+        (state.progress ??= []).push(options);
+        if (state.cancelProgress) {
+          setTimeout(() => {
+            token.isCancellationRequested = true;
+            listeners.forEach((f) => f());
+          }, 0);
+        }
+        return task({ report() {} }, token);
+      },
       setStatusBarMessage() {},
       // Tests answer quick picks by setting state.pick to a function of the items and options.
       showQuickPick: async (items, options) => state.pick?.(items, options),
@@ -1623,6 +1637,183 @@ setInterval(() => {}, 1000);
     assert.match(warnings.pop(), held);
     assert.ok(alive(spawned[2]));
     await require(path.join(process.env.EXT_DIR || path.join(__dirname, '..'), 'dist', 'extension.js')).deactivate();
+    assert.ok(spawned.every((c) => !alive(c)), 'no chat process outlives the window');
+    assert.deepEqual(state.terminals, []);
+    assert.deepEqual(state.errors, []);
+  } finally {
+    cp.spawn = realSpawn;
+    for (const c of spawned) {
+      if (alive(c)) c.kill();
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Chat here: a chat ended mid-reply lets the reply finish; Resume can wait for it or stop it now, and window close interrupts after a grace period', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-sessions-chat-'));
+  const projectsDir = path.join(root, 'claude');
+  const repo = path.join(root, 'repo');
+  const ID = '8e8e8e8e-1111-4222-8333-944455556666';
+  const log = path.join(projectsDir, 'C--repo', `${ID}.jsonl`);
+  const release = path.join(root, 'release');
+  // A stand-in for claude.exe that records every stdin line, answers a "slow" message only once the test creates the
+  // release file (or on an interrupt, as a stopped turn), and on stdin EOF writes to the log and exits a moment later.
+  const standIn = path.join(root, 'stand-in.js');
+  fs.writeFileSync(
+    standIn,
+    `const fs = require('fs');
+const stdinLog = ${JSON.stringify(root)} + '/stdin-' + process.pid + '.log';
+const release = ${JSON.stringify(release)};
+let buf = '';
+let poll;
+const result = (extra) => process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'ok', duration_ms: 5, ...extra }) + '\\n');
+process.stdin.on('data', (d) => {
+  buf += d;
+  let i;
+  while ((i = buf.indexOf('\\n')) >= 0) {
+    const line = buf.slice(0, i);
+    buf = buf.slice(i + 1);
+    fs.appendFileSync(stdinLog, line + '\\n');
+    if (line.includes('"type":"user"')) {
+      if (!line.includes('slow')) {
+        result();
+        continue;
+      }
+      poll = setInterval(() => {
+        if (fs.existsSync(release)) {
+          fs.unlinkSync(release);
+          clearInterval(poll);
+          poll = undefined;
+          result();
+        }
+      }, 20);
+    } else if (line.includes('"subtype":"interrupt"') && poll) {
+      clearInterval(poll);
+      poll = undefined;
+      result({ subtype: 'error_during_execution', is_error: true, terminal_reason: 'aborted_streaming' });
+    }
+  }
+});
+process.stdin.on('end', () => {
+  fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ type: 'system', subtype: 'stand-in', uuid: 's-' + process.pid }) + '\\n');
+  setTimeout(() => process.exit(0), 200);
+});
+setInterval(() => {}, 1000);
+`,
+  );
+  const cp = require('child_process');
+  const realSpawn = cp.spawn;
+  const spawned = [];
+  cp.spawn = (exe, args, opts) => {
+    if (exe !== process.execPath || !args.includes('--input-format')) {
+      return realSpawn(exe, args, opts);
+    }
+    const child = realSpawn(process.execPath, [standIn], opts);
+    spawned.push(child);
+    return child;
+  };
+  const alive = (child) => child.exitCode === null && child.signalCode === null;
+  const stdinOf = (child) => {
+    const file = path.join(root, `stdin-${child.pid}.log`);
+    return fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+  };
+  const interrupted = (child) => /"subtype":"interrupt"/.test(stdinOf(child));
+  try {
+    fs.mkdirSync(repo);
+    writeSession(path.dirname(log), ID, [
+      { type: 'user', message: { content: 'Start the finish test' }, cwd: repo, uuid: 'f-1', timestamp: new Date().toISOString() },
+      { type: 'assistant', message: { id: 'm1', content: [{ type: 'text', text: 'Ready.' }] }, uuid: 'f-2', timestamp: new Date().toISOString() },
+    ]);
+    const old = new Date(Date.now() - 60_000);
+    fs.utimesSync(log, old, old);
+    const state = {
+      projectsDir,
+      config: { copilotDir: path.join(root, 'none'), vscodeUserDir: path.join(root, 'none'), claudeCommand: process.execPath },
+      providers: {},
+      commands: {},
+      panels: [],
+      panelPosts: [],
+      errors: [],
+      terminals: [],
+      infos: [],
+      extensions: { 'anthropic.claude-code': { extensionUri: { fsPath: root } } },
+    };
+    const { vscode } = await activateWithSidebar(state);
+    const warnings = [];
+    let answer;
+    vscode.window.showWarningMessage = async (m, ...rest) => (warnings.push({ m, buttons: rest.filter((x) => typeof x === 'string') }), answer);
+    const opened = [];
+    state.commands['claude-vscode.editor.open'] = (...a) => opened.push(a);
+    const session = { sessionKey: `claude:${ID}` };
+    const posted = (type) => state.panelPosts.filter((m) => m.type === type);
+    const openChat = async (text) => {
+      await state.commands['claudeSessions.openTranscript'](session);
+      const panel = state.panels.at(-1);
+      state.panelPosts.length = 0;
+      await panel.onMessage({ command: 'chatSend', text });
+      assert.ok(posted('sent').length, `sent: ${text}`);
+      await waitFor(() => spawned.length && stdinOf(spawned.at(-1)).includes(text), `the stand-in to get "${text}"`);
+      return { panel, child: spawned.at(-1) };
+    };
+    const replying = /Claude is still replying in the chat.*fork its log/;
+    // The session's folder is open in this window, so Open in Claude Code asks nothing else.
+    vscode.workspace.workspaceFolders = [{ uri: { fsPath: repo, scheme: 'file' } }];
+
+    // 1. Closing the tab mid-reply: no interrupt, the process keeps going, and the session stays held.
+    let { child } = await openChat('slow one');
+    state.panels.at(-1).dispose();
+    await new Promise((r) => setTimeout(r, 100));
+    assert.ok(alive(child), 'the reply carries on after the tab closed');
+    assert.ok(!interrupted(child), 'no interrupt line on stdin');
+    // Cancel: nothing happens.
+    assert.equal(await state.commands['claudeSessions.resume'](session), false);
+    const asked = warnings.pop();
+    assert.match(asked.m, replying);
+    assert.deepEqual(asked.buttons, ['Wait for the Reply', 'Stop It Now']);
+    assert.ok(alive(child) && !interrupted(child));
+    // Wait, then cancel the wait: nothing opens, and the reply still finishes.
+    answer = 'Wait for the Reply';
+    state.cancelProgress = true;
+    assert.equal(await state.commands['claudeSessions.resume'](session), false);
+    state.cancelProgress = false;
+    assert.deepEqual(state.terminals, []);
+    assert.ok(alive(child) && !interrupted(child));
+    // Wait: the action goes ahead only once the reply is in and the process has exited.
+    let done = false;
+    const waiting = state.commands['claudeSessions.openInClaudeCode'](session).then((r) => ((done = true), r));
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(done, false, 'waits for the reply');
+    assert.match(state.progress.at(-1).title, /Waiting for Claude to finish replying/);
+    assert.equal(state.progress.at(-1).cancellable, true);
+    fs.writeFileSync(release, '');
+    assert.equal(await waiting, true);
+    assert.ok(!alive(child), 'exited before the session opened elsewhere');
+    assert.ok(!interrupted(child), 'the reply was never interrupted');
+    assert.equal(opened.length, 1);
+
+    // 2. End chat mid-reply, with the tab open: the reply finishes there. Stop It Now interrupts it.
+    ({ child } = await openChat('slow two'));
+    const panel = state.panels.at(-1);
+    state.panelPosts.length = 0;
+    const ending = panel.onMessage({ command: 'chatEnd' });
+    await waitFor(() => posted('chatState').at(-1)?.finishing === true, 'the chat bar to show the reply finishing');
+    assert.ok(!interrupted(child));
+    answer = 'Stop It Now';
+    assert.equal(await state.commands['claudeSessions.openInClaudeCode'](session), true);
+    assert.match(warnings.pop().m, replying);
+    assert.ok(interrupted(child), 'stopped with the interrupt');
+    assert.ok(!alive(child), 'exited before the session opened elsewhere');
+    assert.equal(opened.length, 2);
+    await ending;
+    assert.equal(posted('chatState').at(-1)?.finishing, false);
+    answer = undefined;
+
+    // 3. Window close mid-reply: the reply gets a grace period, then the interrupt; nothing outlives the window.
+    ({ child } = await openChat('slow three'));
+    const started = Date.now();
+    await require(path.join(process.env.EXT_DIR || path.join(__dirname, '..'), 'dist', 'extension.js')).deactivate();
+    assert.ok(Date.now() - started >= 1000, 'the running turn was given its grace period');
+    assert.ok(interrupted(child), 'then interrupted');
     assert.ok(spawned.every((c) => !alive(c)), 'no chat process outlives the window');
     assert.deepEqual(state.terminals, []);
     assert.deepEqual(state.errors, []);

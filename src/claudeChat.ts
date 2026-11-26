@@ -549,6 +549,8 @@ export interface ChatStatus {
   /** Messages waiting for the running turn to end. */
   queued: number;
   mode: PermissionMode;
+  /** The chat was ended during a turn: the reply finishes, then the process exits. */
+  finishing?: boolean;
   /** The last finished turn. */
   lastTurn?: { cost?: number; durationMs?: number; error?: boolean; interrupted?: boolean };
 }
@@ -557,12 +559,17 @@ export interface ChatStatus {
 const CLOSE_GRACE_MS = 3000;
 /** How long to wait for the exit after a kill before giving up on hearing it. */
 const KILL_WAIT_MS = 1000;
+/** Window close: how long a running turn may carry on before it is interrupted. */
+const TURN_GRACE_MS = 1500;
 
 /**
  * One chat: a `claude` process kept between turns, the messages waiting for it, and what the tab shows meanwhile.
  * Messages go one turn at a time; one typed during a turn waits here (shown as queued) until the turn's `result`, so a
  * mode change can restart the process between turns. Stop sends the interrupt control request and never kills; the
  * process is killed only when it will not exit after its stdin closes.
+ *
+ * Ending the chat during a turn lets the turn finish: stdin stays open until its `result` (so tool requests are still
+ * answered and Stop can still interrupt it), then closes, and the process exits.
  */
 export class ClaudeChat {
   readonly live = new LiveChat();
@@ -571,6 +578,10 @@ export class ClaudeChat {
   private busy = false;
   private restartAfterTurn = false;
   private closing?: Promise<void>;
+  /** Closes stdin and arms the kill timer; waiting for the running turn's result while it is set. */
+  private letGo?: () => void;
+  /** How long the process gets to exit after its stdin closes. */
+  private graceMs = CLOSE_GRACE_MS;
   private disposed = false;
   private stdout = '';
   private stderrTail: string[] = [];
@@ -588,7 +599,19 @@ export class ClaudeChat {
   }
 
   get status(): ChatStatus {
-    return { running: !!this.child && !this.closing, busy: this.busy, queued: this.queue.length, mode: this.mode, lastTurn: this.lastTurn };
+    return {
+      running: !!this.child && !this.closing,
+      busy: this.busy,
+      queued: this.queue.length,
+      mode: this.mode,
+      finishing: (this.disposed && this.busy && !!this.child) || undefined,
+      lastTurn: this.lastTurn,
+    };
+  }
+
+  /** A turn is running (including one finishing after the chat was ended). */
+  get replying(): boolean {
+    return this.busy && !!this.child;
   }
 
   /** A process is up or a turn is pending: the session has a writer. */
@@ -636,12 +659,48 @@ export class ClaudeChat {
     this.opts.onChange();
   }
 
-  /** Ends the process: stdin closed (any running turn interrupted first), then killed if it does not exit. */
-  dispose(graceMs = CLOSE_GRACE_MS): Promise<void> {
-    this.disposed = true;
-    this.queue = [];
-    this.live.dropQueued();
-    return this.close(graceMs);
+  /**
+   * Ends the chat and lets a running turn finish: no more turns start, messages still waiting go back to the message
+   * box, and once the turn's `result` is in, stdin closes and the process exits (killed if it will not). Resolves once
+   * it has exited.
+   */
+  end(graceMs = CLOSE_GRACE_MS): Promise<void> {
+    this.graceMs = Math.min(this.graceMs, graceMs);
+    if (!this.disposed) {
+      this.disposed = true;
+      const unsent = this.queue.splice(0);
+      this.live.dropQueued();
+      if (unsent.length) {
+        this.opts.onUnsent(unsent);
+      }
+    }
+    return this.close(true);
+  }
+
+  /** Ends the chat now: a running turn is interrupted and stdin closes at once. Resolves once the process has exited. */
+  stopNow(graceMs = CLOSE_GRACE_MS): Promise<void> {
+    const done = this.end(graceMs);
+    if (this.busy && this.child && !this.live.interrupting) {
+      this.live.interrupting = true;
+      this.write(interruptLine(`interrupt-${++this.requestSeq}`));
+    }
+    this.letGo?.();
+    return done;
+  }
+
+  /**
+   * The window is closing: a running turn gets `turnGraceMs` to finish and is then interrupted, and the process is
+   * killed if it has not exited `graceMs` after its stdin closed. Never waits longer than that.
+   */
+  dispose(turnGraceMs = TURN_GRACE_MS, graceMs = CLOSE_GRACE_MS): Promise<void> {
+    const done = this.end(graceMs);
+    if (turnGraceMs <= 0) {
+      void this.stopNow(graceMs);
+    } else if (this.letGo) {
+      const timer = setTimeout(() => void this.stopNow(graceMs), turnGraceMs);
+      void done.then(() => clearTimeout(timer));
+    }
+    return done;
   }
 
   private async pump(): Promise<void> {
@@ -790,6 +849,8 @@ export class ClaudeChat {
     this.busy = false;
     this.inFlight = undefined;
     this.lastTurn = { cost: end.cost, durationMs: end.durationMs, error: end.isError || undefined, interrupted: end.interrupted || undefined };
+    // An ended chat's last turn is in: now its stdin closes.
+    this.letGo?.();
     if (this.restartAfterTurn) {
       this.restartAfterTurn = false;
       void this.close();
@@ -805,7 +866,11 @@ export class ClaudeChat {
     }
   }
 
-  private close(graceMs = CLOSE_GRACE_MS): Promise<void> {
+  /**
+   * Ends the process: stdin closed, then killed if it does not exit within the grace period. With a turn running,
+   * `finishTurn` keeps stdin open until the turn's result (letting it finish); otherwise the turn is interrupted first.
+   */
+  private close(finishTurn = false): Promise<void> {
     const child = this.child;
     if (!child) {
       return Promise.resolve();
@@ -813,38 +878,47 @@ export class ClaudeChat {
     if (this.closing) {
       return this.closing;
     }
-    if (this.busy) {
+    if (this.busy && !finishTurn) {
       // Closing stdin alone lets the running turn finish (doc section 4), so it is interrupted first.
       this.live.interrupting = true;
       this.write(interruptLine(`interrupt-${++this.requestSeq}`));
     }
     this.closing = new Promise<void>((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
       let fallback: ReturnType<typeof setTimeout> | undefined;
-      const timer = setTimeout(() => {
-        this.opts.log('Did not exit after stdin closed; killing it.');
-        try {
-          child.kill();
-        } catch {
-          // Already gone.
-        }
-        // A kill whose exit is never reported must not hold up whoever waits for this (window close above all).
-        fallback = setTimeout(() => {
-          this.opts.log('No exit reported after the kill; no longer waiting for it.');
-          resolve();
-        }, KILL_WAIT_MS);
-      }, graceMs);
       child.on('exit', () => {
+        this.letGo = undefined;
         clearTimeout(timer);
         clearTimeout(fallback);
         resolve();
       });
-      try {
-        child.stdin?.end();
-      } catch {
-        // Already closed.
+      this.letGo = () => {
+        this.letGo = undefined;
+        timer = setTimeout(() => {
+          this.opts.log('Did not exit after stdin closed; killing it.');
+          try {
+            child.kill();
+          } catch {
+            // Already gone.
+          }
+          // A kill whose exit is never reported must not hold up whoever waits for this (window close above all).
+          fallback = setTimeout(() => {
+            this.opts.log('No exit reported after the kill; no longer waiting for it.');
+            resolve();
+          }, KILL_WAIT_MS);
+        }, this.graceMs);
+        try {
+          child.stdin?.end();
+        } catch {
+          // Already closed.
+        }
+      };
+      if (!(this.busy && finishTurn)) {
+        this.letGo();
       }
     }).then(() => {
       this.closing = undefined;
+      this.letGo = undefined;
       this.busy = false;
       this.opts.onChange();
     });

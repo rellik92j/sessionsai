@@ -92,6 +92,7 @@ export function chatStateMessage(status: ChatStatus | undefined, mode: Permissio
     running: !!status?.running,
     busy: !!status?.busy,
     queued: status?.queued ?? 0,
+    finishing: !!status?.finishing,
     mode: status?.mode ?? mode,
     last,
   };

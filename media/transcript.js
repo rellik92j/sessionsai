@@ -141,14 +141,16 @@
       const s = chatStatus || {};
       chatBar.hidden = !(target === 'here' || s.running || s.busy);
       if (chatMode.value !== s.mode) chatMode.value = s.mode;
-      chatState.textContent = s.busy
+      chatState.textContent = s.finishing
+        ? 'Chat ended: Claude is finishing its reply, then it stops.'
+        : s.busy
         ? `Claude is working…${s.queued ? ` ${s.queued} queued.` : ''}`
         : s.running
           ? `Ready${s.last ? ` · ${s.last}` : ''}`
           : s.last || '';
       chatState.classList.toggle('busy', !!s.busy);
       chatStop.hidden = !s.busy;
-      chatEnd.hidden = !(s.running || s.busy);
+      chatEnd.hidden = !(s.running || s.busy) || !!s.finishing;
       sendBtn.querySelector('span').textContent = target === 'here' && s.busy ? 'Queue' : 'Send';
       sendBtn.title = target === 'here' && s.busy ? 'Queue this message: it goes when the running turn ends (Enter)' : 'Send (Enter). Shift+Enter adds a line.';
     }
