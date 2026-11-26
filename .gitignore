@@ -3,3 +3,5 @@ out/
 *.vsix
 dist/
 .claude/
+.vscode-test/
+.e2e-out/
