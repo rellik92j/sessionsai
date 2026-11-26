@@ -5,8 +5,9 @@ import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { ClaudeChat, isPermissionMode, PermissionMode, resolveClaudeExecutable } from './claudeChat';
-import { chatModes, chatStateMessage, renderLive } from './chatView';
+import { ChatChild, ClaudeChat, isPermissionMode, resolveClaudeExecutable, resolveExecutable, SessionChat } from './claudeChat';
+import { chatModes, chatSpeaker, chatStateMessage, renderLive } from './chatView';
+import { COPILOT_EXECUTABLE, CopilotChat, DEFAULT_COPILOT_MODE, isCopilotMode } from './copilotChat';
 import { escapeHtml, formatDateTime, formatTokens, formatUsd } from './format';
 import { collectInsights, editsAsDiff, FileTouch, SessionInsights, TodoStatus } from './insights';
 import { LiveProcess, LiveSessions, liveWarning, readRunningTasks, renderLiveNotice, RunningTask, settleWaitingFromDisk, tasksOf } from './liveSessions';
@@ -41,17 +42,17 @@ interface TranscriptTab {
   /** Watches a subagent run's own log, which the extension's session watcher does not cover. */
   watcher?: { file: string; disposable: vscode.Disposable };
   disposed?: boolean;
-  /** "Chat here": the Claude Code process this tab talks to, once the first message is sent. */
-  chat?: ClaudeChat;
+  /** "Chat here": the Claude Code or Copilot CLI chat this tab talks to, once the first message is sent. */
+  chat?: SessionChat;
   /** A chat ended during a turn, still shown here while its reply finishes and its process exits. */
-  ending?: ClaudeChat;
+  ending?: SessionChat;
   /**
    * Messages sent while a chat with the session was still ending: shown as waiting until its process has exited, then
    * sent to a new chat, in order.
    */
   waiting?: string[];
-  /** The permission mode the chat runs (or will run) in. */
-  chatMode: PermissionMode;
+  /** The permission mode the chat runs (or will run) in: a PermissionMode for Claude Code, a CopilotMode for Copilot CLI. */
+  chatMode: string;
   /** Streamed text arrives many times a second; the page is redrawn at most this often. */
   liveTimer?: NodeJS.Timeout;
   /** The background subagents and shells the log has no end for, as last read. */
@@ -84,8 +85,19 @@ const SESSION_ACTIONS = new Set([
   'chatPermission',
 ]);
 
-/** Where the message box can send: a tool, or "Chat here" in the transcript tab itself (Claude Code only). */
+/** Where the message box can send: a tool, or "Chat here" in the transcript tab itself (Claude Code and Copilot CLI). */
 export type ComposerTarget = ContinueTarget | 'here';
+
+/** Whether "Chat here" can run the session's own CLI: Claude Code and GitHub Copilot CLI sessions. */
+export const canChatHere = (session: SessionInfo): boolean => isClaude(session) || sourceOf(session) === 'copilot-cli';
+
+/** A mode the session's chat takes, or undefined when `mode` is not one. */
+function chatModeFor(session: SessionInfo, mode: unknown): string | undefined {
+  return sourceOf(session) === 'copilot-cli' ? (isCopilotMode(mode) ? mode : undefined) : isPermissionMode(mode) ? mode : undefined;
+}
+
+/** The mode a new chat starts in: "Ask me" for Claude Code; for Copilot CLI, which cannot ask, read only. */
+const defaultChatMode = (session: SessionInfo): string => (sourceOf(session) === 'copilot-cli' ? DEFAULT_COPILOT_MODE : 'ask');
 
 /** What the extension lends the transcript tabs for the chat. */
 export interface ChatHooks {
@@ -133,7 +145,7 @@ export class TranscriptPanels {
    * Chats let go of by End chat or a closed tab whose process has not exited yet, by session key. Until it has, the
    * session still has that writer: the guards count it, and window close waits for it.
    */
-  private readonly closing = new Map<ClaudeChat, { key: string; done: Promise<void> }>();
+  private readonly closing = new Map<SessionChat, { key: string; done: Promise<void> }>();
   /** When a session's own ended chats last heard from their process, by session key: their log writes are not another writer's. */
   private readonly ownActivity = new Map<string, number>();
 
@@ -223,6 +235,8 @@ export class TranscriptPanels {
     }
     if (tab) {
       tab.session = session;
+      // The preview tab may switch to a session of another tool, whose chat has other modes.
+      tab.chatMode = chatModeFor(session, tab.chatMode) ?? defaultChatMode(session);
       tab.run = run;
       tab.highlight = highlight;
       tab.panel.reveal();
@@ -253,7 +267,7 @@ export class TranscriptPanels {
       retainContextWhenHidden: true,
       localResourceRoots: [this.codiconsUri, this.mediaUri],
     });
-    const tab: TranscriptTab = { panel, session, highlight, preview, run, queue: Promise.resolve(), chatMode: 'ask' };
+    const tab: TranscriptTab = { panel, session, highlight, preview, run, queue: Promise.resolve(), chatMode: defaultChatMode(session) };
     if (preview) {
       this.preview = tab;
     } else {
@@ -346,13 +360,15 @@ export class TranscriptPanels {
         case 'chatStop':
           (tab.chat ?? tab.ending)?.interrupt();
           break;
-        case 'chatMode':
-          if (isPermissionMode(msg.mode)) {
-            tab.chatMode = msg.mode;
-            tab.chat?.setMode(msg.mode);
+        case 'chatMode': {
+          const mode = chatModeFor(tab.session, msg.mode);
+          if (mode) {
+            tab.chatMode = mode;
+            tab.chat?.setMode(mode);
             this.postChat(tab);
           }
           break;
+        }
         case 'chatEnd':
           await this.endTabChat(tab);
           break;
@@ -448,12 +464,10 @@ export class TranscriptPanels {
    */
   private async chatSend(tab: TranscriptTab, text: string, mode: unknown, accepted: () => void = () => undefined): Promise<boolean> {
     const session = tab.session;
-    if (tab.run || !isClaude(session)) {
+    if (tab.run || !canChatHere(session)) {
       return false;
     }
-    if (isPermissionMode(mode)) {
-      tab.chatMode = mode;
-    }
+    tab.chatMode = chatModeFor(session, mode) ?? tab.chatMode;
     if (tab.waiting) {
       // Already waiting for an ended chat: this one goes after the others, with the new chat.
       tab.waiting.push(text);
@@ -490,16 +504,18 @@ export class TranscriptPanels {
       return false;
     }
     if (!tab.chat) {
-      tab.chat = new ClaudeChat({
+      const common = {
         sessionId: session.id,
-        mode: tab.chatMode,
-        launch: () => chatLaunch(tab.session),
-        spawn: spawnChat,
         onChange: () => this.scheduleLive(tab),
         // After the page has heard "sent" (which empties the box) for the message that started this.
-        onUnsent: (texts) => setTimeout(() => panelPost(tab, { type: 'chatRestore', text: texts.join('\n\n') }), 0),
-        log: (line) => logChat(`${session.id.slice(0, 8)} ${line}`),
-      });
+        onUnsent: (texts: string[]) => setTimeout(() => panelPost(tab, { type: 'chatRestore', text: texts.join('\n\n') }), 0),
+        log: (line: string) => logChat(`${session.id.slice(0, 8)} ${line}`),
+      };
+      const mode = tab.chatMode;
+      tab.chat =
+        sourceOf(session) === 'copilot-cli'
+          ? new CopilotChat({ ...common, mode: isCopilotMode(mode) ? mode : DEFAULT_COPILOT_MODE, launch: () => copilotLaunch(tab.session), spawn: spawnCopilot })
+          : new ClaudeChat({ ...common, mode: isPermissionMode(mode) ? mode : 'ask', launch: () => chatLaunch(tab.session), spawn: spawnChat });
     }
     tab.chat.setMode(tab.chatMode);
     this.hooks.rememberTarget?.(sourceOf(session), 'here');
@@ -516,10 +532,11 @@ export class TranscriptPanels {
 
   private async mayStartChat(tab: TranscriptTab): Promise<boolean> {
     const session = tab.session;
+    const tool = SOURCES[sourceOf(session)].label;
     const terminal = this.hooks.terminalFor?.(session);
     if (terminal) {
       const choice = await vscode.window.showWarningMessage(
-        'This session is open in a terminal. Chatting here as well would put two Claude Code processes on one session, and they fork its log. Send your message in that terminal, or close it first.',
+        `This session is open in a terminal. Chatting here as well would put two ${tool} processes on one session, and they fork its log. Send your message in that terminal, or close it first.`,
         'Show Terminal',
       );
       if (choice === 'Show Terminal') {
@@ -545,7 +562,7 @@ export class TranscriptPanels {
     const ownWrite = Math.max(tab.chat?.lastActivity ?? 0, this.ownActivity.get(sessionKey(session)) ?? 0) + 3000;
     if (Date.now() - mtime < RECENT_WRITE_MS && mtime > ownWrite) {
       const choice = await vscode.window.showWarningMessage(
-        `This session's log was written ${Math.max(1, Math.round((Date.now() - mtime) / 1000))}s ago, so it may be open somewhere else (a terminal or the Claude Code chat). Two Claude Code processes on one session fork its log.`,
+        `This session's log was written ${Math.max(1, Math.round((Date.now() - mtime) / 1000))}s ago, so it may be open somewhere else (${isClaude(session) ? 'a terminal or the Claude Code chat' : 'a terminal'}). Two ${tool} processes on one session fork its log.`,
         { modal: true },
         'Chat Anyway',
       );
@@ -573,12 +590,12 @@ export class TranscriptPanels {
     const chat = tab.chat ?? tab.ending;
     const status = chat?.status;
     const waiting = tab.waiting ?? [];
-    panelPost(tab, { type: 'chatLive', html: chat || waiting.length ? renderLive(chat?.live.pieces ?? [], !!status?.busy, waiting) : '' });
+    panelPost(tab, { type: 'chatLive', html: chat || waiting.length ? renderLive(chat?.live.pieces ?? [], !!status?.busy, waiting, chatSpeaker(sourceOf(tab.session))) : '' });
     panelPost(tab, chatStateMessage(status, tab.chatMode, waiting.length));
   }
 
   /** End chat: a running reply finishes (the tab shows it), then the process exits. Resolves once it has. */
-  private async endTabChat(tab: TranscriptTab, end?: (chat: ClaudeChat) => Promise<void>): Promise<void> {
+  private async endTabChat(tab: TranscriptTab, end?: (chat: SessionChat) => Promise<void>): Promise<void> {
     if (!tab.chat) {
       return;
     }
@@ -594,7 +611,7 @@ export class TranscriptPanels {
    * the process has exited the chat stays in `closing`, so the session still counts as held and window close waits for
    * it; meanwhile the tab (if still open) keeps showing the finishing reply. Resolves once it has exited.
    */
-  private retire(tab: TranscriptTab, end: (chat: ClaudeChat) => Promise<void> = (c) => c.end()): Promise<void> {
+  private retire(tab: TranscriptTab, end: (chat: SessionChat) => Promise<void> = (c) => c.end()): Promise<void> {
     const chat = tab.chat;
     if (!chat) {
       return Promise.resolve();
@@ -645,7 +662,7 @@ export class TranscriptPanels {
    */
   async endChat(session: SessionInfo, stop = false): Promise<void> {
     const key = sessionKey(session);
-    const end = stop ? (c: ClaudeChat) => c.stopNow() : undefined;
+    const end = stop ? (c: SessionChat) => c.stopNow() : undefined;
     const tabs = this.tabs().filter((t) => !t.run && sessionKey(t.session) === key);
     for (const t of tabs) {
       // A message waiting to start a new chat would take the session straight back: it returns to the box instead.
@@ -790,12 +807,12 @@ export class TranscriptPanels {
       composerTarget: this.composerTarget(sourceOf(session)),
       // A rebuilt page starts with the chat as it stands, since a message posted while it loads can be lost.
       chat:
-        !run && isClaude(session)
+        !run && canChatHere(session)
           ? {
               mode: tab.chatMode,
               live:
                 shownChat || tab.waiting?.length
-                  ? renderLive(shownChat?.live.pieces ?? [], !!shownChat?.status.busy, tab.waiting)
+                  ? renderLive(shownChat?.live.pieces ?? [], !!shownChat?.status.busy, tab.waiting, chatSpeaker(sourceOf(session)))
                   : '',
               state: chatStateMessage(shownChat?.status, tab.chatMode, tab.waiting?.length),
             }
@@ -898,13 +915,72 @@ function chatLaunch(session: SessionInfo): { exe: string; cwd?: string } | { err
     return { exe: standIn, cwd };
   }
   const command = vscode.workspace.getConfiguration('claudeSessions').get<string>('claudeCommand', 'claude') || 'claude';
-  const found = resolveClaudeExecutable(command, {
+  const found = resolveClaudeExecutable(command, resolveEnv());
+  return 'error' in found ? found : { exe: found.exe, cwd };
+}
+
+function resolveEnv() {
+  return {
     platform: process.platform,
     pathEnv: process.env.PATH ?? process.env.Path ?? '',
     home: os.homedir(),
-    isFile: (p) => !!statSync(p, { throwIfNoEntry: false })?.isFile(),
-  });
-  return 'error' in found ? found : { exe: found.exe, cwd };
+    isFile: (p: string) => !!statSync(p, { throwIfNoEntry: false })?.isFile(),
+  };
+}
+
+/** End-to-end tests only, as STAND_IN_ENV: the path of a Node script that stands in for copilot in the chat. */
+const COPILOT_STAND_IN_ENV = 'SESSIONSAI_E2E_COPILOT';
+
+/**
+ * Starts one Copilot CLI turn: copilot.exe without a shell, or an npm .cmd shim through cmd.exe (its arguments are
+ * fixed flags and the session id; the message goes on stdin). Stop kills the whole process tree, so a shim's copilot
+ * and the commands it runs go with it.
+ */
+function spawnCopilot(exe: string, args: string[], cwd: string | undefined, shell: boolean): ChatChild {
+  const standIn = process.env[COPILOT_STAND_IN_ENV];
+  const child =
+    standIn && exe === standIn
+      ? spawn(process.execPath, [standIn, ...args], { cwd, shell: false, windowsHide: true, stdio: 'pipe', env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } })
+      : spawn(shell ? `"${exe}"` : exe, args, { cwd, shell, windowsHide: true, stdio: 'pipe' });
+  const kill = () => {
+    if (process.platform === 'win32' && child.pid) {
+      execFile('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true }, (err) => {
+        if (err) {
+          child.kill();
+        }
+      });
+    } else {
+      child.kill();
+    }
+  };
+  return {
+    stdin: child.stdin,
+    stdout: child.stdout,
+    stderr: child.stderr,
+    get pid() {
+      return child.pid;
+    },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    on: (event: string, f: (...a: any[]) => void) => child.on(event, f),
+    kill,
+  } as ChatChild;
+}
+
+/** Where a Copilot CLI turn starts: copilot (an executable, or a .cmd shim) in the session's own folder, or why not. */
+function copilotLaunch(session: SessionInfo): { exe: string; cwd?: string; shell?: boolean } | { error: string } {
+  const cwd = projectPath(session);
+  if (!cwd || !existsSync(cwd)) {
+    return {
+      error: `The session's folder no longer exists (${cwd || 'unknown'}). Copilot CLI would run in another folder, with access to other files, so Chat here does not start it.`,
+    };
+  }
+  const standIn = process.env[COPILOT_STAND_IN_ENV];
+  if (standIn) {
+    return { exe: standIn, cwd };
+  }
+  const command = vscode.workspace.getConfiguration('claudeSessions').get<string>('copilotCommand', 'copilot') || 'copilot';
+  const found = resolveExecutable(command, resolveEnv(), COPILOT_EXECUTABLE);
+  return 'error' in found ? found : { exe: found.exe, cwd, shell: found.shell };
 }
 
 /** The message that brings an open page from `blocks` to `parts` in place (see transcript.js). */
@@ -1075,7 +1151,7 @@ interface HtmlOptions {
    * Offer "Chat here" (a Claude Code session's own tab): the permission mode, and the chat's pending part and state
    * as they stand.
    */
-  chat?: { mode: PermissionMode; live: string; state: ReturnType<typeof chatStateMessage> };
+  chat?: { mode: string; live: string; state: ReturnType<typeof chatStateMessage> };
   /** The notice above the message box that the session is live in another process (renderLiveNotice); empty for none. */
   liveNotice?: string;
   /** What the session did, for the side panel; collected from `entries` when omitted. */
@@ -1402,8 +1478,8 @@ function composerData(session: SessionInfo, o: HtmlOptions) {
   const tools = [own, ...all.filter((t) => t !== own)].filter((t) => t !== 'claude-chat' || o.hasClaudeCode);
   const targets: ComposerTarget[] = o.chat ? ['here', ...tools] : tools;
   const fill = session.usage?.context ? session.usage.context.tokens / session.usage.context.limit : 0;
-  // "Chat here" is the default for a Claude Code session. A remembered "claude" (the CLI in a terminal) predates it,
-  // when it was the only way to send to the session, so it counts as no choice.
+  // "Chat here" is the default for a Claude Code or Copilot CLI session. A remembered "claude" or "copilot-cli" (the CLI
+  // in a terminal) predates it, when it was the only way to send to the session, so it counts as no choice.
   const remembered = o.chat && o.composerTarget === own ? undefined : o.composerTarget;
   return {
     target: remembered && targets.includes(remembered) ? remembered : targets[0],
@@ -1413,7 +1489,15 @@ function composerData(session: SessionInfo, o: HtmlOptions) {
       same: id === 'here' || canResumeIn(own, id),
       cli: id !== 'claude-chat' && id !== 'vscode-chat' && id !== 'here',
     })),
-    chat: o.chat && { mode: o.chat.mode, modes: chatModes(), live: o.chat.live, state: o.chat.state },
+    chat: o.chat && {
+      mode: o.chat.mode,
+      modes: chatModes(own),
+      live: o.chat.live,
+      state: o.chat.state,
+      // Who works in the background, and who replies, for the message box's and the chat bar's wording.
+      tool: SOURCES[own].label,
+      assistant: chatSpeaker(own).name,
+    },
     context: fill >= CONTEXT_WARN ? Math.round(fill * 100) : 0,
     // When the prompt cache lapses (ms since epoch); 0 when unknown, as for sources without usage.
     cacheExpires: session.usage?.cache ? session.usage.cache.lastRequest + session.usage.cache.ttlMs : 0,
@@ -1426,12 +1510,17 @@ function composerData(session: SessionInfo, o: HtmlOptions) {
 function renderComposer(session: SessionInfo, o: HtmlOptions): string {
   const data = composerData(session, o);
   // "Chat here" only: the permission mode, what the chat is doing, Stop while a turn runs, and a way to end the chat.
+  const copilot = sourceOf(session) === 'copilot-cli';
+  const tool = SOURCES[sourceOf(session)].label;
+  const modeTitle = copilot
+    ? 'What Copilot may do in this chat. Copilot CLI cannot ask for approval here, so this grants tools up front; a change applies from the next message.'
+    : 'Permission mode for Claude Code in this chat. Changing it restarts Claude Code between turns.';
   const chatBar = o.chat
     ? `<div class="chat-bar" id="chat-bar" hidden>
-    <label class="chat-mode" title="Permission mode for Claude Code in this chat. Changing it restarts Claude Code between turns."><i class="codicon codicon-shield"></i><select id="chat-mode" aria-label="Permission mode"></select></label>
+    <label class="chat-mode" title="${modeTitle}"><i class="codicon codicon-shield"></i><select id="chat-mode" aria-label="${copilot ? 'Tool permissions' : 'Permission mode'}"></select></label>
     <span class="chat-state" id="chat-state" aria-live="polite"></span>
-    <button class="btn" id="chat-stop" title="Stop the running turn" hidden><i class="codicon codicon-debug-stop"></i><span>Stop</span></button>
-    <button class="btn" id="chat-end" title="End the chat: closes the Claude Code process behind it" hidden><i class="codicon codicon-close"></i><span>End chat</span></button>
+    <button class="btn" id="chat-stop" title="${copilot ? 'Stop the running turn: ends its Copilot CLI process' : 'Stop the running turn'}" hidden><i class="codicon codicon-debug-stop"></i><span>Stop</span></button>
+    <button class="btn" id="chat-end" title="End the chat: closes the ${tool} process behind it" hidden><i class="codicon codicon-close"></i><span>End chat</span></button>
   </div>`
     : '';
   const notice = o.liveNotice ?? '';

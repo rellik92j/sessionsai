@@ -67,7 +67,7 @@ let n = 0;
 const planned = [];
 for (const area of allAreas) {
   const fixtures = {};
-  const fixtureSessions = (area.sessions ?? []).map((f) => ({ key: f.key, id: sessionIdFor(++n), prompt: f.prompt }));
+  const fixtureSessions = (area.sessions ?? []).map((f) => ({ key: f.key, id: sessionIdFor(++n), prompt: f.prompt, source: f.source }));
   for (const f of fixtureSessions) fixtures[f.key] = { id: f.id, title: f.prompt };
   const scenarios = area.scenarios.map((sc) => ({ ...sc, area: area.name, id: sessionIdFor(++n), title: sc.prompt, fixtures }));
   planned.push({ area, fixtureSessions, scenarios });
@@ -88,7 +88,7 @@ resetOut();
 const sandboxSessions = [
   ...chosenAreas.filter((p) => chosen.some((sc) => sc.area === p.area.name)).flatMap((p) => p.fixtureSessions),
   ...chosen,
-].map((x) => ({ id: x.id, prompt: x.prompt, log: x.log, files: x.files }));
+].map((x) => ({ id: x.id, prompt: x.prompt, log: x.log, files: x.files, source: x.source }));
 const s = makeSandbox(sandboxSessions);
 console.log(`Sandbox: ${s.dir}`);
 

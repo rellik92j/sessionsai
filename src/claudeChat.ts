@@ -125,31 +125,59 @@ export interface ResolveEnv {
   isFile: (p: string) => boolean;
 }
 
+/** Which CLI to find, and what to say when it is not there. */
+export interface ExecutableSpec {
+  /** The default command, and the executable's base name: `claude`, `copilot`. */
+  base: string;
+  /** The tool's name in messages. */
+  tool: string;
+  /** The setting that names the command. */
+  setting: string;
+  /** Where the tool's installer puts it, when the PATH may lack it; `~` is the home folder. */
+  extraDirs: string[];
+  /**
+   * What to do with a Windows `.cmd` or `.bat` shim: refuse it, or run it through cmd.exe. Only a tool whose arguments
+   * carry nothing cmd.exe could rewrite may take `shell` (Copilot CLI's chat sends the message on stdin).
+   */
+  shims: 'refuse' | 'shell';
+}
+
+export const CLAUDE_EXECUTABLE: ExecutableSpec = {
+  base: 'claude',
+  tool: 'Claude Code',
+  setting: 'claudeSessions.claudeCommand',
+  extraDirs: ['~/.local/bin'],
+  shims: 'refuse',
+};
+
 /**
- * The Claude Code executable for the chat, which is spawned without a shell (doc section 8): the claudeCommand setting
- * when it is a path to an executable, else `claude` (`claude.exe` on Windows) on the PATH or in ~/.local/bin, where the
- * native installer puts it. An npm `.cmd` shim is refused rather than run through cmd.exe, which rewrites arguments
- * and, when killed, leaves Claude running.
+ * The CLI executable for the chat, which is spawned without a shell (doc section 8): the command setting when it is a
+ * path to an executable, else the base name (`.exe` on Windows) on the PATH or in the installer's folder. A `.cmd` or
+ * `.bat` shim is refused rather than run through cmd.exe, which rewrites arguments and, when killed, leaves the CLI
+ * running; unless the spec takes shims (`shell: true` in the result), for a CLI whose arguments are safe there.
  */
-export function resolveClaudeExecutable(command: string, env: ResolveEnv): { exe: string } | { error: string } {
+export function resolveExecutable(command: string, env: ResolveEnv, spec: ExecutableSpec): { exe: string; shell?: boolean } | { error: string } {
   const win = env.platform === 'win32';
   const sep = win ? ';' : ':';
-  const cmd = command.trim() || 'claude';
+  const cmd = command.trim() || spec.base;
   const shim = /\.(cmd|bat|ps1)$/i;
-  const shimError = (p: string) => ({
-    error: `Chat here runs Claude Code without a shell, and ${p} is a script shim. Set claudeSessions.claudeCommand to the path of claude${win ? '.exe' : ''} (the native installer puts it in ~/.local/bin).`,
-  });
+  const exeName = `${spec.base}${win ? '.exe' : ''}`;
+  const where = spec.extraDirs.length ? ` (its installer puts it in ${spec.extraDirs.join(' or ')})` : '';
+  const shimResult = (p: string) =>
+    spec.shims === 'shell' && /\.(cmd|bat)$/i.test(p)
+      ? { exe: p, shell: true }
+      : { error: `Chat here runs ${spec.tool} without a shell, and ${p} is a script shim. Set ${spec.setting} to the path of ${exeName}${where}.` };
   if (env.isFile(cmd)) {
-    return win && shim.test(cmd) ? shimError(cmd) : { exe: cmd };
+    return win && shim.test(cmd) ? shimResult(cmd) : { exe: cmd };
   }
   if (/\s/.test(cmd) || /[\\/]/.test(cmd)) {
     return {
-      error: `Chat here needs the Claude Code executable itself, but claudeSessions.claudeCommand is "${cmd}". Set it to the path of claude${win ? '.exe' : ''}, or to "claude".`,
+      error: `Chat here needs the ${spec.tool} executable itself, but ${spec.setting} is "${cmd}". Set it to the path of ${exeName}, or to "${spec.base}".`,
     };
   }
   const names = win ? (/\.exe$/i.test(cmd) ? [cmd] : [`${cmd}.exe`]) : [cmd];
   const dirs = env.pathEnv.split(sep).map((d) => d.trim().replace(/^"(.*)"$/, '$1')).filter(Boolean);
-  dirs.push(path.join(env.home, '.local', 'bin'));
+  dirs.push(...spec.extraDirs.map((d) => d.replace(/^~(?=$|[\\/])/, env.home)));
   let shimFound: string | undefined;
   for (const dir of dirs) {
     for (const name of names) {
@@ -163,11 +191,17 @@ export function resolveClaudeExecutable(command: string, env: ResolveEnv): { exe
     }
   }
   if (shimFound) {
-    return shimError(shimFound);
+    return shimResult(shimFound);
   }
+  const places = ['the PATH', ...spec.extraDirs].join(spec.extraDirs.length > 1 ? ', ' : ' or in ');
   return {
-    error: `Claude Code was not found: no ${names[0]} on the PATH or in ~/.local/bin. Install Claude Code, or set claudeSessions.claudeCommand to its path.`,
+    error: `${spec.tool} was not found: no ${names[0]} on ${places}. Install ${spec.tool}, or set ${spec.setting} to its path.`,
   };
+}
+
+/** The Claude Code executable for the chat (see resolveExecutable); an npm `.cmd` shim is refused. */
+export function resolveClaudeExecutable(command: string, env: ResolveEnv): { exe: string } | { error: string } {
+  return resolveExecutable(command, env, CLAUDE_EXECUTABLE);
 }
 
 // ---------- what the chat shows while the log catches up ----------
@@ -262,7 +296,9 @@ function resultText(content: unknown): string {
  */
 export class LiveChat {
   pieces: LivePiece[] = [];
-  private nextId = 1;
+  protected nextId = 1;
+  /** The field under which the log records a piece's uuid: Claude Code's `uuid`; Copilot CLI's records have an `id`. */
+  protected logKey = 'uuid';
   /** The API message being streamed, for stream events that do not name it. */
   private streamingMessage?: string;
   /** Stop was pressed during the running turn, so its error result is the interrupt. */
@@ -617,7 +653,7 @@ export class LiveChat {
         return p.state === 'pending' || !p.expire;
       }
       if (p.uuid) {
-        return !logText.includes(`"uuid":"${p.uuid}"`);
+        return !logText.includes(`"${this.logKey}":"${p.uuid}"`);
       }
       return !p.expire;
     });
@@ -672,11 +708,41 @@ export interface ChatStatus {
   queued: number;
   /** Permission cards waiting for the user's answer: the turn is held until they are answered. */
   awaiting?: number;
-  mode: PermissionMode;
+  /** The permission mode: a PermissionMode for Claude Code, a CopilotMode (copilotChat.ts) for Copilot CLI. */
+  mode: string;
   /** The chat was ended during a turn: the reply finishes, then the process exits. */
   finishing?: boolean;
   /** The last finished turn. */
   lastTurn?: { cost?: number; durationMs?: number; error?: boolean; interrupted?: boolean };
+}
+
+/**
+ * What a transcript tab needs of its chat, whichever CLI runs it: ClaudeChat (one long-lived Claude Code process) or
+ * CopilotChat (one Copilot CLI process per turn).
+ */
+export interface SessionChat {
+  readonly live: { pieces: LivePiece[]; forget(logText: string): boolean };
+  readonly status: ChatStatus;
+  /** A turn is running (including one finishing after the chat was ended). */
+  readonly replying: boolean;
+  /** The running process's pid. */
+  readonly pid: number | undefined;
+  /** A process is up or a turn is pending: the session has a writer. */
+  readonly active: boolean;
+  /** When this chat last heard from its process; its own writes to the log are not another writer's. */
+  readonly lastActivity: number;
+  send(text: string): void;
+  /** The user's answer to a permission card; false when nothing was waiting on it. */
+  answer(requestId: string, allow: boolean): boolean;
+  /** Stop: ends the running turn; messages still waiting go back to the message box. */
+  interrupt(): void;
+  setMode(mode: string): void;
+  /** Ends the chat and lets a running turn finish. Resolves once its process has exited. */
+  end(graceMs?: number): Promise<void>;
+  /** Ends the chat now, stopping a running turn. */
+  stopNow(graceMs?: number): Promise<void>;
+  /** The window is closing: a running turn gets `turnGraceMs` to finish. */
+  dispose(turnGraceMs?: number, graceMs?: number): Promise<void>;
 }
 
 /** How long a closing process gets to exit after its stdin closes before it is killed. */
@@ -695,7 +761,7 @@ const TURN_GRACE_MS = 1500;
  * Ending the chat during a turn lets the turn finish: stdin stays open until its `result` (so tool requests are still
  * answered and Stop can still interrupt it), then closes, and the process exits.
  */
-export class ClaudeChat {
+export class ClaudeChat implements SessionChat {
   readonly live = new LiveChat();
   private child?: ChatChild;
   private queue: string[] = [];
