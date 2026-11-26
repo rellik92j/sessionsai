@@ -216,7 +216,7 @@ The **SessionsAI: Search Sessions…** command in the Command Palette searches t
 npm install
 npm test          # compile, bundle and run unit tests (plus a smoke test against your real ~/.claude/projects)
 npm run test:e2e  # drive the chat in a real VS Code window (local only; see docs/dev/e2e.md)
-npm run package   # build sessionsai-<version>.vsix
+npm run package   # build releases/sessionsai-<version>.vsix
 ```
 
 Press F5 with this folder open to run the extension in a development host.

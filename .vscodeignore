@@ -12,6 +12,7 @@ tsconfig.json
 .claude/**
 # Scratch files the release-manager writes in its worktree (notes, test .vsix) while preparing a release.
 .tmp/**
+releases/**
 docs/**
 .gitignore
 *.vsix

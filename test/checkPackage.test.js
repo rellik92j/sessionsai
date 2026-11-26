@@ -72,6 +72,8 @@ test('local agent files, scratch files and sources are refused', async () => {
     'src/extension.ts',
     'dist/extension.js.map',
     'sessionsai-0.4.9.vsix',
+    'releases/sessionsai-0.4.9.vsix',
+    'releases/notes.txt',
   ];
   const problems = packageProblems([...GOOD, ...leaks], [...GOOD_IGNORED, '.claude/settings.local.json']);
   assert.deepEqual(problems, leaks.map((f) => `should not ship: ${f}`));
