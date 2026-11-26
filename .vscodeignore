@@ -20,3 +20,6 @@ node_modules/**
 !node_modules/@vscode/codicons/LICENSE
 !node_modules/@vscode/codicons/dist/codicon.css
 !node_modules/@vscode/codicons/dist/codicon.ttf
+# The end-to-end harness's VS Code download and its screenshots (docs/dev/e2e.md).
+.vscode-test/**
+.e2e-out/**

@@ -402,7 +402,7 @@ export class TranscriptPanels {
         sessionId: session.id,
         mode: tab.chatMode,
         launch: () => chatLaunch(tab.session),
-        spawn: (exe, args, cwd) => spawn(exe, args, { cwd, shell: false, windowsHide: true, stdio: 'pipe' }),
+        spawn: spawnChat,
         onChange: () => this.scheduleLive(tab),
         // After the page has heard "sent" (which empties the box) for the message that started this.
         onUnsent: (texts) => setTimeout(() => panelPost(tab, { type: 'chatRestore', text: texts.join('\n\n') }), 0),
@@ -742,6 +742,21 @@ function panelPost(tab: TranscriptTab, message: unknown): void {
   }
 }
 
+/**
+ * End-to-end tests only (docs/dev/e2e.md): the path of a Node script that stands in for claude.exe in the chat. Unset
+ * for every user, and then nothing below changes how the chat starts.
+ */
+const STAND_IN_ENV = 'SESSIONSAI_E2E_CLAUDE';
+
+/** Starts the chat process without a shell; the e2e stand-in script runs on VS Code's own Node. */
+function spawnChat(exe: string, args: string[], cwd: string | undefined) {
+  const standIn = process.env[STAND_IN_ENV];
+  if (standIn && exe === standIn) {
+    return spawn(process.execPath, [standIn, ...args], { cwd, shell: false, windowsHide: true, stdio: 'pipe', env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } });
+  }
+  return spawn(exe, args, { cwd, shell: false, windowsHide: true, stdio: 'pipe' });
+}
+
 /** Where the chat process starts: claude.exe (never a shell shim) in the session's own folder, or why it cannot. */
 function chatLaunch(session: SessionInfo): { exe: string; cwd?: string } | { error: string } {
   const cwd = projectPath(session);
@@ -749,6 +764,10 @@ function chatLaunch(session: SessionInfo): { exe: string; cwd?: string } | { err
     return {
       error: `The session's folder no longer exists (${cwd || 'unknown'}). Claude Code finds a session by the folder it ran in, so it cannot be resumed from here.`,
     };
+  }
+  const standIn = process.env[STAND_IN_ENV];
+  if (standIn) {
+    return { exe: standIn, cwd };
   }
   const command = vscode.workspace.getConfiguration('claudeSessions').get<string>('claudeCommand', 'claude') || 'claude';
   const found = resolveClaudeExecutable(command, {
