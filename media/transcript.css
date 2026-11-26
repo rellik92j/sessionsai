@@ -948,6 +948,8 @@ body.has-composer .fab { bottom: calc(var(--composer-h, 110px) + 12px); }
 .chat-live { max-width: var(--content); margin: 0 auto; }
 .chat-live:empty { display: none; }
 .chat-pending .msg-meta .pill { margin-right: 2px; }
+/* Held until an ended chat has stopped: not sent yet. */
+.chat-pending.waiting .bubble { opacity: 0.75; }
 .chat-tool {
   display: flex;
   align-items: center;

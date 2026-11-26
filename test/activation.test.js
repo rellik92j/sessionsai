@@ -1970,3 +1970,233 @@ setInterval(() => {}, 1000);
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('Chat here: a message sent while an ended chat finishes its reply shows as waiting, then starts a new chat (SA-32)', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-sessions-chat-'));
+  const projectsDir = path.join(root, 'claude');
+  const repo = path.join(root, 'repo');
+  const ID = '7d7d7d7d-1111-4222-8333-944455556666';
+  const log = path.join(projectsDir, 'C--repo', `${ID}.jsonl`);
+  const release = path.join(root, 'release');
+  // A stand-in for claude.exe that records every stdin line. A "card" message first asks permission for one tool call;
+  // a "slow" one (after that answer, if any) is answered only once the test creates the release file, or on an
+  // interrupt as a stopped turn. On stdin EOF it writes to the log and exits a moment later.
+  const standIn = path.join(root, 'stand-in.js');
+  fs.writeFileSync(
+    standIn,
+    `const fs = require('fs');
+const stdinLog = ${JSON.stringify(root)} + '/stdin-' + process.pid + '.log';
+const release = ${JSON.stringify(release)};
+let buf = '';
+let poll;
+let asking = false;
+const out = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
+const result = (extra) => out({ type: 'result', subtype: 'success', is_error: false, result: 'ok', duration_ms: 5, ...extra });
+const slow = () => {
+  poll = setInterval(() => {
+    if (fs.existsSync(release)) {
+      fs.unlinkSync(release);
+      clearInterval(poll);
+      poll = undefined;
+      result();
+    }
+  }, 20);
+};
+process.stdin.on('data', (d) => {
+  buf += d;
+  let i;
+  while ((i = buf.indexOf('\\n')) >= 0) {
+    const line = buf.slice(0, i);
+    buf = buf.slice(i + 1);
+    fs.appendFileSync(stdinLog, line + '\\n');
+    const msg = JSON.parse(line);
+    if (msg.type === 'user') {
+      const text = msg.message.content;
+      if (text.includes('card')) {
+        asking = true;
+        out({ type: 'control_request', request_id: 'q-' + process.pid, request: { subtype: 'can_use_tool', tool_name: 'Bash', input: { command: 'echo hi' }, description: 'Say hi', tool_use_id: 'toolu_' + process.pid } });
+      } else if (text.includes('slow')) {
+        slow();
+      } else {
+        result();
+      }
+    } else if (msg.type === 'control_response' && asking) {
+      asking = false;
+      slow();
+    } else if (msg.type === 'control_request' && msg.request.subtype === 'interrupt' && (poll || asking)) {
+      clearInterval(poll);
+      poll = undefined;
+      asking = false;
+      result({ subtype: 'error_during_execution', is_error: true, terminal_reason: 'aborted_streaming' });
+    }
+  }
+});
+process.stdin.on('end', () => {
+  fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ type: 'system', subtype: 'stand-in', uuid: 's-' + process.pid }) + '\\n');
+  setTimeout(() => process.exit(0), 200);
+});
+setInterval(() => {}, 1000);
+`,
+  );
+  const cp = require('child_process');
+  const realSpawn = cp.spawn;
+  const spawned = [];
+  cp.spawn = (exe, args, opts) => {
+    if (exe !== process.execPath || !args.includes('--input-format')) {
+      return realSpawn(exe, args, opts);
+    }
+    const child = realSpawn(process.execPath, [standIn], opts);
+    spawned.push(child);
+    return child;
+  };
+  const alive = (child) => child.exitCode === null && child.signalCode === null;
+  const stdinOf = (child) => {
+    const file = path.join(root, `stdin-${child.pid}.log`);
+    return fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+  };
+  try {
+    fs.mkdirSync(repo);
+    writeSession(path.dirname(log), ID, [
+      { type: 'user', message: { content: 'Start the waiting test' }, cwd: repo, uuid: 'w-1', timestamp: new Date().toISOString() },
+      { type: 'assistant', message: { id: 'm1', content: [{ type: 'text', text: 'Ready.' }] }, uuid: 'w-2', timestamp: new Date().toISOString() },
+    ]);
+    const old = new Date(Date.now() - 60_000);
+    fs.utimesSync(log, old, old);
+    const state = {
+      projectsDir,
+      config: { copilotDir: path.join(root, 'none'), vscodeUserDir: path.join(root, 'none'), claudeCommand: process.execPath },
+      providers: {},
+      commands: {},
+      panels: [],
+      panelPosts: [],
+      errors: [],
+      terminals: [],
+      infos: [],
+      extensions: { 'anthropic.claude-code': { extensionUri: { fsPath: root } } },
+    };
+    const { vscode } = await activateWithSidebar(state);
+    const warnings = [];
+    let answer;
+    vscode.window.showWarningMessage = async (m) => (warnings.push(m), answer);
+    const opened = [];
+    state.commands['claude-vscode.editor.open'] = (...args) => opened.push(args);
+    // The session's folder is open in this window, so Open in Claude Code asks nothing else.
+    vscode.workspace.workspaceFolders = [{ uri: { fsPath: repo, scheme: 'file' } }];
+    const session = { sessionKey: `claude:${ID}` };
+    const posted = (type) => state.panelPosts.filter((m) => m.type === type);
+    const lastLive = () => posted('chatLive').at(-1)?.html ?? '';
+    const lastState = () => posted('chatState').at(-1) ?? {};
+    const WAITS = /waits for the previous reply to finish/g;
+    let panel;
+    /** Sends from the box; a waiting send is taken (the box empties) before it is answered, so this returns its promise. */
+    const chatSend = async (text) => {
+      state.panelPosts.length = 0;
+      const handled = panel.onMessage({ command: 'chatSend', text });
+      await waitFor(() => posted('sent').length || posted('sendFailed').length, `an answer to "${text}"`);
+      assert.equal(posted('sendFailed').length, 0, `sent: ${text}`);
+      return { handled };
+    };
+    /** Ends the chat mid-reply: the bar shows the reply finishing. */
+    const endChat = async () => {
+      const ending = panel.onMessage({ command: 'chatEnd' });
+      await waitFor(() => lastState().finishing === true, 'the chat bar to show the reply finishing');
+      return { ending };
+    };
+
+    // 1. A reply with a permission card, ended mid-turn: the card is denied, the reply finishes, and two messages sent
+    //    meanwhile show at once as waiting, below the reply, with the bar saying a new chat starts after it.
+    await state.commands['claudeSessions.openTranscript'](session);
+    panel = state.panels.at(-1);
+    await (await chatSend('slow card one')).handled;
+    await waitFor(() => /data-perm="allow"/.test(lastLive()), 'a permission card');
+    const first = spawned[0];
+    const { ending } = await endChat();
+    await waitFor(() => /The chat was ended before it was answered/.test(lastLive()), 'the open card to be denied');
+    const a = await chatSend('next **message**');
+    assert.equal(posted('sent').length, 1, 'taken at once, before the old process has exited');
+    assert.equal(lastLive().match(WAITS)?.length, 1, 'shown at once, marked as waiting');
+    assert.ok(lastLive().indexOf('The chat was ended before') < lastLive().indexOf('next <strong>message</strong>'), 'below the finishing reply');
+    assert.doesNotMatch(lastLive(), /data-perm="allow"/, 'no card left to answer');
+    assert.equal(lastState().finishing, true);
+    assert.equal(lastState().waiting, 1);
+    const b = await chatSend('and another');
+    assert.equal(lastLive().match(WAITS)?.length, 2);
+    assert.equal(lastState().waiting, 2);
+    assert.equal(spawned.length, 1, 'no new process while the old one is up');
+    assert.ok(!stdinOf(first).includes('next'), 'nothing of it went to the ended chat');
+    // The reply finishes and the process exits; then both go, in order, to a new chat, and the marker goes away.
+    fs.writeFileSync(release, '');
+    await Promise.all([ending, a.handled, b.handled]);
+    await waitFor(() => spawned.length === 2 && stdinOf(spawned[1]).includes('and another'), 'a new chat to get both messages');
+    assert.ok(!alive(first), 'the ended chat had exited first');
+    assert.ok(stdinOf(spawned[1]).indexOf('next **message**') < stdinOf(spawned[1]).indexOf('and another'));
+    await waitFor(() => lastState().busy === false && lastState().running, 'the new chat to answer');
+    assert.doesNotMatch(lastLive(), WAITS);
+    assert.equal(lastState().waiting, 0);
+    assert.equal(posted('sent').length, 1, 'the box was emptied once, not again when the wait ended');
+    assert.deepEqual(posted('chatRestore'), [], 'nothing came back to the box');
+    assert.deepEqual(warnings, [], 'its own log writes did not count as another writer');
+
+    // 2. Stop on the finishing reply: the waiting message is sent right after.
+    await (await chatSend('slow two')).handled;
+    await waitFor(() => stdinOf(spawned[1]).includes('slow two'), 'the second chat to get "slow two"');
+    const second = spawned[1];
+    const { ending: ending2 } = await endChat();
+    const c = await chatSend('after the stop');
+    assert.equal(lastLive().match(WAITS)?.length, 1);
+    await panel.onMessage({ command: 'chatStop' });
+    await Promise.all([ending2, c.handled]);
+    await waitFor(() => spawned.length === 3 && stdinOf(spawned[2]).includes('after the stop'), 'a new chat to get it after the stop');
+    assert.match(stdinOf(second), /"subtype":"interrupt"/);
+    assert.ok(!alive(second));
+    await waitFor(() => lastState().busy === false && lastState().running, 'the new chat to answer');
+    assert.doesNotMatch(lastLive(), WAITS);
+
+    // 3. The session let go of elsewhere (Open in Claude Code, Stop It Now) while a message waits: it would take the
+    //    session straight back, so it returns to the box instead and starts nothing.
+    await (await chatSend('slow four')).handled;
+    await waitFor(() => stdinOf(spawned[2]).includes('slow four'), 'the third chat to get "slow four"');
+    assert.equal(spawned.length, 3);
+    const fourth = spawned[2];
+    const { ending: ending4 } = await endChat();
+    const e = await chatSend('taken back');
+    answer = 'Stop It Now';
+    assert.equal(await state.commands['claudeSessions.openInClaudeCode'](session), true);
+    answer = undefined;
+    assert.match(warnings.pop(), /Claude is still replying in the chat/);
+    await Promise.all([ending4, e.handled]);
+    assert.ok(!alive(fourth));
+    assert.equal(opened.length, 1);
+    assert.deepEqual(posted('chatRestore').map((m) => m.text), ['taken back']);
+    assert.doesNotMatch(lastLive(), WAITS);
+    assert.equal(lastState().waiting, 0);
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(spawned.length, 3, 'no new chat');
+    assert.ok(spawned.every((x) => !stdinOf(x).includes('taken back')));
+
+    // 4. The tab closed while a message waits: it is never sent. (Chat here starts a new chat first.)
+    await (await chatSend('slow five')).handled;
+    await waitFor(() => spawned.length === 4 && stdinOf(spawned[3]).includes('slow five'), 'a new chat to get "slow five"');
+    const fifth = spawned[3];
+    const { ending: ending5 } = await endChat();
+    const d = await chatSend('never sent');
+    assert.equal(lastLive().match(WAITS)?.length, 1);
+    panel.dispose();
+    fs.writeFileSync(release, '');
+    await Promise.all([ending5, d.handled]);
+    await waitFor(() => !alive(fifth), 'the ended chat to exit');
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(spawned.length, 4, 'no new chat for a closed tab');
+    assert.ok(spawned.every((x) => !stdinOf(x).includes('never sent')));
+
+    await require(path.join(process.env.EXT_DIR || path.join(__dirname, '..'), 'dist', 'extension.js')).deactivate();
+    assert.ok(spawned.every((x) => !alive(x)));
+    assert.deepEqual(state.errors, []);
+  } finally {
+    cp.spawn = realSpawn;
+    for (const x of spawned) {
+      if (alive(x)) x.kill();
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

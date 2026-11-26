@@ -1,0 +1,23 @@
+{
+  "name": "claude-code",
+  "publisher": "anthropic",
+  "displayName": "Claude Code (e2e stand-in)",
+  "description": "Stands in for the Claude Code extension in the end-to-end harness (docs/dev/e2e.md): it only records that its chat was asked to open.",
+  "version": "0.0.1",
+  "private": true,
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "main": "./extension.js",
+  "activationEvents": [
+    "onCommand:claude-vscode.editor.open"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "claude-vscode.editor.open",
+        "title": "Open Claude Code chat (e2e stand-in)"
+      }
+    ]
+  }
+}
