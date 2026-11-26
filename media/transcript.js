@@ -119,7 +119,9 @@
       if (target === 'here') {
         // A full context or a cold cache is worth knowing, but chatting here is still this session.
         const why = reason();
-        status.innerHTML = `<i class="codicon codicon-${t.icon}"></i><span>${esc('Chats with this session in this tab. Claude Code runs in the background; tools that need approval are declined for now.')}</span>${why ? `<span class="why">${esc(why)}</span>` : ''}`;
+        const approval =
+          chatMode && chatMode.value === 'deny' ? 'tools that need approval are declined.' : 'tools that need approval ask you here first.';
+        status.innerHTML = `<i class="codicon codicon-${t.icon}"></i><span>${esc(`Chats with this session in this tab. Claude Code runs in the background; ${approval}`)}</span>${why ? `<span class="why">${esc(why)}</span>` : ''}`;
         renderChat();
         return;
       }
@@ -143,6 +145,8 @@
       if (chatMode.value !== s.mode) chatMode.value = s.mode;
       chatState.textContent = s.finishing
         ? 'Chat ended: Claude is finishing its reply, then it stops.'
+        : s.awaiting
+        ? `Waiting for your answer${s.awaiting > 1 ? ` (${s.awaiting} requests)` : ''}…${s.queued ? ` ${s.queued} queued.` : ''}`
         : s.busy
         ? `Claude is working…${s.queued ? ` ${s.queued} queued.` : ''}`
         : s.running
@@ -166,7 +170,17 @@
     if (chat && chatMode) {
       chatMode.innerHTML = chat.modes.map((m) => `<option value="${esc(m.id)}" title="${esc(m.title)}">${esc(m.label)}</option>`).join('');
       chatMode.value = chat.mode;
-      chatMode.addEventListener('change', () => vscode.postMessage({ command: 'chatMode', mode: chatMode.value }));
+      chatMode.addEventListener('change', () => {
+        vscode.postMessage({ command: 'chatMode', mode: chatMode.value });
+        describe();
+      });
+      // Allow / Deny on a permission card. The buttons go inactive at once; the extension redraws the card.
+      chatLive?.addEventListener('click', (e) => {
+        const b = e.target.closest('button[data-perm]');
+        if (!b || b.disabled) return;
+        b.closest('.perm-actions')?.querySelectorAll('button').forEach((x) => (x.disabled = true));
+        vscode.postMessage({ command: 'chatPermission', requestId: b.dataset.request, allow: b.dataset.perm === 'allow' });
+      });
       chatStop.addEventListener('click', () => vscode.postMessage({ command: 'chatStop' }));
       chatEnd.addEventListener('click', () => vscode.postMessage({ command: 'chatEnd' }));
       if (chatLive) chatLive.innerHTML = chat.live || '';

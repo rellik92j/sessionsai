@@ -5,18 +5,36 @@
 import * as path from 'path';
 import { toolHint } from './sessionParser';
 
-/** The permission modes the chat offers, passed explicitly as --permission-mode (doc section 7). */
-export const PERMISSION_MODES = ['default', 'acceptEdits', 'plan', 'auto'] as const;
+/**
+ * The permission modes the chat's picker offers. `ask` and `deny` both run Claude Code in its `default` mode and differ
+ * only in how the chat answers a permission request: `ask` shows a card to allow or deny it, `deny` declines it at once
+ * with a neutral message. The others are passed through as --permission-mode (doc section 7), and whatever they still
+ * leave to ask shows a card too.
+ */
+export const PERMISSION_MODES = ['ask', 'acceptEdits', 'plan', 'auto', 'deny'] as const;
 export type PermissionMode = (typeof PERMISSION_MODES)[number];
 
 export const isPermissionMode = (v: unknown): v is PermissionMode => typeof v === 'string' && (PERMISSION_MODES as readonly string[]).includes(v);
 
+/** The --permission-mode Claude Code runs in for a mode of the picker. */
+export const cliPermissionMode = (mode: PermissionMode): string => (mode === 'ask' || mode === 'deny' ? 'default' : mode);
+
 /**
- * What the extension answers every `can_use_tool` request with until permission cards exist. Deliberately neutral:
+ * What the chat answers every `can_use_tool` request with in the decline-prompts mode. Deliberately neutral:
  * `--permission-prompts none` tells the model approvals are gone for the rest of the session, and it stops retrying
  * in later turns (doc section 5).
  */
 export const DENY_MESSAGE = 'Not approved this time. The user can approve it in a later turn.';
+/** Deny on a permission card: the tool result Claude sees, which it then carries on from. */
+export const USER_DENY_MESSAGE = 'The user declined this tool call. Carry on without it, or ask the user if you need it.';
+/** Deny on a plan card (ExitPlanMode). */
+export const PLAN_DENY_MESSAGE = 'The user did not approve the plan yet. Stay in plan mode and wait for their feedback.';
+/** A card still open when the user pressed Stop. */
+export const STOP_DENY_MESSAGE = 'Not approved: the user stopped the turn before answering. They can approve it in a later turn.';
+/** A card still open (or a request arriving) after the chat was ended: the tab closed, End chat, or the window closing. */
+export const ENDED_DENY_MESSAGE = 'Not approved: the chat was closed before the user answered. They can approve it in a later turn.';
+
+const OWN_DENY_MESSAGES = new Set([DENY_MESSAGE, USER_DENY_MESSAGE, PLAN_DENY_MESSAGE, STOP_DENY_MESSAGE, ENDED_DENY_MESSAGE]);
 
 /** The command line of the chat process (doc section 9). */
 export function chatArgs(sessionId: string, mode: PermissionMode): string[] {
@@ -35,7 +53,7 @@ export function chatArgs(sessionId: string, mode: PermissionMode): string[] {
     '--permission-prompt-tool',
     'stdio',
     '--permission-mode',
-    mode,
+    cliPermissionMode(mode),
   ];
 }
 
@@ -49,12 +67,14 @@ export function interruptLine(requestId: string): string {
   return JSON.stringify({ type: 'control_request', request_id: requestId, request: { subtype: 'interrupt' } }) + '\n';
 }
 
-/** The automatic answer to a `can_use_tool` request. */
-export function denyLine(requestId: string): string {
-  return (
-    JSON.stringify({ type: 'control_response', response: { subtype: 'success', request_id: requestId, response: { behavior: 'deny', message: DENY_MESSAGE } } }) +
-    '\n'
-  );
+/** Declines a `can_use_tool` request: the tool result is an error whose text is `message` (doc section 6). */
+export function denyLine(requestId: string, message = DENY_MESSAGE): string {
+  return JSON.stringify({ type: 'control_response', response: { subtype: 'success', request_id: requestId, response: { behavior: 'deny', message } } }) + '\n';
+}
+
+/** Allows a `can_use_tool` request: the tool runs with `input`, the input it asked for (doc section 6). */
+export function allowLine(requestId: string, input: Record<string, unknown>): string {
+  return JSON.stringify({ type: 'control_response', response: { subtype: 'success', request_id: requestId, response: { behavior: 'allow', updatedInput: input } } }) + '\n';
 }
 
 /** The answer to a control request this chat does not handle, so the CLI is never left waiting on it. */
@@ -171,7 +191,28 @@ export type LivePiece =
       expire?: boolean;
     }
   /** Something the log does not record in this form: a declined request, a failed turn, a crash. */
-  | { kind: 'notice'; id: number; text: string; tone: 'error' | 'info'; expire?: boolean };
+  | { kind: 'notice'; id: number; text: string; tone: 'error' | 'info'; expire?: boolean }
+  /** A permission request waiting for (or answered by) the user: a card with Allow and Deny. */
+  | PermissionPiece;
+
+export interface PermissionPiece {
+  kind: 'permission';
+  id: number;
+  /** The control request's id, which the answer names. */
+  requestId: string;
+  toolName: string;
+  /** The tool's input as the request gave it; Allow sends it back unchanged as `updatedInput`. */
+  input: Record<string, unknown>;
+  toolUseId?: string;
+  /** Claude Code's own one-line description of the call, when it gives one. */
+  description?: string;
+  /** A path outside what the session may touch, when that is why it asks. */
+  blockedPath?: string;
+  state: 'pending' | 'allowed' | 'denied';
+  /** Why a card was denied without the user pressing Deny: Stop, the chat closing, the process exiting. */
+  why?: string;
+  expire?: boolean;
+}
 
 /** What a turn's `result` said. */
 export interface TurnEnd {
@@ -226,11 +267,64 @@ export class LiveChat {
   private streamingMessage?: string;
   /** Stop was pressed during the running turn, so its error result is the interrupt. */
   interrupting = false;
+  /**
+   * When set, every permission request is declined at once with this message instead of showing a card: the
+   * decline-prompts mode, or a chat that has ended (nobody is left to answer, and the turn must not hang).
+   */
+  decline?: string;
+
+  /** The cards still waiting for an answer, oldest first. Only the first can be answered: requests go in order. */
+  pendingPermissions(): PermissionPiece[] {
+    return this.pieces.filter((p): p is PermissionPiece => p.kind === 'permission' && p.state === 'pending');
+  }
+
+  /**
+   * The user's answer to a card: the reply line for the process, or undefined when the card is not the one waiting
+   * (already answered, or a later one while an earlier is still open).
+   */
+  answer(requestId: string, allow: boolean): string | undefined {
+    const card = this.pendingPermissions()[0];
+    if (!card || card.requestId !== requestId) {
+      return undefined;
+    }
+    if (allow) {
+      card.state = 'allowed';
+      return allowLine(card.requestId, card.input);
+    }
+    return this.denyCard(card, card.toolName === 'ExitPlanMode' ? PLAN_DENY_MESSAGE : USER_DENY_MESSAGE);
+  }
+
+  /** Denies every open card with `message` (Stop, the chat ending), noting `why` on each; the reply lines, in order. */
+  denyPending(message: string, why: string): string[] {
+    return this.pendingPermissions().map((card) => {
+      card.why = why;
+      return this.denyCard(card, message);
+    });
+  }
+
+  /** The process is gone, or the turn ended without an answer: open cards can no longer be answered. */
+  abandonPending(why: string): boolean {
+    const open = this.pendingPermissions();
+    for (const card of open) {
+      card.state = 'denied';
+      card.why = why;
+    }
+    return open.length > 0;
+  }
+
+  private denyCard(card: PermissionPiece, message: string): string {
+    card.state = 'denied';
+    const tool = card.toolUseId ? this.pieces.find((p) => p.kind === 'tool' && p.toolUseId === card.toolUseId) : undefined;
+    if (tool && tool.kind === 'tool') {
+      tool.status = 'denied';
+    }
+    return denyLine(card.requestId, message);
+  }
 
   addUser(text: string, queued: boolean): void {
     // A new turn clears errors and notes from earlier ones; one queued behind a running turn leaves that turn's alone.
     if (!queued) {
-      this.pieces = this.pieces.filter((p) => p.kind !== 'notice');
+      this.pieces = this.pieces.filter((p) => p.kind !== 'notice' && !(p.kind === 'permission' && p.state !== 'pending'));
     }
     this.pieces.push({ kind: 'user', id: this.nextId++, text, queued: queued || undefined });
   }
@@ -380,7 +474,7 @@ export class LiveChat {
       } else if (piece.kind === 'text') {
         piece.text = str(b.text) ?? piece.text;
       }
-      if (piece.kind !== 'user' && piece.kind !== 'notice') {
+      if (piece.kind === 'text' || piece.kind === 'thinking' || piece.kind === 'tool') {
         piece.streaming = false;
         piece.uuid = uuid;
         piece.messageId = messageId ?? piece.messageId;
@@ -411,7 +505,7 @@ export class LiveChat {
       }
       const tool = this.pieces.find((p) => p.kind === 'tool' && p.toolUseId === str(b.tool_use_id));
       if (tool && tool.kind === 'tool' && tool.status !== 'denied') {
-        tool.status = b.is_error === true ? (resultText(b.content) === DENY_MESSAGE ? 'denied' : 'failed') : 'ok';
+        tool.status = b.is_error === true ? (OWN_DENY_MESSAGES.has(resultText(b.content)) ? 'denied' : 'failed') : 'ok';
         changed = true;
       }
     }
@@ -427,22 +521,44 @@ export class LiveChat {
     if (request.subtype !== 'can_use_tool') {
       return { changed: false, reply: unsupportedLine(requestId, str(request.subtype) ?? 'unknown') };
     }
-    // Every request is answered, or the turn hangs (doc section 6). Permission cards (SA-26) replace this.
+    // Every request is answered, or the turn hangs (doc section 6): by the user on a card, or at once when declining.
     const name = str(request.tool_name) ?? 'a tool';
-    const changed = this.denied(str(request.tool_use_id), name, undefined);
-    return { changed, reply: denyLine(requestId) };
+    const toolUseId = str(request.tool_use_id);
+    if (this.decline !== undefined) {
+      const changed = this.denied(toolUseId, name, undefined, this.decline === DENY_MESSAGE ? 'mode' : 'ended');
+      return { changed, reply: denyLine(requestId, this.decline) };
+    }
+    if (this.pieces.some((p) => p.kind === 'permission' && p.requestId === requestId)) {
+      // The same request twice: the card is already up.
+      return { changed: false };
+    }
+    this.pieces.push({
+      kind: 'permission',
+      id: this.nextId++,
+      requestId,
+      toolName: name,
+      input: obj(request.input) ?? {},
+      toolUseId,
+      description: str(request.description),
+      blockedPath: str(request.blocked_path),
+      state: 'pending',
+    });
+    return { changed: true };
   }
 
   /** Marks a tool call declined, and says so; the log records it only as a failed tool result. */
-  private denied(toolUseId: string | undefined, name: string | undefined, reason: string | undefined): boolean {
+  private denied(toolUseId: string | undefined, name: string | undefined, reason: string | undefined, by: 'mode' | 'ended' | 'cli' = 'cli'): boolean {
     const tool = toolUseId ? this.pieces.find((p) => p.kind === 'tool' && p.toolUseId === toolUseId) : undefined;
     if (tool && tool.kind === 'tool') {
       tool.status = 'denied';
     }
+    const what = name === 'ExitPlanMode' ? 'the plan' : (name ?? 'a tool');
     const text =
-      name === 'ExitPlanMode'
-        ? 'Declined the plan: approving a plan from this chat is not available yet. Change the permission mode to let Claude carry on.'
-        : `Declined ${name ?? 'a tool'}: it needs approval, and approving from this chat is not available yet. Change the permission mode to allow it.${reason ? ` (${reason})` : ''}`;
+      by === 'mode'
+        ? `Declined ${what}: the chat is set to decline what needs approval. Pick "Ask me" in the permission mode to approve it here.`
+        : by === 'ended'
+          ? `Declined ${what}: the chat was ended, so nobody was there to approve it.`
+          : `Declined ${what}: it needs approval.${reason ? ` (${reason})` : ''}`;
     this.pieces.push({ kind: 'notice', id: this.nextId++, text, tone: 'info', expire: true });
     return true;
   }
@@ -462,12 +578,14 @@ export class LiveChat {
       durationMs: typeof ev.duration_ms === 'number' ? ev.duration_ms : undefined,
       interrupted,
     };
+    // Claude Code is no longer waiting on a card still open (an interrupted turn): it can no longer be answered.
+    this.abandonPending('The turn ended before it was answered.');
     for (const p of this.pieces) {
       if ('streaming' in p) {
         p.streaming = false;
       }
-      // What never got a uuid goes at the next log read: the log has the turn by then.
-      if (p.kind !== 'notice' && !p.uuid) {
+      // What never got a uuid goes at the next log read: the log has the turn by then. So do the turn's cards.
+      if (p.kind === 'permission' || (p.kind !== 'notice' && !p.uuid)) {
         p.expire = true;
       }
     }
@@ -494,6 +612,10 @@ export class LiveChat {
         // Declined-tool notes go with their turn; errors stay until the next message.
         return !p.expire;
       }
+      if (p.kind === 'permission') {
+        // A card stays while it is open, and goes with its turn once answered: the log then shows what happened.
+        return p.state === 'pending' || !p.expire;
+      }
       if (p.uuid) {
         return !logText.includes(`"uuid":"${p.uuid}"`);
       }
@@ -505,7 +627,7 @@ export class LiveChat {
   /** A turn's notes to drop at the next log read (an interrupted or crashed turn). */
   expireAll(): void {
     for (const p of this.pieces) {
-      if (p.kind !== 'notice' && !(p.kind === 'user' && p.queued)) {
+      if (p.kind !== 'notice' && !(p.kind === 'user' && p.queued) && !(p.kind === 'permission' && p.state === 'pending')) {
         p.expire = true;
       }
     }
@@ -548,6 +670,8 @@ export interface ChatStatus {
   busy: boolean;
   /** Messages waiting for the running turn to end. */
   queued: number;
+  /** Permission cards waiting for the user's answer: the turn is held until they are answered. */
+  awaiting?: number;
   mode: PermissionMode;
   /** The chat was ended during a turn: the reply finishes, then the process exits. */
   finishing?: boolean;
@@ -593,9 +717,12 @@ export class ClaudeChat {
   /** When this chat last heard from its process; its own writes to the log are not another writer's. */
   lastActivity = 0;
   mode: PermissionMode;
+  /** The --permission-mode the running process was started with. */
+  private runningCliMode?: string;
 
   constructor(private readonly opts: ChatOptions) {
     this.mode = opts.mode;
+    this.live.decline = opts.mode === 'deny' ? DENY_MESSAGE : undefined;
   }
 
   get status(): ChatStatus {
@@ -603,6 +730,7 @@ export class ClaudeChat {
       running: !!this.child && !this.closing,
       busy: this.busy,
       queued: this.queue.length,
+      awaiting: this.live.pendingPermissions().length || undefined,
       mode: this.mode,
       finishing: (this.disposed && this.busy && !!this.child) || undefined,
       lastTurn: this.lastTurn,
@@ -629,7 +757,24 @@ export class ClaudeChat {
     void this.pump();
   }
 
-  /** Stops the running turn with the interrupt control request; messages still waiting go back to the message box. */
+  /**
+   * The user answered a permission card: Allow lets the tool run, Deny declines it and Claude carries on. Only the
+   * oldest open card can be answered, so requests go in order; an answer to any other is ignored.
+   */
+  answer(requestId: string, allow: boolean): boolean {
+    const line = this.live.answer(requestId, allow);
+    if (!line) {
+      return false;
+    }
+    this.write(line);
+    this.opts.onChange();
+    return true;
+  }
+
+  /**
+   * Stops the running turn with the interrupt control request; messages still waiting go back to the message box. Open
+   * permission cards are denied first, since the turn is blocked on them.
+   */
   interrupt(): void {
     const dropped = this.queue.splice(0);
     if (dropped.length) {
@@ -637,26 +782,44 @@ export class ClaudeChat {
       this.opts.onUnsent(dropped);
     }
     if (this.busy && this.child) {
+      this.denyPending(STOP_DENY_MESSAGE, 'Stopped before it was answered.');
       this.live.interrupting = true;
       this.write(interruptLine(`interrupt-${++this.requestSeq}`));
     }
     this.opts.onChange();
   }
 
-  /** A new permission mode takes a new process: now when idle, after the running turn otherwise. */
+  /**
+   * A new permission mode. Claude Code takes a new process for a new --permission-mode: now when idle, after the
+   * running turn otherwise. Between "Ask me" and decline-prompts only the answer changes, so the process stays (and
+   * open cards are declined when switching to decline).
+   */
   setMode(mode: PermissionMode): void {
     if (mode === this.mode) {
       return;
     }
     this.mode = mode;
+    if (!this.disposed) {
+      this.live.decline = mode === 'deny' ? DENY_MESSAGE : undefined;
+      if (mode === 'deny') {
+        this.denyPending(DENY_MESSAGE, 'Declined: the permission mode was changed to decline.');
+      }
+    }
     if (this.child && !this.closing) {
+      const restart = cliPermissionMode(mode) !== this.runningCliMode;
       if (this.busy) {
-        this.restartAfterTurn = true;
-      } else {
+        this.restartAfterTurn = restart;
+      } else if (restart) {
         void this.close();
       }
     }
     this.opts.onChange();
+  }
+
+  private denyPending(message: string, why: string): void {
+    for (const line of this.live.denyPending(message, why)) {
+      this.write(line);
+    }
   }
 
   /**
@@ -668,6 +831,9 @@ export class ClaudeChat {
     this.graceMs = Math.min(this.graceMs, graceMs);
     if (!this.disposed) {
       this.disposed = true;
+      // Nobody is left to answer a card: open ones are denied, and so is any request the finishing turn still makes.
+      this.live.decline = ENDED_DENY_MESSAGE;
+      this.denyPending(ENDED_DENY_MESSAGE, 'The chat was ended before it was answered.');
       const unsent = this.queue.splice(0);
       this.live.dropQueued();
       if (unsent.length) {
@@ -741,6 +907,7 @@ export class ClaudeChat {
       return false;
     }
     this.child = child;
+    this.runningCliMode = cliPermissionMode(this.mode);
     this.stdout = '';
     this.stderrTail = [];
     child.stdin?.on('error', (err) => this.opts.log(`stdin: ${err.message}`));
@@ -785,6 +952,8 @@ export class ClaudeChat {
       return;
     }
     this.child = undefined;
+    // A card still open can no longer be answered: nothing hangs on it, and it says why.
+    this.live.abandonPending('Claude Code exited before it was answered.');
     const expected = !!this.closing || this.disposed;
     if (!expected) {
       const tail = this.stderrTail.length ? ` ${this.stderrTail.join(' ')}` : '';

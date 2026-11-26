@@ -7,15 +7,20 @@ const { EventEmitter } = require('events');
 const {
   chatArgs,
   ClaudeChat,
+  allowLine,
   DENY_MESSAGE,
   denyLine,
+  ENDED_DENY_MESSAGE,
   LiveChat,
+  PLAN_DENY_MESSAGE,
+  STOP_DENY_MESSAGE,
+  USER_DENY_MESSAGE,
   resolveClaudeExecutable,
   resultError,
   turnCost,
   userLine,
 } = require('../out/claudeChat');
-const { renderLive, chatStateMessage } = require('../out/chatView');
+const { renderLive, chatStateMessage, permissionDetail } = require('../out/chatView');
 
 const fixture = fs
   .readFileSync(path.join(__dirname, 'fixtures', 'claude-stream', 'turn.jsonl'), 'utf8')
@@ -34,6 +39,11 @@ test('the chat process is resumed in stream-json mode with an explicit permissio
   assert.equal(args[args.indexOf('--permission-prompt-tool') + 1], 'stdio');
   assert.equal(args[args.indexOf('--permission-mode') + 1], 'acceptEdits');
   assert.ok(!args.includes('--permission-prompts'), 'never --permission-prompts none: it poisons the session');
+  // "Ask me" and decline-prompts both run Claude Code in its default mode; only the chat's answer differs.
+  for (const mode of ['ask', 'deny']) {
+    const a = chatArgs('sess-0001', mode);
+    assert.equal(a[a.indexOf('--permission-mode') + 1], 'default', mode);
+  }
   assert.deepEqual(JSON.parse(userLine('Say "ok"\nplease')), {
     type: 'user',
     message: { role: 'user', content: 'Say "ok"\nplease' },
@@ -42,8 +52,9 @@ test('the chat process is resumed in stream-json mode with an explicit permissio
   });
 });
 
-test('a turn streams in, a tool request is denied with the neutral message, and the result ends it', () => {
+test('a turn streams in, a tool request is denied with the neutral message (decline-prompts mode), and the result ends it', () => {
   const live = new LiveChat();
+  live.decline = DENY_MESSAGE;
   live.addUser('Write hello.txt, then tell me what you did.', false);
   const replies = [];
   let end;
@@ -138,8 +149,9 @@ test('per-turn cost, and what a failed turn says', () => {
   }
 });
 
-test('ExitPlanMode in plan mode is declined the same way, with a note about the plan', () => {
+test('in the decline-prompts mode, ExitPlanMode is declined the same way, with a note about the plan', () => {
   const live = new LiveChat();
+  live.decline = DENY_MESSAGE;
   const r = live.apply({ type: 'control_request', request_id: 'p1', request: { subtype: 'can_use_tool', tool_name: 'ExitPlanMode', input: { plan: 'Step 1' }, tool_use_id: 'toolu_P' } });
   assert.equal(r.reply, denyLine('p1'));
   assert.match(live.pieces[0].text, /^Declined the plan/);
@@ -225,7 +237,7 @@ function makeChat(overrides = {}) {
   let changes = 0;
   const chat = new ClaudeChat({
     sessionId: 'sess-0001',
-    mode: 'default',
+    mode: 'ask',
     launch: () => ({ exe: '/bin/claude', cwd: '/work/demo' }),
     spawn,
     onChange: () => changes++,
@@ -273,8 +285,8 @@ test('one process takes several turns; a message typed during a turn waits for i
   assert.equal(chatStateMessage(chat.status, 'default').last, 'Last turn $0.01 · 1.0s');
 });
 
-test('a can_use_tool request is answered with the deny on stdin', async () => {
-  const { chat, spawns } = makeChat();
+test('in the decline-prompts mode, a can_use_tool request is answered with the deny on stdin', async () => {
+  const { chat, spawns } = makeChat({ mode: 'deny' });
   chat.send('write it');
   await tick();
   const { child } = spawns[0];
@@ -359,9 +371,10 @@ test('ending the chat during a turn lets the reply finish: no interrupt, stdin c
   assert.equal(chat.replying, true);
   assert.equal(chatStateMessage(chat.status, 'default').finishing, true);
 
-  // The finishing turn still has its tool requests answered.
+  // The finishing turn still has its tool requests answered: nobody is left to answer a card, so they are denied.
   child.say({ type: 'control_request', request_id: 'r-1', request: { subtype: 'can_use_tool', tool_name: 'Bash', input: {}, tool_use_id: 'toolu_1' } });
-  assert.deepEqual(child.controls(), [JSON.parse(denyLine('r-1'))]);
+  assert.deepEqual(child.controls(), [JSON.parse(denyLine('r-1', ENDED_DENY_MESSAGE))]);
+  assert.ok(!chat.live.pieces.some((p) => p.kind === 'permission'), 'no card for a chat that has ended');
   await tick();
   assert.equal(exited, false);
 
@@ -534,6 +547,204 @@ test('the pending part shows the message at once, a typing indicator, and the re
   assert.doesNotMatch(html, /chat-typing/);
   live.apply(fixture[15]);
   html = renderLive(live.pieces, false);
-  assert.match(html, /Declined Write/);
+  assert.match(html, /Claude wants to use <strong>Write<\/strong>/, 'a card, by default');
   assert.equal(renderLive([], false), '');
+});
+
+// ---------- permission cards (SA-26) ----------
+
+const readStream = (name) =>
+  fs
+    .readFileSync(path.join(__dirname, 'fixtures', 'claude-stream', name), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+
+test('"Ask me": each request shows a card, answered in order; Allow and Deny reply on stdin and the turn carries on', () => {
+  const events = readStream('permissions.jsonl');
+  const live = new LiveChat();
+  live.addUser('Make the out folder and fix the typo in notes.txt.', false);
+  const firstResult = events.findIndex((e) => e.type === 'user' && Array.isArray(e.message.content) && e.message.content[0]?.type === 'tool_result');
+  const replies = [];
+  for (const ev of events.slice(0, firstResult)) {
+    const r = live.apply(ev);
+    if (r.reply) replies.push(r.reply);
+  }
+  assert.deepEqual(replies, [], 'nothing is answered until the user does');
+  const cards = live.pendingPermissions();
+  assert.deepEqual(cards.map((c) => [c.requestId, c.toolName, c.toolUseId]), [
+    ['req-b1', 'Bash', 'toolu_B1'],
+    ['req-e1', 'Edit', 'toolu_E1'],
+  ]);
+  assert.equal(cards[0].description, 'Create directory out');
+  assert.equal(cards[1].blockedPath, '/work/demo/notes.txt');
+
+  // Only the oldest card has buttons; the next one waits.
+  let html = renderLive(live.pieces, true);
+  assert.equal((html.match(/data-perm="allow"/g) ?? []).length, 1);
+  assert.match(html, /data-perm="allow" data-request="req-b1"/);
+  assert.match(html, /Claude wants to use <strong>Bash<\/strong>/);
+  assert.match(html, /mkdir out/);
+  assert.match(html, /Waiting: answer the request above first/);
+  assert.doesNotMatch(html, /chat-typing/, 'a card, not the typing dots');
+
+  // Out of order, or twice: ignored.
+  assert.equal(live.answer('req-e1', true), undefined);
+  assert.equal(live.answer('nope', true), undefined);
+  const allow = live.answer('req-b1', true);
+  assert.equal(allow, allowLine('req-b1', { command: 'mkdir out', description: 'Create directory out' }));
+  assert.deepEqual(JSON.parse(allow).response, {
+    subtype: 'success',
+    request_id: 'req-b1',
+    response: { behavior: 'allow', updatedInput: { command: 'mkdir out', description: 'Create directory out' } },
+  });
+  assert.equal(live.answer('req-b1', false), undefined, 'already answered');
+  html = renderLive(live.pieces, true);
+  assert.match(html, /data-perm="deny" data-request="req-e1"/);
+  assert.match(html, /perm-outcome allowed/);
+
+  const deny = JSON.parse(live.answer('req-e1', false));
+  assert.deepEqual(deny.response, { subtype: 'success', request_id: 'req-e1', response: { behavior: 'deny', message: USER_DENY_MESSAGE } });
+  assert.doesNotMatch(USER_DENY_MESSAGE, /rest of (this|the) session|do not retry/i, 'never says approvals are gone for good');
+  assert.deepEqual(live.pendingPermissions(), []);
+
+  // The rest of the turn: the allowed call ran, the denied one failed with the message Claude carries on from.
+  let end;
+  for (const ev of events.slice(firstResult)) {
+    const r = live.apply(ev);
+    assert.equal(r.reply, undefined);
+    if (r.turnEnd) end = r.turnEnd;
+  }
+  assert.equal(end.isError, false);
+  const tools = live.pieces.filter((p) => p.kind === 'tool');
+  assert.deepEqual(tools.map((t) => [t.name, t.status]), [
+    ['Bash', 'ok'],
+    ['Edit', 'denied'],
+  ]);
+  // Both outcomes stay visible until the log has the turn, which then shows the tool output and the denial.
+  html = renderLive(live.pieces, false);
+  assert.match(html, /perm-outcome allowed[\s\S]*Allowed/);
+  assert.match(html, /perm-outcome denied[\s\S]*Denied/);
+  live.forget(['p-user-1', 'p-asst-1', 'p-asst-2', 'p-asst-3'].map((u) => `{"uuid":"${u}"}`).join('\n'));
+  assert.deepEqual(live.pieces, []);
+});
+
+test('plan mode: ExitPlanMode shows the plan with Approve plan and Keep planning', () => {
+  const events = readStream('plan.jsonl');
+  for (const approve of [true, false]) {
+    const live = new LiveChat();
+    live.addUser('Plan a greeting module.', false);
+    for (const ev of events) {
+      assert.equal(live.apply(ev).reply, undefined);
+    }
+    const html = renderLive(live.pieces, true);
+    assert.match(html, /Claude has a plan/);
+    assert.match(html, /<strong>greeting<\/strong>/, 'the plan is rendered as markdown');
+    assert.match(html, /Approve plan/);
+    assert.match(html, /Keep planning/);
+    const reply = JSON.parse(live.answer('req-plan', approve));
+    assert.deepEqual(
+      reply.response.response,
+      approve ? { behavior: 'allow', updatedInput: { plan: '## Plan\n\n1. Add a **greeting** module.\n2. Test it.' } } : { behavior: 'deny', message: PLAN_DENY_MESSAGE },
+    );
+    assert.match(renderLive(live.pieces, true), approve ? /Plan approved/ : /Plan not approved/);
+  }
+});
+
+test('a card never hangs the turn: Stop, ending the chat, switching to decline, or the process exiting resolves it', async () => {
+  const ask = (child, id, tool = 'Bash') =>
+    child.say({ type: 'control_request', request_id: id, request: { subtype: 'can_use_tool', tool_name: tool, input: { command: `echo ${id}` }, tool_use_id: `toolu_${id}` } });
+
+  // Stop: every open card is denied, in order, before the interrupt.
+  const a = makeChat();
+  a.chat.send('two calls');
+  await tick();
+  const aChild = a.spawns[0].child;
+  ask(aChild, 'r1');
+  ask(aChild, 'r2');
+  assert.equal(a.chat.status.awaiting, 2);
+  assert.equal(chatStateMessage(a.chat.status, 'ask').awaiting, 2);
+  assert.deepEqual(aChild.controls(), []);
+  a.chat.interrupt();
+  assert.deepEqual(
+    aChild.controls().map((c) => c.response?.request_id ?? c.request.subtype),
+    ['r1', 'r2', 'interrupt'],
+  );
+  assert.ok(aChild.controls().slice(0, 2).every((c) => c.response.response.behavior === 'deny' && c.response.response.message === STOP_DENY_MESSAGE));
+  assert.equal(a.chat.status.awaiting, undefined);
+  assert.match(renderLive(a.chat.live.pieces, true), /Denied\. Stopped before it was answered/);
+  assert.equal(a.chat.answer('r1', true), false, 'too late to answer');
+
+  // The tab closes (end): open cards are denied, the reply finishes, then the process exits.
+  const b = makeChat();
+  b.chat.send('one call');
+  await tick();
+  const bChild = b.spawns[0].child;
+  ask(bChild, 'r1', 'Write');
+  const done = b.chat.end();
+  assert.deepEqual(bChild.controls(), [JSON.parse(denyLine('r1', ENDED_DENY_MESSAGE))]);
+  assert.equal(bChild.ended, false, 'the reply still finishes');
+  bChild.say(result());
+  await done;
+  assert.equal(bChild.ended, true);
+
+  // Window close (dispose) mid-card: denied at once, then the usual grace and interrupt.
+  const c = makeChat();
+  c.chat.send('one call');
+  await tick();
+  const cChild = c.spawns[0].child;
+  ask(cChild, 'r1');
+  const cDone = c.chat.dispose(20, 1000);
+  assert.deepEqual(cChild.controls()[0], JSON.parse(denyLine('r1', ENDED_DENY_MESSAGE)));
+  await cDone;
+  assert.equal(cChild.ended, true);
+
+  // Switching to decline-prompts denies an open card and changes no process; back to "Ask me" asks again.
+  const d = makeChat();
+  d.chat.send('one call');
+  await tick();
+  const dChild = d.spawns[0].child;
+  ask(dChild, 'r1');
+  d.chat.setMode('deny');
+  assert.deepEqual(dChild.controls(), [JSON.parse(denyLine('r1', DENY_MESSAGE))]);
+  ask(dChild, 'r2');
+  assert.deepEqual(dChild.controls().at(-1), JSON.parse(denyLine('r2', DENY_MESSAGE)));
+  d.chat.setMode('ask');
+  ask(dChild, 'r3');
+  assert.equal(dChild.controls().length, 2, 'asks the user again');
+  assert.equal(d.chat.answer('r3', true), true);
+  assert.equal(dChild.controls().at(-1).response.response.behavior, 'allow');
+  dChild.say(result());
+  await tick();
+  await tick();
+  assert.equal(dChild.ended, false, 'same --permission-mode: no restart');
+  assert.equal(d.spawns.length, 1);
+
+  // The process exits with a card open: it is closed, says why, and nothing is written.
+  const e = makeChat();
+  e.chat.send('one call');
+  await tick();
+  const eChild = e.spawns[0].child;
+  ask(eChild, 'r1');
+  eChild.emit('exit', 1, null);
+  assert.equal(e.chat.status.awaiting, undefined);
+  assert.equal(e.chat.status.busy, false);
+  assert.deepEqual(eChild.controls(), []);
+  assert.match(renderLive(e.chat.live.pieces, false), /Denied\. Claude Code exited before it was answered/);
+});
+
+test('a card shows what the call does: the command, the file and its content or diff, or the input', () => {
+  assert.match(permissionDetail('Bash', { command: 'rm -rf <out>' }), /<pre class="perm-pre">rm -rf &lt;out&gt;<\/pre>/);
+  const write = permissionDetail('Write', { file_path: '/work/a.txt', content: Array.from({ length: 30 }, (_, i) => `line ${i + 1}`).join('\n') });
+  assert.match(write, /\/work\/a\.txt/);
+  assert.match(write, /Writes 30 lines/);
+  assert.match(write, /line 12\n… 18 more lines/);
+  const edit = permissionDetail('Edit', { file_path: '/work/b.txt', old_string: 'helo', new_string: 'hello\nworld' });
+  assert.match(edit, /−1 \+2 lines/);
+  assert.match(edit, /- helo\n\+ hello\n\+ world/);
+  assert.match(permissionDetail('MultiEdit', { file_path: '/work/c.txt', edits: [{ old_string: 'a', new_string: 'b' }, { old_string: 'c', new_string: 'd' }] }), /2 edits/);
+  assert.match(permissionDetail('WebFetch', { url: 'https://example.com/x' }), /https:\/\/example\.com\/x/);
+  assert.match(permissionDetail('mcp__thing__do', { target: 'x', count: 2 }), /&quot;target&quot;: &quot;x&quot;/);
+  assert.equal(permissionDetail('Mystery', {}), '');
+  assert.doesNotThrow(() => permissionDetail('Edit', { file_path: 3, old_string: null }));
 });

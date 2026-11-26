@@ -980,6 +980,46 @@ body.has-composer .fab { bottom: calc(var(--composer-h, 110px) + 12px); }
   background: var(--vscode-inputValidation-errorBackground, color-mix(in srgb, var(--red) 12%, transparent));
   border-color: var(--vscode-inputValidation-errorBorder, color-mix(in srgb, var(--red) 45%, transparent));
 }
+/* A permission request: what Claude wants to run, with Allow and Deny on the one waiting. */
+.chat-permission {
+  margin: 8px 0;
+  padding: 9px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--hairline);
+  background: var(--subtle);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.chat-permission.active {
+  border-color: var(--vscode-focusBorder);
+  background: color-mix(in srgb, var(--vscode-focusBorder) 8%, var(--subtle));
+}
+.chat-permission.denied { border-color: color-mix(in srgb, var(--red) 35%, transparent); }
+.perm-head { display: flex; align-items: center; gap: 7px; font-size: 13px; }
+.perm-head .codicon { flex: none; }
+.perm-desc { margin-top: 3px; }
+.perm-sub { margin-top: 3px; color: var(--muted); }
+.perm-path { display: flex; align-items: center; gap: 6px; margin-top: 6px; font-family: var(--vscode-editor-font-family); word-break: break-all; }
+.perm-path .codicon { flex: none; color: var(--muted); }
+.perm-pre {
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  max-height: 260px;
+  overflow: auto;
+  border-radius: 5px;
+  background: var(--vscode-textCodeBlock-background, var(--subtle-2));
+  font-family: var(--vscode-editor-font-family);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.perm-plan { margin-top: 6px; max-height: 360px; overflow: auto; }
+.perm-actions { display: flex; gap: 8px; margin-top: 9px; }
+.perm-actions .btn:disabled { opacity: 0.5; cursor: default; }
+.perm-outcome { display: flex; align-items: center; gap: 6px; margin-top: 8px; color: var(--muted); }
+.perm-outcome.allowed .codicon { color: var(--vscode-testing-iconPassed, var(--vscode-charts-green, #388a34)); }
+.perm-outcome.denied .codicon { color: var(--red); }
+
 .chat-typing { display: inline-flex; gap: 4px; padding: 8px 0; }
 .chat-typing span {
   width: 6px;
