@@ -9,12 +9,12 @@ import { ClaudeChat, isPermissionMode, PermissionMode, resolveClaudeExecutable }
 import { chatModes, chatStateMessage, renderLive } from './chatView';
 import { escapeHtml, formatDateTime, formatTokens, formatUsd } from './format';
 import { collectInsights, editsAsDiff, FileTouch, SessionInsights, TodoStatus } from './insights';
-import { LiveProcess, LiveSessions, liveWarning, renderLiveNotice, RunningTask, runningTasks, tasksOf } from './liveSessions';
+import { LiveProcess, LiveSessions, liveWarning, readRunningTasks, renderLiveNotice, RunningTask, settleWaitingFromDisk, tasksOf } from './liveSessions';
 import { renderMarkdown } from './markdown';
 import { projectName, projectPath, SessionModel } from './model';
 import { parseTranscript, SessionInfo, SubagentRun, TranscriptEntry, TranscriptPart, TurnStats } from './sessionParser';
 import { findSubagentRun, readSubagentRuns } from './sessionStore';
-import { parseTranscriptFor } from './transcripts';
+import { parseTranscriptAndTasks } from './transcripts';
 import { diffBlocks, logSignature } from './transcriptUpdate';
 import { canResumeIn, ContinueTarget, isClaude, NO_FOLDER, sessionKey, SessionSource, SourceInfo, SOURCES, sourceOf } from './sources';
 import { UsageSummary } from './usage';
@@ -534,7 +534,7 @@ export class TranscriptPanels {
       if (elsewhere.length) {
         const log = await fs.readFile(session.filePath, 'utf8').catch(() => '');
         const choice = await vscode.window.showWarningMessage(
-          liveWarning(session.title, elsewhere[0], tasksOf(runningTasks(log), elsewhere[0]), 'Chatting here as well'),
+          liveWarning(session.title, elsewhere[0], tasksOf(await readRunningTasks(log, session.filePath, session.id), elsewhere[0]), 'Chatting here as well'),
           { modal: true },
           'Chat Anyway',
         );
@@ -759,8 +759,9 @@ export class TranscriptPanels {
       } else {
         const subagents = isClaude(session) ? await readSubagentRuns(session.filePath, session.id) : [];
         logText = await fs.readFile(session.filePath, 'utf8');
-        entries = parseTranscriptFor(session, logText, subagents);
-        tab.tasks = isClaude(session) ? runningTasks(logText) : undefined;
+        const read = parseTranscriptAndTasks(session, logText, subagents);
+        entries = read.entries;
+        tab.tasks = read.tasks && (await settleWaitingFromDisk(read.tasks, session.filePath, session.id));
       }
     } catch (err) {
       // A live update that cannot read the log (moved, mid-rewrite) keeps the page as it is.

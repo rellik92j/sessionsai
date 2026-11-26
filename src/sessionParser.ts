@@ -877,6 +877,11 @@ export interface TranscriptOptions {
    * show the main session's follow-up messages as prompts, and its SubagentHandback call as its reply.
    */
   sidechain?: boolean;
+  /**
+   * Called with every parsed record of the log, sidechain ones included, so a caller that needs something else from
+   * the log (what still runs in the background) gets it from the same parse rather than a second one.
+   */
+  onRecord?: (record: any) => void;
 }
 
 /** A message the main session sent a running subagent; logged in the subagent's log as a meta user record. */
@@ -1019,6 +1024,11 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
   const handbackCalls = new Set<string>();
 
   for (const r of records(text)) {
+    try {
+      options.onRecord?.(r);
+    } catch {
+      // A caller's hook that throws must not stop the transcript.
+    }
     if (!r || typeof r !== 'object' || (r.isSidechain && !options.sidechain)) {
       continue;
     }
