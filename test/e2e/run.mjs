@@ -90,6 +90,8 @@ const sandboxSessions = [
   ...chosen,
 ].map((x) => ({ id: x.id, prompt: x.prompt, log: x.log, files: x.files }));
 const s = makeSandbox(sandboxSessions);
+// An area that needs sessions richer than the two-record default writes them here, into the sandbox, before VS Code starts.
+for (const p of chosenAreas.filter((p) => chosen.some((sc) => sc.area === p.area.name))) await p.area.seed?.(s);
 console.log(`Sandbox: ${s.dir}`);
 
 let app;

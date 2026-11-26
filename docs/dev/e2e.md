@@ -96,8 +96,8 @@ page alone cannot.
 
 ## Areas
 
-Scenarios are grouped by what they exercise, one module per area in `test/e2e/scenarios/`: `chat` and `transcript` today, with
-`sidebar`, `resume`, `overview` and `other-tools` to come. The runner finds areas by file name, so an
+Scenarios are grouped by what they exercise, one module per area in `test/e2e/scenarios/`: `chat`, `transcript` and
+`sidebar` today, with `resume`, `overview` and `other-tools` to come. The runner finds areas by file name, so an
 area's name is its file name and no list needs editing. Two people adding scenarios to different areas never touch the
 same file. Shared steps (`openTranscript`, `chatHere`, `send`, `click`, `sidebarMenu`, `modal`, `assert`, `waitFor`,
 `waitEvent`, ...) live in `harness.mjs`; a helper only one area uses stays in that area's module.
@@ -121,6 +121,13 @@ A scenario (or an area session) that needs a log of its own shape gives `log: ({
 `files: ({ id, cwd }) => ({ '<path relative to the project folder>': text })` for files beside it, such as a subagent's
 log. The sandbox writes them before VS Code starts. `transcript.mjs` builds its logs with a small `Log` class and keeps
 each one by session id, so a scenario can append records to the log of an open session.
+
+An area that needs sessions in several project folders, or another tool's log, exports `seed(s)`, which the runner
+calls with the sandbox right after it is made and before VS Code starts, to write them. Use `log` and `files` for a
+session in the default project folder whose log has a particular shape; use `seed(s)` for anything beyond that (the
+`sidebar` area seeds two projects and a Copilot CLI session). Seeded sessions show beside every other area's, so the
+`sidebar` scenarios find theirs by id and ignore every other card, and a scenario that changes shared state (grouping,
+filters, the search box, tabs) puts it back, so the next one starts clean.
 
 Scenario names stay unique across areas, since `--only` and the failure screenshots use them. Session ids are numbered
 over every area, so a scenario's session does not change with the areas chosen.
@@ -166,6 +173,24 @@ Area `transcript`, `test/e2e/scenarios/transcript.mjs`, reading a session as a c
 | `transcript-prompt-cost` | Each prompt shows `$0.10 · 2m` style cost and duration beside it, and the details panel's prompts show the same figures. |
 | `transcript-live-update` | Records appended to an open session's log appear in the tab in place (the page is not rebuilt, the reader's scroll stays), the new-messages dot shows when scrolled up and clears on Jump to latest, and at the bottom the page follows along. |
 | `transcript-other-branch` | A reply appended to the log from a second writer, parented on the first answer, shows in place with the "other branch" pill, under the question it answers. |
+
+Area `sidebar`, `test/e2e/scenarios/sidebar.mjs`. Its sessions are synthetic and seeded: four Claude Code sessions in two
+projects (`alpha-api`, two sessions minutes old, one with an edit, a skill, a commit, a pull request, an agent and a
+cost; `beta-web`, three and forty days old) and one Copilot CLI session in `beta-web`. Four plain sessions open in tabs.
+
+| Name | What it checks |
+|---|---|
+| `sidebar-groups-by-project` | Projects are groups with an avatar of their initials, their folder, a count and their sessions newest first; a header folds and unfolds its cards. |
+| `sidebar-groups-by-date` | Recent puts each session under its date group (Today, Yesterday, Previous 7 Days, ...), in order, and the cards name their project. |
+| `sidebar-workspace-filter` | Workspace leaves only the sessions started in the open folder, and turns off again. |
+| `sidebar-source-chips` | A chip per tool with its count, and All; the window starts on Claude Code; adding Copilot CLI shows it, with a tag naming each card's tool; with everything on, a click shows just that tool. |
+| `sidebar-card-details` | A card shows its title, latest prompt, agent, tool, branch, prompt count, pull request and cost; a plain session shows none of the optional ones; hovering shows the quick actions. |
+| `sidebar-search-words` | Words in any case, an exact phrase (with the matching passage and its highlight), `-` exclusion, `OR`, file paths searched and tool output not, the no-matches message, the summary. |
+| `sidebar-search-filters` | `source:`, `file:`, `skill:`, `has:commits`, `has:pr`, `has:edits` and their `-` forms, and a filter with a word. |
+| `sidebar-search-help` | The ? button lists the filters, clicking one adds it to the box; Escape, the clear button and `/` behave. |
+| `sidebar-click-opens-preview-tab` | A click opens a transcript in the preview tab (which offers Keep open) and the next click replaces it. |
+| `sidebar-double-click-keeps-tab` | A double-click gives the session a tab of its own; the next clicks use one preview tab beside it. |
+| `sidebar-keep-open-button` | Keep open in the transcript does the same. |
 
 ## Writing a scenario
 

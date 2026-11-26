@@ -20,7 +20,7 @@ const CLAUDE_CODE_STUB = path.join(ROOT, 'test', 'e2e', 'claude-code-stub');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** Claude Code's folder name for a project: every character that is not a letter or digit becomes '-'. */
-const projectDirName = (cwd) => cwd.replace(/[^a-zA-Z0-9]/g, '-');
+export const projectDirName = (cwd) => cwd.replace(/[^a-zA-Z0-9]/g, '-');
 
 /** A synthetic session id; `n` keeps them apart. */
 export const sessionIdFor = (n) => `e2e00000-0000-4000-8000-${String(n).padStart(12, '0')}`;
