@@ -375,8 +375,8 @@ test('bundled extension activates, fills the sidebar, and renders a transcript',
     const box = composerData(state.panels[0].webview.html);
     assert.equal(box.target, 'here', 'Chat here by default, for a Claude Code session');
     assert.deepEqual(box.targets.map((t) => [t.id, t.same]), [['here', true], ['claude', true], ['copilot-cli', false], ['vscode-chat', false]]);
-    assert.deepEqual(box.chat.modes.map((m) => m.id), ['default', 'acceptEdits', 'plan', 'auto']);
-    assert.equal(box.chat.mode, 'default');
+    assert.deepEqual(box.chat.modes.map((m) => m.id), ['ask', 'acceptEdits', 'plan', 'auto', 'deny']);
+    assert.equal(box.chat.mode, 'ask', '"Ask me" by default');
     assert.match(state.panels[0].webview.html, /id="chat-live"/);
     assert.match(state.panels[0].webview.html, /id="chat-mode"/);
     assert.equal(box.context, 0);
@@ -1816,6 +1816,151 @@ setInterval(() => {}, 1000);
     assert.ok(interrupted(child), 'then interrupted');
     assert.ok(spawned.every((c) => !alive(c)), 'no chat process outlives the window');
     assert.deepEqual(state.terminals, []);
+    assert.deepEqual(state.errors, []);
+  } finally {
+    cp.spawn = realSpawn;
+    for (const c of spawned) {
+      if (alive(c)) c.kill();
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Chat here: permission cards are answered from the tab in order, and Stop or closing the tab denies an open one', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-sessions-chat-'));
+  const projectsDir = path.join(root, 'claude');
+  const repo = path.join(root, 'repo');
+  const ID = '9f9f9f9f-1111-4222-8333-944455556666';
+  const log = path.join(projectsDir, 'C--repo', `${ID}.jsonl`);
+  // A stand-in for claude.exe that records every stdin line. A message naming N calls asks permission for N tool calls
+  // at once and holds the turn until every request is answered (or interrupted), as Claude Code does.
+  const standIn = path.join(root, 'stand-in.js');
+  fs.writeFileSync(
+    standIn,
+    `const fs = require('fs');
+const stdinLog = ${JSON.stringify(root)} + '/stdin-' + process.pid + '.log';
+let buf = '';
+let seq = 0;
+let open = null;
+const out = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
+const result = (extra) => out({ type: 'result', subtype: 'success', is_error: false, result: 'ok', duration_ms: 5, ...extra });
+process.stdin.on('data', (d) => {
+  buf += d;
+  let i;
+  while ((i = buf.indexOf('\\n')) >= 0) {
+    const line = buf.slice(0, i);
+    buf = buf.slice(i + 1);
+    fs.appendFileSync(stdinLog, line + '\\n');
+    const msg = JSON.parse(line);
+    if (msg.type === 'user') {
+      const n = Number((/(\\d) calls/.exec(msg.message.content) || [])[1] || 0);
+      open = new Set();
+      for (let k = 0; k < n; k++) {
+        const id = 'q' + ++seq;
+        open.add(id);
+        out({ type: 'control_request', request_id: id, request: { subtype: 'can_use_tool', tool_name: 'Bash', input: { command: 'echo ' + id }, description: 'Run ' + id, tool_use_id: 'toolu_' + id } });
+      }
+      if (!n) { open = null; result(); }
+    } else if (msg.type === 'control_response' && open) {
+      open.delete(msg.response.request_id);
+      if (!open.size) { open = null; result(); }
+    } else if (msg.type === 'control_request' && msg.request.subtype === 'interrupt' && open) {
+      open = null;
+      result({ subtype: 'error_during_execution', is_error: true, terminal_reason: 'aborted_streaming' });
+    }
+  }
+});
+process.stdin.on('end', () => setTimeout(() => process.exit(0), 100));
+setInterval(() => {}, 1000);
+`,
+  );
+  const cp = require('child_process');
+  const realSpawn = cp.spawn;
+  const spawned = [];
+  cp.spawn = (exe, args, opts) => {
+    if (exe !== process.execPath || !args.includes('--input-format')) {
+      return realSpawn(exe, args, opts);
+    }
+    const child = realSpawn(process.execPath, [standIn], opts);
+    spawned.push(Object.assign(child, { args }));
+    return child;
+  };
+  const alive = (child) => child.exitCode === null && child.signalCode === null;
+  const answers = (child) => {
+    const file = path.join(root, `stdin-${child.pid}.log`);
+    const lines = fs.existsSync(file) ? fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : [];
+    return lines
+      .filter((m) => m.type !== 'user')
+      .map((m) => (m.type === 'control_request' ? m.request.subtype : `${m.response.request_id}:${m.response.response.behavior}:${m.response.response.message ?? ''}`));
+  };
+  try {
+    fs.mkdirSync(repo);
+    writeSession(path.dirname(log), ID, [
+      { type: 'user', message: { content: 'Start the card test' }, cwd: repo, uuid: 'c-1', timestamp: new Date().toISOString() },
+      { type: 'assistant', message: { id: 'm1', content: [{ type: 'text', text: 'Ready.' }] }, uuid: 'c-2', timestamp: new Date().toISOString() },
+    ]);
+    const old = new Date(Date.now() - 60_000);
+    fs.utimesSync(log, old, old);
+    const state = {
+      projectsDir,
+      config: { copilotDir: path.join(root, 'none'), vscodeUserDir: path.join(root, 'none'), claudeCommand: process.execPath },
+      providers: {},
+      commands: {},
+      panels: [],
+      panelPosts: [],
+      errors: [],
+      terminals: [],
+      infos: [],
+    };
+    await activateWithSidebar(state);
+    await state.commands['claudeSessions.openTranscript']({ sessionKey: `claude:${ID}` });
+    const panel = state.panels[0];
+    const posted = (type) => state.panelPosts.filter((m) => m.type === type);
+    const lastLive = () => posted('chatLive').at(-1)?.html ?? '';
+    const chatSend = async (text) => {
+      state.panelPosts.length = 0;
+      await panel.onMessage({ command: 'chatSend', text });
+      assert.ok(posted('sent').length, `sent: ${text}`);
+    };
+    const answer = (requestId, allow) => panel.onMessage({ command: 'chatPermission', requestId, allow });
+
+    // "Ask me" (the default): two requests at once show two cards; only the first can be answered.
+    await chatSend('Run 2 calls');
+    await waitFor(() => /data-perm="allow" data-request="q1"/.test(lastLive()) && /data-request="q2"/.test(lastLive()), 'two cards');
+    const child = spawned[0];
+    assert.equal(child.args[child.args.indexOf('--permission-mode') + 1], 'default');
+    assert.match(lastLive(), /Claude wants to use <strong>Bash<\/strong>[\s\S]*echo q1/);
+    assert.match(lastLive(), /Waiting: answer the request above first/);
+    await waitFor(() => posted('chatState').at(-1)?.awaiting === 2, 'the chat bar to wait for an answer');
+    assert.deepEqual(answers(child), [], 'nothing answered yet: the turn waits');
+    await answer('q2', true);
+    await new Promise((r) => setTimeout(r, 50));
+    assert.deepEqual(answers(child), [], 'the second card cannot jump the first');
+    await answer('q1', true);
+    await waitFor(() => /data-perm="deny" data-request="q2"/.test(lastLive()), 'the second card to become answerable');
+    await answer('q2', false);
+    await waitFor(() => posted('chatState').at(-1)?.busy === false, 'the turn to end');
+    assert.deepEqual(answers(child), ['q1:allow:', 'q2:deny:The user declined this tool call. Carry on without it, or ask the user if you need it.']);
+    assert.match(lastLive(), /Allowed[\s\S]*Denied/);
+
+    // Stop with two cards open: both denied, then the interrupt; the process stays for the next turn.
+    await chatSend('Run 2 calls again');
+    await waitFor(() => /data-request="q3"/.test(lastLive()) && /data-request="q4"/.test(lastLive()), 'two more cards');
+    await panel.onMessage({ command: 'chatStop' });
+    await waitFor(() => posted('chatState').at(-1)?.busy === false, 'the stopped turn to end');
+    assert.deepEqual(answers(child).slice(2).map((a) => a.split(':').slice(0, 2).join(':')), ['q3:deny', 'q4:deny', 'interrupt']);
+    assert.match(answers(child)[2], /stopped the turn before answering/);
+    assert.ok(alive(child));
+
+    // Closing the tab with a card open: denied at once, the reply finishes, and the process exits.
+    await chatSend('Run 1 calls');
+    await waitFor(() => /data-request="q5"/.test(lastLive()), 'a card');
+    panel.dispose();
+    await waitFor(() => !alive(child), 'the process to exit after the tab closed');
+    assert.match(answers(child).at(-1), /^q5:deny:Not approved: the chat was closed/);
+    assert.equal(answers(child).length, 6, 'the reply was let finish, not interrupted');
+    await require(path.join(process.env.EXT_DIR || path.join(__dirname, '..'), 'dist', 'extension.js')).deactivate();
+    assert.ok(spawned.every((c) => !alive(c)));
     assert.deepEqual(state.errors, []);
   } finally {
     cp.spawn = realSpawn;

@@ -71,6 +71,7 @@ const SESSION_ACTIONS = new Set([
   'chatStop',
   'chatMode',
   'chatEnd',
+  'chatPermission',
 ]);
 
 /** Where the message box can send: a tool, or "Chat here" in the transcript tab itself (Claude Code only). */
@@ -201,7 +202,7 @@ export class TranscriptPanels {
       retainContextWhenHidden: true,
       localResourceRoots: [this.codiconsUri, this.mediaUri],
     });
-    const tab: TranscriptTab = { panel, session, highlight, preview, run, queue: Promise.resolve(), chatMode: 'default' };
+    const tab: TranscriptTab = { panel, session, highlight, preview, run, queue: Promise.resolve(), chatMode: 'ask' };
     if (preview) {
       this.preview = tab;
     } else {
@@ -291,6 +292,12 @@ export class TranscriptPanels {
           break;
         case 'chatEnd':
           await this.endTabChat(tab);
+          break;
+        case 'chatPermission':
+          // Allow or Deny on a permission card. An answer to a card that is no longer the open one changes nothing.
+          if (typeof msg.requestId === 'string' && !(tab.chat ?? tab.ending)?.answer(msg.requestId, msg.allow === true)) {
+            this.postChat(tab);
+          }
           break;
         case 'copyId':
         case 'openRawFile':
