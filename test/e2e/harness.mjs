@@ -6,7 +6,7 @@
 // The user's own VS Code, settings and ~/.claude are never read or written, and the real claude CLI is never run: the
 // chat starts the stand-in (SESSIONSAI_E2E_CLAUDE) and Resume's terminal runs a stub that only records it was called.
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync, existsSync } from 'node:fs';
+import { copyFileSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync, existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -102,14 +102,32 @@ export function makeSandbox(sessions) {
     writeFileSync(file, records.map((r) => JSON.stringify(r)).join('\n') + '\n');
     utimesSync(file, new Date(dayAgo), new Date(dayAgo));
   }
-  // Resume runs `<claudeCommand> --resume <id>` in a terminal. This stub stands in for claude there: it records the
-  // call in the events file and does nothing else.
+  // Resume runs `<claudeCommand> --resume <id>` in a terminal, and Continue, Send and New session start the command as
+  // the terminal's own process with their arguments. This stub stands in for claude there: it records the call (the
+  // arguments one by one, so a multi-line handoff arrives whole, and the folder it started in) in the events file and
+  // does nothing else. It is a Node script, because a .cmd file cannot take a multi-line argument.
+  const stubScript = path.join(s.bin, 'terminal-stub.mjs');
+  writeFileSync(
+    stubScript,
+    `import { appendFileSync } from 'node:fs';\n` +
+      `const argv = process.argv.slice(2);\n` +
+      `appendFileSync(${JSON.stringify(s.events)}, JSON.stringify({ t: Date.now(), event: 'terminal-resume', args: argv.join(' '), argv, cwd: process.cwd() }) + '\\n');\n` +
+      `console.log('stand-in claude terminal', argv.join(' ').slice(0, 200));\n`,
+  );
   if (process.platform === 'win32') {
-    s.terminalStub = path.join(s.bin, 'claude-terminal.cmd');
-    writeFileSync(s.terminalStub, `@echo off\r\necho stand-in claude terminal %*\r\necho {"event":"terminal-resume","args":"%*"}>>"${s.events}"\r\n`);
+    // Windows cannot run a script as a program, so the command is a copy of node.exe next to it (a hard link when the
+    // volume allows) followed by the script. claudeCommand is split on whitespace unless it is a path that exists, so
+    // neither path may contain a space (the sandbox is in the temp folder, which does not).
+    const exe = path.join(s.bin, 'claude-terminal.exe');
+    try {
+      linkSync(process.execPath, exe);
+    } catch {
+      copyFileSync(process.execPath, exe);
+    }
+    s.terminalStub = `${exe} ${stubScript}`;
   } else {
     s.terminalStub = path.join(s.bin, 'claude-terminal');
-    writeFileSync(s.terminalStub, `#!/bin/sh\necho "stand-in claude terminal $*"\necho "{\\"event\\":\\"terminal-resume\\",\\"args\\":\\"$*\\"}" >> '${s.events}'\n`, { mode: 0o755 });
+    writeFileSync(s.terminalStub, `#!/bin/sh\nexec "${process.execPath}" "${stubScript}" "$@"\n`, { mode: 0o755 });
   }
   const settings = {
     // Modals and menus drawn in the page, so Playwright can see and click them.
