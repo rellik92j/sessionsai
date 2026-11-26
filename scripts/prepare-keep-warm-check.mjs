@@ -152,8 +152,8 @@ All commands below are for PowerShell.
 ${rule}
 Before you start (once)
 ${rule}
-1. ${prText} must be merged first. It adds scripts/show-session-cache.mjs, which the steps below use
-   to read a session's cache numbers.
+1. ${prText} must be merged first.
+   It adds scripts/show-session-cache.mjs, which the steps below use to read a session's cache numbers.
 
 2. Bring the main checkout up to date and compile it. trial-keep-warm.mjs loads out/claudeChat.js, which only
    exists after a compile. The main checkout is on main:
