@@ -14,6 +14,8 @@ import { fileURLToPath } from 'node:url';
 export const ROOT = path.resolve(fileURLToPath(new URL('../..', import.meta.url)));
 export const OUT = path.join(ROOT, '.e2e-out');
 const STAND_IN = path.join(ROOT, 'test', 'e2e', 'stand-in-claude.mjs');
+/** Stands in for the Claude Code extension, so "Open in Claude Code Chat" is offered; it only records being asked. */
+const CLAUDE_CODE_STUB = path.join(ROOT, 'test', 'e2e', 'claude-code-stub');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -99,6 +101,8 @@ export function makeSandbox(sessions) {
     'claudeSessions.copilotDir': s.copilot,
     'claudeSessions.vscodeUserDir': s.vscodeUser,
     'claudeSessions.claudeCommand': s.terminalStub,
+    // The transcript's Resume and Open in chat buttons keep the tab open, so a scenario can see what is left in it.
+    'claudeSessions.closeTranscriptOnResume': false,
   };
   mkdirSync(path.join(s.userData, 'User'), { recursive: true });
   writeFileSync(path.join(s.userData, 'User', 'settings.json'), JSON.stringify(settings, null, 2));
@@ -135,6 +139,7 @@ export async function launch(s) {
     args: [
       s.work,
       `--extensionDevelopmentPath=${ROOT}`,
+      `--extensionDevelopmentPath=${CLAUDE_CODE_STUB}`,
       `--user-data-dir=${s.userData}`,
       `--extensions-dir=${s.extensions}`,
       '--new-window',

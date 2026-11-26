@@ -8,7 +8,8 @@
 // by SESSIONSAI_E2E_EVENTS, which the harness reads to check what the process saw.
 //
 // Scripts, picked by the first matching word in the user's message:
-//   "permission"  a Bash call that asks for permission (can_use_tool); the reply depends on Allow or Deny
+//   "permission"  a Bash call that asks for permission (can_use_tool); the reply depends on Allow or Deny, and with
+//                 "slowly" in the message as well, it goes on for REPLY_LINES more lines after the answer
 //   anything else a slow reply: REPLY_LINES lines, one every LINE_MS
 // An interrupt control request stops either script where it is, as Claude Code does.
 
@@ -185,7 +186,7 @@ async function slowReply(started, n) {
   note('turn-end', { how: 'completed' });
 }
 
-async function permissionReply(started, n) {
+async function permissionReply(started, n, slowly) {
   const messageId = `msg_e2e_${n}a`;
   const toolUseId = `toolu_e2e_${n}`;
   const requestId = `req-e2e-${n}`;
@@ -217,6 +218,10 @@ async function permissionReply(started, n) {
   const second = `msg_e2e_${n}b`;
   stream({ type: 'message_start', message: { id: second, role: 'assistant', model: MODEL, content: [] } }, second);
   const lines = allowed ? ['The command ran', 'and printed the word stand-in.'] : ['The command was declined,', 'so I am carrying on without it.'];
+  if (slowly) {
+    // Long enough after the answer for a scenario to act while the reply is still going.
+    lines.push(...Array.from({ length: REPLY_LINES }, (_, i) => `Afterthought ${i + 1} of the stand-in reply.`));
+  }
   const { text, cut } = await streamText(second, 0, lines);
   if (cut) {
     return interrupted(started, second, text);
@@ -238,7 +243,7 @@ async function runTurn(text) {
   await sleep(150);
   out({ type: 'user', message: { role: 'user', content: text }, session_id: sessionId, parent_tool_use_id: null, uuid, timestamp: now(), isReplay: true });
   if (/permission/i.test(text)) {
-    await permissionReply(started, n);
+    await permissionReply(started, n, /slowly/i.test(text));
   } else {
     await slowReply(started, n);
   }

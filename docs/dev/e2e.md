@@ -10,7 +10,7 @@ It is local and opt-in. It is not part of `npm test` or of the `test` CI check, 
 ## Running it
 
 ```
-npm run test:e2e                      # every scenario, about a minute after the first run
+npm run test:e2e                      # every scenario, about three minutes after the first run
 npm run test:e2e -- stop permission   # only scenarios whose name contains one of the words
 ```
 
@@ -39,6 +39,12 @@ Windows is where it has been run. The harness has a POSIX terminal stub too, but
   and there is no setting for it.
 - **Resume's terminal** runs `claudeSessions.claudeCommand`, which the sandbox sets to a stub script that only appends
   a `terminal-resume` line to the events file.
+- **The Claude Code extension** is `test/e2e/claude-code-stub/`, loaded as a second `--extensionDevelopmentPath` with
+  the id `anthropic.claude-code`, so SessionsAI offers Open in Claude Code Chat (sidebar menu and the transcript's
+  "Open in chat" button). Its `claude-vscode.editor.open` command only appends a `claude-code-open` line (with the
+  session id) to the events file; it opens nothing.
+- `claudeSessions.closeTranscriptOnResume` is off, so the transcript tab stays open after its Resume or Open in chat
+  button, and a scenario can check what is left in it.
 - `window.dialogStyle`, `window.titleBarStyle` and `window.menuStyle` are `custom`, so the modals and the sidebar's
   context menu are drawn in the page, where Playwright can see and click them.
 
@@ -53,7 +59,7 @@ Each user message plays a script, picked by a word in it:
 
 | Message contains | What happens |
 |---|---|
-| `permission` | A Bash call, then a `can_use_tool` control request. It waits for the answer: Allow logs a tool result and "The command ran…"; Deny logs the error result with the extension's deny message and "…carrying on without it." |
+| `permission` | A Bash call, then a `can_use_tool` control request. It waits for the answer: Allow logs a tool result and "The command ran…"; Deny logs the error result with the extension's deny message and "…carrying on without it." With `slowly` in the message as well, 12 more lines follow the answer, one every 450 ms, so a scenario can act while that reply runs. |
 | anything else | A slow reply: 12 lines, one every 450 ms, streamed as `text_delta`s. |
 
 An `interrupt` control request stops either script where it is: the partial text and a `[Request interrupted by
@@ -62,8 +68,9 @@ running turn finishes and then the process exits, as the real CLI does.
 
 It writes what happened to it to the events file (`SESSIONSAI_E2E_EVENTS`), one JSON line each: `start`,
 `turn-start`, `permission-asked`, `permission-answered` (with `behavior` and `message`), `interrupt`, `turn-end`
-(`how`: `completed` or `interrupted`), `stdin-end`, `exit`. Scenarios assert on these, because they show what the
-process actually saw, which the page alone cannot.
+(`how`: `completed` or `interrupted`), `stdin-end`, `exit`. The terminal stub adds `terminal-resume` and the Claude
+Code stub `claude-code-open`. Scenarios assert on these, because they show what the process actually saw, which the
+page alone cannot.
 
 ## The scenarios
 
@@ -79,6 +86,13 @@ process actually saw, which the page alone cannot.
 | `close-tab-mid-reply` | Closing the transcript tab during the reply lets it finish (no interrupt, whole reply in the log), then stdin closes and the process exits. |
 | `resume-while-replying-wait` | Right-click the session in the sidebar, Resume Session: the "still replying" modal shows; Wait for the Reply lets the reply finish, the process exits, and only then does the terminal start. |
 | `resume-while-replying-stop` | The same modal; Stop It Now interrupts the reply, the process exits, then the terminal starts. |
+| `waiting-message-enter` | End chat mid-reply, then send with Enter: the box empties, the message shows below the reply with the "waits for the previous reply to finish" pill, and the bar says it starts a new chat after it. A second message makes it "Your 2 messages…". Once the reply ends and the process exits, one new chat gets both, in order, and the pills go. |
+| `waiting-message-queue-button` | While the ended chat finishes, the Send button reads Queue; sending with it waits and goes to the new chat as above. |
+| `waiting-message-stop` | Stop on the finishing reply with a message waiting: the reply is interrupted and the message goes to a new chat at once. |
+| `waiting-message-below-denied-card` | End chat at an open permission card, then send: the card shows as denied with no Allow/Deny buttons, the waiting message sits below it, and it goes to a new chat after the reply. |
+| `waiting-message-tab-closed` | Close the tab with a message waiting: the reply finishes, and no new chat starts. |
+| `waiting-message-{sidebar,topbar}-{resume,open-chat}-{wait,stop}` | With a message waiting, Resume Session or Open in Claude Code Chat, from the sidebar's right-click menu or the transcript's top bar, then Wait for the Reply or Stop It Now in the modal: the message goes back to the box, no new chat starts, and the terminal (or the Claude Code chat stub) opens only after the process has exited. Eight scenarios. |
+| `queued-not-waiting` | A second message in a chat that was not ended shows the usual "queued" pill, not the waiting one, and goes to the same process. |
 
 ## Writing a scenario
 

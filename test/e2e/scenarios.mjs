@@ -96,6 +96,107 @@ function assert(ok, message) {
   if (!ok) throw new Error(message);
 }
 
+// ---------- a message sent while an ended chat finishes its reply ----------
+
+const WAITING_PILL = 'waits for the previous reply to finish';
+const composerText = async (ctx) => (await transcript(ctx)).$eval('#composer-input', (el) => el.value);
+const sendLabel = async (ctx) => (await transcript(ctx)).$eval('#composer-send span', (el) => el.textContent || '');
+/** The text of each message in the pending part marked as waiting for the ended chat. */
+const waitingShown = async (ctx) => (await transcript(ctx)).$$eval('#chat-live .chat-pending.waiting', (els) => els.map((el) => el.textContent || ''));
+
+/** Starts a slow reply in Chat here and presses End chat during it; returns once the bar says it is finishing. */
+async function endMidReply(ctx) {
+  const frame = await openTranscript(ctx);
+  await chatHere(frame);
+  await send(frame, 'Tell me twelve lines.');
+  await midReply(ctx);
+  await click(ctx, '#chat-end');
+  await waitFor('the chat bar to say the reply is finishing', async () => /Chat ended: Claude is finishing/.test(await chatState(ctx)), 5_000);
+}
+
+/** Sends `text` while the ended chat finishes (Enter, or the Send button); waits until the box has emptied and the message shows as waiting. */
+async function sendWhileFinishing(ctx, text, { button = false } = {}) {
+  const frame = await transcript(ctx);
+  if (button) {
+    await frame.fill('#composer-input', text);
+    await frame.click('#composer-send');
+  } else {
+    await send(frame, text);
+  }
+  await waitFor(`"${text}" to show as waiting`, async () => (await waitingShown(ctx)).some((t) => t.includes(text) && t.includes(WAITING_PILL)), 5_000);
+  await waitFor('the message box to empty', async () => (await composerText(ctx)) === '', 5_000);
+  assert(!events(ctx.s, ctx.id).some((e) => e.event === 'exit'), 'the ended chat had already exited: the stand-in reply is too quick for this check');
+}
+
+/** The messages that started turns after the first chat process had exited, in order. */
+function turnsAfterExit(ctx) {
+  const ev = events(ctx.s, ctx.id);
+  const exit = ev.find((e) => e.event === 'exit');
+  return exit ? ev.filter((e) => e.event === 'turn-start' && e.i > exit.i).map((e) => e.text) : [];
+}
+
+/** Waits until the first chat process has exited and a new one has started a turn for each of `texts`, in order. */
+async function newChatGets(ctx, texts, timeout = 30_000) {
+  const exit = await waitEvent(ctx.s, ctx.id, 'exit', undefined, 30_000);
+  await waitFor(`a new chat to get ${texts.map((t) => `"${t}"`).join(', ')}`, () => turnsAfterExit(ctx).length >= texts.length, timeout);
+  const got = turnsAfterExit(ctx);
+  assert(JSON.stringify(got) === JSON.stringify(texts), `the new chat got ${JSON.stringify(got)}, not ${JSON.stringify(texts)}`);
+  const starts = events(ctx.s, ctx.id).filter((e) => e.event === 'start');
+  assert(starts.length === 2 && starts[1].i > exit.i, `expected one new chat process after the first had exited, saw ${starts.length} starts`);
+  assert(!events(ctx.s, ctx.id).some((e) => e.event === 'turn-start' && texts.includes(e.text) && e.i < exit.i), 'a waiting message reached the ended chat');
+  await waitFor('the waiting marker to go away', async () => (await waitingShown(ctx)).length === 0, 10_000);
+}
+
+/**
+ * Checks that the message never went anywhere. Nothing happens when it works, so this has to give a wrongly started
+ * chat time to show up (a new stand-in records `start` within about a second of being spawned) before looking.
+ */
+async function neverSent(ctx, text) {
+  await new Promise((r) => setTimeout(r, 3_000));
+  const ev = events(ctx.s, ctx.id);
+  assert(ev.filter((e) => e.event === 'start').length === 1, 'a new chat started');
+  assert(!ev.some((e) => e.event === 'turn-start' && e.text === text), `"${text}" was sent`);
+}
+
+/**
+ * Resume or Open in Claude Code Chat, from the sidebar's right-click menu or the transcript's top bar, while a message
+ * waits for the ended chat: the "still replying" modal, then Wait for the Reply or Stop It Now. The waiting message
+ * goes back to the box and no new chat starts; the session opens elsewhere once the chat process has exited.
+ */
+function letGoWhileWaiting({ name, prompt, from, open, choice }) {
+  const terminal = open === 'resume';
+  return {
+    name,
+    prompt,
+    async run(ctx) {
+      const text = `Hold this until the old chat is done (${name}).`;
+      await endMidReply(ctx);
+      await sendWhileFinishing(ctx, text);
+      if (from === 'sidebar') {
+        await sidebarMenu(ctx, terminal ? 'Resume Session' : 'Open in Claude Code Chat');
+      } else {
+        await click(ctx, terminal ? '[data-cmd="resume"]' : '[data-cmd="openInClaudeCode"]');
+      }
+      const box = await modal(ctx, 'Claude is still replying');
+      await box.locator('.monaco-button', { hasText: choice === 'wait' ? 'Wait for the Reply' : 'Stop It Now' }).click();
+      await waitFor('the waiting message to come back to the box', async () => (await composerText(ctx)) === text, 5_000);
+      assert((await waitingShown(ctx)).length === 0, 'the message still shows as waiting after going back to the box');
+      if (choice === 'wait') {
+        await waitEvent(ctx.s, ctx.id, 'turn-end', (e) => e.how === 'completed', 30_000);
+        assert(!events(ctx.s, ctx.id).some((e) => e.event === 'interrupt'), 'Wait for the Reply interrupted it');
+      } else {
+        await waitEvent(ctx.s, ctx.id, 'interrupt', undefined, 5_000);
+        await waitEvent(ctx.s, ctx.id, 'turn-end', (e) => e.how === 'interrupted', 5_000);
+      }
+      const exit = await waitEvent(ctx.s, ctx.id, 'exit', undefined, 10_000);
+      const opened = await waitEvent(ctx.s, ctx.id, terminal ? 'terminal-resume' : 'claude-code-open', undefined, 20_000);
+      assert(exit.i < opened.i, `the session opened ${terminal ? 'in the terminal' : 'in the Claude Code chat'} before the chat process had exited`);
+      await neverSent(ctx, text);
+      assert((await composerText(ctx)) === text, 'the message left the box again');
+    },
+  };
+}
+
 // ---------- the scenarios ----------
 
 export const SCENARIOS = [
@@ -236,6 +337,131 @@ export const SCENARIOS = [
       const term = await waitEvent(ctx.s, ctx.id, 'terminal-resume', undefined, 20_000);
       assert(exit.i < term.i, 'the terminal started before the chat process had exited');
       assert(!logText(ctx.s, ctx.id).includes(LAST_LINE), 'the reply ran to the end after Stop It Now');
+    },
+  },
+  {
+    name: 'waiting-message-enter',
+    prompt: 'E2E send while the ended chat finishes',
+    async run(ctx) {
+      const first = 'First message for the new chat.';
+      const second = 'Second message for the new chat.';
+      await endMidReply(ctx);
+      await sendWhileFinishing(ctx, first);
+      await waitFor('the chat bar to say the message starts a new chat', async () => /Your message starts a new chat after it/.test(await chatState(ctx)), 5_000);
+      await sendWhileFinishing(ctx, second);
+      await waitFor('the chat bar to count 2 messages', async () => /Your 2 messages start a new chat after it/.test(await chatState(ctx)), 5_000);
+      const shown = await waitingShown(ctx);
+      assert(shown.length === 2 && shown[0].includes(first) && shown[1].includes(second), `the waiting messages show as ${JSON.stringify(shown)}`);
+      await waitEvent(ctx.s, ctx.id, 'turn-end', (e) => e.how === 'completed', 30_000);
+      assert(!events(ctx.s, ctx.id).some((e) => e.event === 'interrupt'), 'sending while it finished interrupted the reply');
+      await newChatGets(ctx, [first, second]);
+    },
+  },
+  {
+    name: 'waiting-message-queue-button',
+    prompt: 'E2E queue with the button while the ended chat finishes',
+    async run(ctx) {
+      const text = 'Queued with the button for the new chat.';
+      await endMidReply(ctx);
+      await waitFor('the Send button to read Queue', async () => (await sendLabel(ctx)) === 'Queue', 5_000);
+      await sendWhileFinishing(ctx, text, { button: true });
+      await waitFor('the chat bar to say the message starts a new chat', async () => /Your message starts a new chat after it/.test(await chatState(ctx)), 5_000);
+      await waitEvent(ctx.s, ctx.id, 'turn-end', (e) => e.how === 'completed', 30_000);
+      await newChatGets(ctx, [text]);
+    },
+  },
+  {
+    name: 'waiting-message-stop',
+    prompt: 'E2E stop the finishing reply with a message waiting',
+    async run(ctx) {
+      const text = 'Sent once the stopped chat is gone.';
+      await endMidReply(ctx);
+      await sendWhileFinishing(ctx, text);
+      await click(ctx, '#chat-stop');
+      await waitEvent(ctx.s, ctx.id, 'interrupt', undefined, 5_000);
+      await waitEvent(ctx.s, ctx.id, 'turn-end', (e) => e.how === 'interrupted', 5_000);
+      assert(!events(ctx.s, ctx.id).some((e) => e.event === 'turn-end' && e.how === 'completed'), 'the reply ran to the end after Stop');
+      // At once: the new chat gets the message within seconds of Stop, not after the reply would have finished.
+      await newChatGets(ctx, [text], 5_000);
+    },
+  },
+  {
+    name: 'waiting-message-below-denied-card',
+    prompt: 'E2E end the chat at a permission card, then send',
+    async run(ctx) {
+      const text = 'A message after the denied card.';
+      const frame = await openTranscript(ctx);
+      await chatHere(frame);
+      await send(frame, 'Run a command that needs permission, slowly.');
+      await waitEvent(ctx.s, ctx.id, 'permission-asked');
+      await (await transcript(ctx)).waitForSelector('#chat-live .chat-permission.active button[data-perm="allow"]', { timeout: 10_000 });
+      await click(ctx, '#chat-end');
+      const answer = await waitEvent(ctx.s, ctx.id, 'permission-answered', undefined, 5_000);
+      assert(answer.behavior === 'deny', `ending the chat answered the card with "${answer.behavior}", not deny`);
+      await waitFor('the chat bar to say the reply is finishing', async () => /Chat ended: Claude is finishing/.test(await chatState(ctx)), 5_000);
+      await sendWhileFinishing(ctx, text);
+      const page = await (await transcript(ctx)).evaluate(() => {
+        const live = document.getElementById('chat-live');
+        const card = live.querySelector('.chat-permission');
+        const waiting = live.querySelector('.chat-pending.waiting');
+        return {
+          card: !!card,
+          denied: !!card?.querySelector('.perm-outcome.denied') && /Denied/.test(card.textContent || ''),
+          active: !!card?.classList.contains('active'),
+          buttons: live.querySelectorAll('button[data-perm]').length,
+          below: !!(card && waiting && card.compareDocumentPosition(waiting) & Node.DOCUMENT_POSITION_FOLLOWING),
+        };
+      });
+      assert(page.card, 'the permission card is gone');
+      assert(page.denied && !page.active, 'the card does not show as denied');
+      assert(page.buttons === 0, 'the denied card still has Allow and Deny buttons');
+      assert(page.below, 'the waiting message is not below the card');
+      await waitEvent(ctx.s, ctx.id, 'turn-end', (e) => e.how === 'completed', 30_000);
+      await newChatGets(ctx, [text]);
+    },
+  },
+  {
+    name: 'waiting-message-tab-closed',
+    prompt: 'E2E close the tab with a message waiting',
+    async run(ctx) {
+      const text = 'Never to be sent: the tab closes first.';
+      await endMidReply(ctx);
+      await sendWhileFinishing(ctx, text);
+      const t = tab(ctx);
+      await t.hover();
+      await t.locator('.tab-actions .action-label').first().click();
+      await waitFor('the transcript tab to close', async () => (await t.count()) === 0, 5_000);
+      await waitEvent(ctx.s, ctx.id, 'turn-end', (e) => e.how === 'completed', 30_000);
+      await waitEvent(ctx.s, ctx.id, 'exit');
+      await neverSent(ctx, text);
+    },
+  },
+  letGoWhileWaiting({ name: 'waiting-message-sidebar-resume-wait', prompt: 'E2E waiting, sidebar Resume, wait', from: 'sidebar', open: 'resume', choice: 'wait' }),
+  letGoWhileWaiting({ name: 'waiting-message-sidebar-resume-stop', prompt: 'E2E waiting, sidebar Resume, stop', from: 'sidebar', open: 'resume', choice: 'stop' }),
+  letGoWhileWaiting({ name: 'waiting-message-sidebar-open-chat-wait', prompt: 'E2E waiting, sidebar Open in chat, wait', from: 'sidebar', open: 'chat', choice: 'wait' }),
+  letGoWhileWaiting({ name: 'waiting-message-sidebar-open-chat-stop', prompt: 'E2E waiting, sidebar Open in chat, stop', from: 'sidebar', open: 'chat', choice: 'stop' }),
+  letGoWhileWaiting({ name: 'waiting-message-topbar-resume-wait', prompt: 'E2E waiting, top bar Resume, wait', from: 'topbar', open: 'resume', choice: 'wait' }),
+  letGoWhileWaiting({ name: 'waiting-message-topbar-resume-stop', prompt: 'E2E waiting, top bar Resume, stop', from: 'topbar', open: 'resume', choice: 'stop' }),
+  letGoWhileWaiting({ name: 'waiting-message-topbar-open-chat-wait', prompt: 'E2E waiting, top bar Open in chat, wait', from: 'topbar', open: 'chat', choice: 'wait' }),
+  letGoWhileWaiting({ name: 'waiting-message-topbar-open-chat-stop', prompt: 'E2E waiting, top bar Open in chat, stop', from: 'topbar', open: 'chat', choice: 'stop' }),
+  {
+    name: 'queued-not-waiting',
+    prompt: 'E2E queue a message in a running chat',
+    async run(ctx) {
+      const text = 'A follow-up while it replies.';
+      const frame = await openTranscript(ctx);
+      await chatHere(frame);
+      await send(frame, 'Tell me twelve lines.');
+      await midReply(ctx);
+      await send(await transcript(ctx), text);
+      const pills = async () =>
+        (await transcript(ctx)).$$eval('#chat-live .chat-pending.user', (els) => els.map((el) => ({ text: el.textContent || '', waiting: el.classList.contains('waiting') })));
+      await waitFor(`"${text}" to show as queued`, async () => (await pills()).some((p) => p.text.includes(text) && /queued/.test(p.text)), 5_000);
+      const mine = (await pills()).filter((p) => p.text.includes(text));
+      assert(mine.every((p) => !p.waiting && !p.text.includes(WAITING_PILL)), 'a message in a running chat shows as waiting for an ended one');
+      assert(!/new chat/.test(await chatState(ctx)), 'the chat bar says a new chat starts');
+      await waitEvent(ctx.s, ctx.id, 'turn-start', (e) => e.text === text, 30_000);
+      assert(events(ctx.s, ctx.id).filter((e) => e.event === 'start').length === 1, 'the queued message started a new chat');
     },
   },
 ];
