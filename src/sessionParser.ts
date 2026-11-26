@@ -960,7 +960,9 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
   const callEntries = new Map<string, TranscriptEntry>();
   /**
    * A prompt and what answered it, with the requests made since it, to give each prompt its cost. `tail` is the last
-   * entry shown for it and `fork` the reply entry a second writer's branch is filling (see `place`).
+   * entry shown for it and `fork` the reply entry a second writer's branch is filling (see `place`). `synthetic` is
+   * the reply entry shown for it when that holds only records Claude Code wrote itself (`"model":"<synthetic>"`), such
+   * as the "No response requested." a second writer closes the first one's open turn with.
    */
   interface Turn {
     entry: TranscriptEntry;
@@ -969,6 +971,7 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
     last?: number;
     tail: TranscriptEntry;
     fork?: TranscriptEntry;
+    synthetic?: TranscriptEntry;
   }
   const turns: Turn[] = [];
   /** The latest prompt's turn: where records whose parent is unknown go. */
@@ -1077,13 +1080,20 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
       // merge everything Claude does between two user prompts into a single turn.
       // A subagent's reply in between starts a new one, so the conversation reads main AI, subagent, main AI.
       let target: TranscriptEntry | undefined;
+      const synthetic = r.message?.model === '<synthetic>';
       if (!owner || owner === turn) {
         target = entries[entries.length - 1];
         if (target?.role === 'assistant') {
           target.parts.push(...parts);
+          if (owner?.synthetic === target && !synthetic) {
+            owner.synthetic = undefined;
+          }
         } else {
           target = { role: 'assistant', timestamp: r.timestamp, parts };
           place(target, owner);
+          if (owner && synthetic) {
+            owner.synthetic = target;
+          }
         }
       } else if (owner.fork && owner.tail === owner.fork) {
         // The other branch's reply goes on: kept in one entry, as a reply on the main line would be.
@@ -1095,6 +1105,15 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
         target = { role: 'assistant', timestamp: r.timestamp, parts, branch: true };
         place(target, owner);
         owner.fork = target;
+        // The other writer closed this turn with a reply of its own making; now that the real answer is here, that
+        // placeholder is noise. Only the shown entry goes: its record stays in the log and in the turn's usage.
+        if (owner.synthetic) {
+          const at = entries.indexOf(owner.synthetic);
+          if (at >= 0) {
+            entries.splice(at, 1);
+          }
+          owner.synthetic = undefined;
+        }
       }
       if (runs.length) {
         for (const p of parts) {
