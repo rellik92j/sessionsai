@@ -58,6 +58,7 @@ function fakeVscode(state) {
     },
     ViewColumn: { Active: -1, Beside: -2 },
     TerminalLocation: { Panel: 1 },
+    ProgressLocation: { Notification: 15 },
     ConfigurationTarget: { Global: 1 },
     extensions: { getExtension: (id) => state.extensions?.[id], onDidChange: () => disposable },
     env: { clipboard: { writeText: async () => {} }, openExternal: async () => {} },
@@ -97,6 +98,19 @@ function fakeVscode(state) {
       showErrorMessage: (m) => state.errors.push(m),
       showWarningMessage: async () => undefined,
       showInformationMessage: async (m) => (state.infos?.push(m), undefined),
+      // A progress notification: kept in state.progress; state.cancelProgress cancels it as soon as it shows.
+      withProgress: (options, task) => {
+        const listeners = [];
+        const token = { isCancellationRequested: false, onCancellationRequested: (f) => (listeners.push(f), disposable) };
+        (state.progress ??= []).push(options);
+        if (state.cancelProgress) {
+          setTimeout(() => {
+            token.isCancellationRequested = true;
+            listeners.forEach((f) => f());
+          }, 0);
+        }
+        return task({ report() {} }, token);
+      },
       setStatusBarMessage() {},
       // Tests answer quick picks by setting state.pick to a function of the items and options.
       showQuickPick: async (items, options) => state.pick?.(items, options),
@@ -359,8 +373,12 @@ test('bundled extension activates, fills the sidebar, and renders a transcript',
     const composerData = (html) =>
       JSON.parse(/data-composer="([^"]*)"/.exec(html)[1].replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&'));
     const box = composerData(state.panels[0].webview.html);
-    assert.equal(box.target, 'claude', "the session's own tool by default");
-    assert.deepEqual(box.targets.map((t) => [t.id, t.same]), [['claude', true], ['copilot-cli', false], ['vscode-chat', false]]);
+    assert.equal(box.target, 'here', 'Chat here by default, for a Claude Code session');
+    assert.deepEqual(box.targets.map((t) => [t.id, t.same]), [['here', true], ['claude', true], ['copilot-cli', false], ['vscode-chat', false]]);
+    assert.deepEqual(box.chat.modes.map((m) => m.id), ['default', 'acceptEdits', 'plan', 'auto']);
+    assert.equal(box.chat.mode, 'default');
+    assert.match(state.panels[0].webview.html, /id="chat-live"/);
+    assert.match(state.panels[0].webview.html, /id="chat-mode"/);
     assert.equal(box.context, 0);
     assert.equal(typeof box.cacheExpires, 'number', 'when the prompt cache lapses, for the default');
     assert.equal(typeof box.contextTokens, 'number', 'and how big the conversation is');
@@ -390,7 +408,7 @@ test('bundled extension activates, fills the sidebar, and renders a transcript',
     assert.match(chatOpen.query, /Over to chat$/);
     assert.equal(state.memento['composerTarget.claude'], 'vscode-chat');
     await state.panels[0].onMessage({ command: 'refresh' });
-    await waitFor(() => composerData(state.panels[0].webview.html).target !== 'claude', 'the transcript to render again');
+    await waitFor(() => composerData(state.panels[0].webview.html).target !== 'here', 'the transcript to render again');
     assert.equal(composerData(state.panels[0].webview.html).target, 'vscode-chat', 'the last tool chosen is the next default');
     // Nothing to send, or an unknown target: nothing happens and the page keeps the text.
     assert.equal(await sendBox({ text: '   ', target: 'claude', mode: 'same' }), 'sendFailed');
@@ -612,6 +630,11 @@ test('Copilot CLI and VS Code Chat sessions: source chips, filters, search, tran
     html = state.panels[0].webview.html;
     assert.match(html, /GitHub Copilot CLI/);
     assert.match(html, /Create Chat Session/);
+    // "Chat here" is for Claude Code sessions only: not offered, and refused if asked for.
+    assert.doesNotMatch(html, /id="chat-live"|id="chat-bar"|&quot;here&quot;/);
+    state.panelPosts.length = 0;
+    await state.panels[0].onMessage({ command: 'chatSend', text: 'hello' });
+    assert.deepEqual(state.panelPosts.map((m) => m.type), ['sendFailed']);
 
     // Open in Claude Code Chat refuses other sources; resuming Copilot runs its CLI in the session's folder.
     const copilotSession = { sessionKey: `copilot-cli:${shared}` };
@@ -962,6 +985,11 @@ test("a subagent's full run opens from the transcript as a read-only transcript 
       await panel.onMessage({ command });
     }
     await panel.onMessage({ command: 'send', text: 'hello', target: 'claude', mode: 'same' });
+    // No chat either: the page has no chat, and a chat message is ignored.
+    assert.doesNotMatch(run, /id="chat-live"|id="chat-bar"/);
+    const postsBefore = state.panelPosts.length;
+    await panel.onMessage({ command: 'chatSend', text: 'hello', permissionMode: 'auto' });
+    assert.equal(state.panelPosts.length, postsBefore, 'no reply, no chat');
     assert.equal(state.terminals.length, 0, 'nothing was resumed or sent');
     assert.equal(panel.webview.html, run);
 
@@ -1391,6 +1419,409 @@ test("a subagent run's tab follows the run's own log", async () => {
     assert.ok(watcher.disposed);
     assert.deepEqual(state.errors, []);
   } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Chat here: refuses a second writer, shows start errors in the tab, and spawns the CLI without a shell', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-sessions-chat-'));
+  const projectsDir = path.join(root, 'claude');
+  const repo = path.join(root, 'repo');
+  const ID = '7c7c7c7c-1111-4222-8333-944455556666';
+  const log = path.join(projectsDir, 'C--repo', `${ID}.jsonl`);
+  try {
+    fs.mkdirSync(repo);
+    writeSession(path.dirname(log), ID, [
+      { type: 'user', message: { content: 'Start the chat test' }, cwd: repo, uuid: 'l-1', timestamp: new Date().toISOString() },
+      { type: 'assistant', message: { id: 'm1', content: [{ type: 'text', text: 'Ready.' }] }, uuid: 'l-2', timestamp: new Date().toISOString() },
+    ]);
+    const state = {
+      projectsDir,
+      config: { copilotDir: path.join(root, 'none'), vscodeUserDir: path.join(root, 'none') },
+      providers: {},
+      commands: {},
+      panels: [],
+      panelPosts: [],
+      errors: [],
+      terminals: [],
+      infos: [],
+    };
+    const { vscode } = await activateWithSidebar(state);
+    const warnings = [];
+    vscode.window.showWarningMessage = async (m) => (warnings.push(m), undefined);
+    await state.commands['claudeSessions.openTranscript']({ sessionKey: `claude:${ID}` });
+    const panel = state.panels[0];
+    const chatSend = async (text) => {
+      state.panelPosts.length = 0;
+      await panel.onMessage({ command: 'chatSend', text, permissionMode: 'acceptEdits' });
+      return state.panelPosts.find((m) => m.type === 'sent' || m.type === 'sendFailed')?.type;
+    };
+    const posted = (type) => state.panelPosts.filter((m) => m.type === type);
+
+    // The log was written moments ago, perhaps by another Claude Code: asked first, and refused when not confirmed.
+    assert.equal(await chatSend('hello'), 'sendFailed');
+    assert.match(warnings.pop(), /written \d+s ago.*fork its log/);
+    const old = new Date(Date.now() - 60_000);
+    fs.utimesSync(log, old, old);
+
+    // Claude Code that cannot be found: the error shows in the tab, and the message goes back to the box.
+    state.config.claudeCommand = path.join(root, 'missing', 'claude.exe');
+    assert.equal(await chatSend('hello'), 'sent');
+    await waitFor(() => posted('chatRestore').length, 'the message to come back');
+    assert.equal(posted('chatRestore')[0].text, 'hello');
+    await waitFor(() => posted('chatLive').some((m) => /needs the Claude Code executable/.test(m.html)), 'the error in the tab');
+
+    // A real process, spawned without a shell in the session's folder: node, which rejects Claude Code's flags and
+    // exits. Its exit code and stderr show in the tab, and the message it never took comes back.
+    state.config.claudeCommand = process.execPath;
+    assert.equal(await chatSend('hello again'), 'sent');
+    await waitFor(() => posted('chatLive').some((m) => /exit code 9/.test(m.html)), 'the crash in the tab');
+    assert.match(posted('chatLive').pop().html, /bad option: --resume/);
+    await waitFor(() => posted('chatRestore').length, 'the message to come back');
+    assert.equal(posted('chatRestore')[0].text, 'hello again');
+    await waitFor(() => posted('chatState').at(-1)?.busy === false, 'the chat to settle');
+    const stateMsg = posted('chatState').at(-1);
+    assert.equal(stateMsg.running, false);
+    assert.equal(stateMsg.mode, 'acceptEdits', 'the mode the page asked for');
+
+    // The permission mode can change while no chat runs.
+    state.panelPosts.length = 0;
+    await panel.onMessage({ command: 'chatMode', mode: 'plan' });
+    assert.equal(posted('chatState').at(-1).mode, 'plan');
+    await panel.onMessage({ command: 'chatMode', mode: 'bypassPermissions' });
+    assert.equal(posted('chatState').length, 1, 'an unknown mode is ignored');
+
+    // Open in a terminal this extension started: Chat here refuses, naming the forked log.
+    await state.commands['claudeSessions.resume']({ sessionKey: `claude:${ID}` });
+    assert.equal(state.terminals.length, 1);
+    assert.equal(await chatSend('hello'), 'sendFailed');
+    assert.match(warnings.pop(), /open in a terminal.*fork its log/);
+
+    // Closing the window ends every chat process.
+    await require(path.join(process.env.EXT_DIR || path.join(__dirname, '..'), 'dist', 'extension.js')).deactivate();
+    assert.deepEqual(state.errors, []);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Chat here: Resume, Send to the CLI and Open in Claude Code ask to end the chat, which holds the session until its process exits', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-sessions-chat-'));
+  const projectsDir = path.join(root, 'claude');
+  const repo = path.join(root, 'repo');
+  const ID = '7d7d7d7d-1111-4222-8333-944455556666';
+  const log = path.join(projectsDir, 'C--repo', `${ID}.jsonl`);
+  // A stand-in for claude.exe that stays up between turns, answers each message with a result, and on stdin EOF
+  // writes to the session log (as Claude Code does) and exits a moment later: the window the guards must cover.
+  const standIn = path.join(root, 'stand-in.js');
+  fs.writeFileSync(
+    standIn,
+    `const fs = require('fs');
+let buf = '';
+process.stdin.on('data', (d) => {
+  buf += d;
+  let i;
+  while ((i = buf.indexOf('\\n')) >= 0) {
+    const line = buf.slice(0, i);
+    buf = buf.slice(i + 1);
+    if (line.includes('"type":"user"')) {
+      process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'ok', duration_ms: 5 }) + '\\n');
+    }
+  }
+});
+process.stdin.on('end', () => {
+  fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ type: 'system', subtype: 'stand-in', uuid: 's-' + process.pid }) + '\\n');
+  setTimeout(() => process.exit(0), 400);
+});
+setInterval(() => {}, 1000);
+`,
+  );
+  const cp = require('child_process');
+  const realSpawn = cp.spawn;
+  const spawned = [];
+  cp.spawn = (exe, args, opts) => {
+    if (exe !== process.execPath || !args.includes('--input-format')) {
+      return realSpawn(exe, args, opts);
+    }
+    const earlierExited = spawned.every((c) => c.exitCode !== null || c.signalCode !== null);
+    const child = realSpawn(process.execPath, [standIn], opts);
+    spawned.push(Object.assign(child, { earlierExited }));
+    return child;
+  };
+  const alive = (child) => child.exitCode === null && child.signalCode === null;
+  try {
+    fs.mkdirSync(repo);
+    writeSession(path.dirname(log), ID, [
+      { type: 'user', message: { content: 'Start the guard test' }, cwd: repo, uuid: 'g-1', timestamp: new Date().toISOString() },
+      { type: 'assistant', message: { id: 'm1', content: [{ type: 'text', text: 'Ready.' }] }, uuid: 'g-2', timestamp: new Date().toISOString() },
+    ]);
+    const old = new Date(Date.now() - 60_000);
+    fs.utimesSync(log, old, old);
+    const state = {
+      projectsDir,
+      config: { copilotDir: path.join(root, 'none'), vscodeUserDir: path.join(root, 'none'), claudeCommand: process.execPath },
+      providers: {},
+      commands: {},
+      panels: [],
+      panelPosts: [],
+      errors: [],
+      terminals: [],
+      infos: [],
+      extensions: { 'anthropic.claude-code': { extensionUri: { fsPath: root } } },
+    };
+    const { vscode } = await activateWithSidebar(state);
+    const warnings = [];
+    let answer;
+    vscode.window.showWarningMessage = async (m) => (warnings.push(m), answer);
+    const opened = [];
+    state.commands['claude-vscode.editor.open'] = (...a) => opened.push(a);
+    const session = { sessionKey: `claude:${ID}` };
+    await state.commands['claudeSessions.openTranscript'](session);
+    const panel = state.panels[0];
+    const posted = (type) => state.panelPosts.filter((m) => m.type === type);
+    const chatSend = async (text) => {
+      state.panelPosts.length = 0;
+      await panel.onMessage({ command: 'chatSend', text });
+      return state.panelPosts.find((m) => m.type === 'sent' || m.type === 'sendFailed')?.type;
+    };
+    const turnDone = () => waitFor(() => posted('chatState').at(-1)?.busy === false && posted('chatState').at(-1)?.running, 'the turn to end');
+
+    assert.equal(await chatSend('hello'), 'sent');
+    await turnDone();
+    assert.equal(spawned.length, 1);
+
+    // Declined: each refuses, starts nothing, and the chat carries on.
+    const held = /being chatted with in its transcript tab.*fork its log/;
+    assert.equal(await state.commands['claudeSessions.resume'](session), false);
+    assert.match(warnings.pop(), held);
+    assert.equal(await state.commands['claudeSessions.sendMessage'](session, 'to the CLI', 'claude', 'same', false), false);
+    assert.match(warnings.pop(), held);
+    assert.equal(await state.commands['claudeSessions.openInClaudeCode'](session), false);
+    assert.match(warnings.pop(), held);
+    assert.deepEqual(state.terminals, []);
+    assert.deepEqual(opened, []);
+    assert.ok(alive(spawned[0]), 'the chat process is still up');
+
+    // Accepted: the chat ends, its process has exited, and only then does the session open elsewhere.
+    answer = 'End Chat and Resume';
+    // The session's folder is open in this window, so nothing else is asked.
+    vscode.workspace.workspaceFolders = [{ uri: { fsPath: repo, scheme: 'file' } }];
+    assert.equal(await state.commands['claudeSessions.openInClaudeCode'](session), true);
+    vscode.workspace.workspaceFolders = [];
+    assert.match(warnings.pop(), held);
+    assert.ok(!alive(spawned[0]), 'exited before the session opened elsewhere');
+    assert.equal(opened[0][0], ID);
+    answer = undefined;
+
+    // Chatting again: the old process's own last log write is no other writer's, so nothing is asked.
+    assert.equal(await chatSend('again'), 'sent');
+    await turnDone();
+    assert.equal(spawned.length, 2);
+    assert.deepEqual(warnings, []);
+
+    // End chat lets go of the process only once it has exited: until then the session is held, and a new message
+    // waits for it rather than putting a second process on the log.
+    const ending = panel.onMessage({ command: 'chatEnd' });
+    assert.equal(await state.commands['claudeSessions.resume'](session), false);
+    assert.match(warnings.pop(), held, 'still held while its process exits');
+    assert.equal(await chatSend('third'), 'sent');
+    await ending;
+    assert.equal(spawned.length, 3);
+    assert.ok(spawned[2].earlierExited, 'the new process started after the old one exited');
+    await turnDone();
+    assert.deepEqual(warnings, []);
+
+    // Closing the tab: held until the process exits, and window close waits for that shutdown.
+    panel.dispose();
+    assert.equal(await state.commands['claudeSessions.resume'](session), false);
+    assert.match(warnings.pop(), held);
+    assert.ok(alive(spawned[2]));
+    await require(path.join(process.env.EXT_DIR || path.join(__dirname, '..'), 'dist', 'extension.js')).deactivate();
+    assert.ok(spawned.every((c) => !alive(c)), 'no chat process outlives the window');
+    assert.deepEqual(state.terminals, []);
+    assert.deepEqual(state.errors, []);
+  } finally {
+    cp.spawn = realSpawn;
+    for (const c of spawned) {
+      if (alive(c)) c.kill();
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Chat here: a chat ended mid-reply lets the reply finish; Resume can wait for it or stop it now, and window close interrupts after a grace period', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-sessions-chat-'));
+  const projectsDir = path.join(root, 'claude');
+  const repo = path.join(root, 'repo');
+  const ID = '8e8e8e8e-1111-4222-8333-944455556666';
+  const log = path.join(projectsDir, 'C--repo', `${ID}.jsonl`);
+  const release = path.join(root, 'release');
+  // A stand-in for claude.exe that records every stdin line, answers a "slow" message only once the test creates the
+  // release file (or on an interrupt, as a stopped turn), and on stdin EOF writes to the log and exits a moment later.
+  const standIn = path.join(root, 'stand-in.js');
+  fs.writeFileSync(
+    standIn,
+    `const fs = require('fs');
+const stdinLog = ${JSON.stringify(root)} + '/stdin-' + process.pid + '.log';
+const release = ${JSON.stringify(release)};
+let buf = '';
+let poll;
+const result = (extra) => process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'ok', duration_ms: 5, ...extra }) + '\\n');
+process.stdin.on('data', (d) => {
+  buf += d;
+  let i;
+  while ((i = buf.indexOf('\\n')) >= 0) {
+    const line = buf.slice(0, i);
+    buf = buf.slice(i + 1);
+    fs.appendFileSync(stdinLog, line + '\\n');
+    if (line.includes('"type":"user"')) {
+      if (!line.includes('slow')) {
+        result();
+        continue;
+      }
+      poll = setInterval(() => {
+        if (fs.existsSync(release)) {
+          fs.unlinkSync(release);
+          clearInterval(poll);
+          poll = undefined;
+          result();
+        }
+      }, 20);
+    } else if (line.includes('"subtype":"interrupt"') && poll) {
+      clearInterval(poll);
+      poll = undefined;
+      result({ subtype: 'error_during_execution', is_error: true, terminal_reason: 'aborted_streaming' });
+    }
+  }
+});
+process.stdin.on('end', () => {
+  fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ type: 'system', subtype: 'stand-in', uuid: 's-' + process.pid }) + '\\n');
+  setTimeout(() => process.exit(0), 200);
+});
+setInterval(() => {}, 1000);
+`,
+  );
+  const cp = require('child_process');
+  const realSpawn = cp.spawn;
+  const spawned = [];
+  cp.spawn = (exe, args, opts) => {
+    if (exe !== process.execPath || !args.includes('--input-format')) {
+      return realSpawn(exe, args, opts);
+    }
+    const child = realSpawn(process.execPath, [standIn], opts);
+    spawned.push(child);
+    return child;
+  };
+  const alive = (child) => child.exitCode === null && child.signalCode === null;
+  const stdinOf = (child) => {
+    const file = path.join(root, `stdin-${child.pid}.log`);
+    return fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+  };
+  const interrupted = (child) => /"subtype":"interrupt"/.test(stdinOf(child));
+  try {
+    fs.mkdirSync(repo);
+    writeSession(path.dirname(log), ID, [
+      { type: 'user', message: { content: 'Start the finish test' }, cwd: repo, uuid: 'f-1', timestamp: new Date().toISOString() },
+      { type: 'assistant', message: { id: 'm1', content: [{ type: 'text', text: 'Ready.' }] }, uuid: 'f-2', timestamp: new Date().toISOString() },
+    ]);
+    const old = new Date(Date.now() - 60_000);
+    fs.utimesSync(log, old, old);
+    const state = {
+      projectsDir,
+      config: { copilotDir: path.join(root, 'none'), vscodeUserDir: path.join(root, 'none'), claudeCommand: process.execPath },
+      providers: {},
+      commands: {},
+      panels: [],
+      panelPosts: [],
+      errors: [],
+      terminals: [],
+      infos: [],
+      extensions: { 'anthropic.claude-code': { extensionUri: { fsPath: root } } },
+    };
+    const { vscode } = await activateWithSidebar(state);
+    const warnings = [];
+    let answer;
+    vscode.window.showWarningMessage = async (m, ...rest) => (warnings.push({ m, buttons: rest.filter((x) => typeof x === 'string') }), answer);
+    const opened = [];
+    state.commands['claude-vscode.editor.open'] = (...a) => opened.push(a);
+    const session = { sessionKey: `claude:${ID}` };
+    const posted = (type) => state.panelPosts.filter((m) => m.type === type);
+    const openChat = async (text) => {
+      await state.commands['claudeSessions.openTranscript'](session);
+      const panel = state.panels.at(-1);
+      state.panelPosts.length = 0;
+      await panel.onMessage({ command: 'chatSend', text });
+      assert.ok(posted('sent').length, `sent: ${text}`);
+      await waitFor(() => spawned.length && stdinOf(spawned.at(-1)).includes(text), `the stand-in to get "${text}"`);
+      return { panel, child: spawned.at(-1) };
+    };
+    const replying = /Claude is still replying in the chat.*fork its log/;
+    // The session's folder is open in this window, so Open in Claude Code asks nothing else.
+    vscode.workspace.workspaceFolders = [{ uri: { fsPath: repo, scheme: 'file' } }];
+
+    // 1. Closing the tab mid-reply: no interrupt, the process keeps going, and the session stays held.
+    let { child } = await openChat('slow one');
+    state.panels.at(-1).dispose();
+    await new Promise((r) => setTimeout(r, 100));
+    assert.ok(alive(child), 'the reply carries on after the tab closed');
+    assert.ok(!interrupted(child), 'no interrupt line on stdin');
+    // Cancel: nothing happens.
+    assert.equal(await state.commands['claudeSessions.resume'](session), false);
+    const asked = warnings.pop();
+    assert.match(asked.m, replying);
+    assert.deepEqual(asked.buttons, ['Wait for the Reply', 'Stop It Now']);
+    assert.ok(alive(child) && !interrupted(child));
+    // Wait, then cancel the wait: nothing opens, and the reply still finishes.
+    answer = 'Wait for the Reply';
+    state.cancelProgress = true;
+    assert.equal(await state.commands['claudeSessions.resume'](session), false);
+    state.cancelProgress = false;
+    assert.deepEqual(state.terminals, []);
+    assert.ok(alive(child) && !interrupted(child));
+    // Wait: the action goes ahead only once the reply is in and the process has exited.
+    let done = false;
+    const waiting = state.commands['claudeSessions.openInClaudeCode'](session).then((r) => ((done = true), r));
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(done, false, 'waits for the reply');
+    assert.match(state.progress.at(-1).title, /Waiting for Claude to finish replying/);
+    assert.equal(state.progress.at(-1).cancellable, true);
+    fs.writeFileSync(release, '');
+    assert.equal(await waiting, true);
+    assert.ok(!alive(child), 'exited before the session opened elsewhere');
+    assert.ok(!interrupted(child), 'the reply was never interrupted');
+    assert.equal(opened.length, 1);
+
+    // 2. End chat mid-reply, with the tab open: the reply finishes there. Stop It Now interrupts it.
+    ({ child } = await openChat('slow two'));
+    const panel = state.panels.at(-1);
+    state.panelPosts.length = 0;
+    const ending = panel.onMessage({ command: 'chatEnd' });
+    await waitFor(() => posted('chatState').at(-1)?.finishing === true, 'the chat bar to show the reply finishing');
+    assert.ok(!interrupted(child));
+    answer = 'Stop It Now';
+    assert.equal(await state.commands['claudeSessions.openInClaudeCode'](session), true);
+    assert.match(warnings.pop().m, replying);
+    assert.ok(interrupted(child), 'stopped with the interrupt');
+    assert.ok(!alive(child), 'exited before the session opened elsewhere');
+    assert.equal(opened.length, 2);
+    await ending;
+    assert.equal(posted('chatState').at(-1)?.finishing, false);
+    answer = undefined;
+
+    // 3. Window close mid-reply: the reply gets a grace period, then the interrupt; nothing outlives the window.
+    ({ child } = await openChat('slow three'));
+    const started = Date.now();
+    await require(path.join(process.env.EXT_DIR || path.join(__dirname, '..'), 'dist', 'extension.js')).deactivate();
+    assert.ok(Date.now() - started >= 1000, 'the running turn was given its grace period');
+    assert.ok(interrupted(child), 'then interrupted');
+    assert.ok(spawned.every((c) => !alive(c)), 'no chat process outlives the window');
+    assert.deepEqual(state.terminals, []);
+    assert.deepEqual(state.errors, []);
+  } finally {
+    cp.spawn = realSpawn;
+    for (const c of spawned) {
+      if (alive(c)) c.kill();
+    }
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

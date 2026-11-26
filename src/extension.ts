@@ -15,7 +15,7 @@ import { canResumeIn, CONTINUE_TARGETS, ContinueTarget, isClaude, sessionKey, SO
 import { parseTranscriptFor } from './transcripts';
 import { OverviewPanel } from './overviewPanel';
 import { SidebarView } from './sidebarView';
-import { registerGitContentProvider, TranscriptPanels } from './transcriptPanel';
+import { ComposerTarget, registerGitContentProvider, TranscriptPanels } from './transcriptPanel';
 
 const CONFIG = 'claudeSessions';
 const CLAUDE_CODE_EXTENSION = 'anthropic.claude-code';
@@ -101,9 +101,73 @@ export function activate(context: vscode.ExtensionContext): void {
   const model = new SessionModel(store);
   // The tool last chosen in a transcript's message box, per kind of session; it is where the next message goes.
   const composerKey = (s: SessionSource) => `composerTarget.${s}`;
-  const composerTarget = (s: SessionSource) => context.globalState?.get<ContinueTarget>(composerKey(s));
-  const transcripts = new TranscriptPanels(context.extensionUri, hasClaudeCode, model, composerTarget);
+  const composerTarget = (s: SessionSource) => context.globalState?.get<ComposerTarget>(composerKey(s));
+  // One terminal per session, so resuming twice focuses the running CLI instead of starting a second one.
+  const sessionTerminals = new Map<string, vscode.Terminal>();
+  const openTerminal = (session: SessionInfo) => {
+    const t = sessionTerminals.get(sessionKey(session));
+    return t && t.exitStatus === undefined ? t : undefined;
+  };
+  const transcripts = new TranscriptPanels(context.extensionUri, hasClaudeCode, model, composerTarget, {
+    rememberTarget: (s, target) => void context.globalState?.update(composerKey(s), target),
+    terminalFor: openTerminal,
+  });
+  disposeChats = () => transcripts.dispose();
   const overview = new OverviewPanel(context.extensionUri, model);
+
+  /**
+   * A session a transcript tab is chatting with has a writer already; resuming it elsewhere as well would fork its log
+   * (doc section 8). Asks to end the chat first; while Claude is still replying there, offers to wait for the reply or
+   * to stop it now. True when the session is free to resume.
+   */
+  const freeFromChat = async (session: SessionInfo): Promise<boolean> => {
+    if (!transcripts.chatHolds(session)) {
+      return true;
+    }
+    if (transcripts.chatReplying(session)) {
+      const WAIT = 'Wait for the Reply';
+      const STOP = 'Stop It Now';
+      const choice = await vscode.window.showWarningMessage(
+        `Claude is still replying in the chat with "${session.title}". Resuming it somewhere else before the reply ends would put two Claude Code processes on one session, and they fork its log. Wait for the reply to finish, or stop it now (the reply ends where it is).`,
+        { modal: true },
+        WAIT,
+        STOP,
+      );
+      if (choice === STOP) {
+        await transcripts.endChat(session, true);
+        return true;
+      }
+      if (choice !== WAIT) {
+        return false;
+      }
+      const ending = transcripts.endChat(session);
+      // The reply may take a while: the action goes ahead once it has finished and the chat process has exited.
+      return vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: `Waiting for Claude to finish replying in "${session.title}"…`, cancellable: true },
+        (_progress, token) =>
+          new Promise<boolean>((resolve) => {
+            const sub = token.onCancellationRequested(() => {
+              sub.dispose();
+              resolve(false);
+            });
+            void ending.then(() => {
+              sub.dispose();
+              resolve(!token.isCancellationRequested);
+            });
+          }),
+      );
+    }
+    const choice = await vscode.window.showWarningMessage(
+      `"${session.title}" is being chatted with in its transcript tab. Resuming it somewhere else at the same time would put two Claude Code processes on one session, and they fork its log.`,
+      { modal: true },
+      'End Chat and Resume',
+    );
+    if (choice !== 'End Chat and Resume') {
+      return false;
+    }
+    await transcripts.endChat(session);
+    return true;
+  };
 
   /**
    * Commands receive a SessionInfo (from the transcript page or quick pick), a webview context
@@ -215,8 +279,6 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
   );
 
-  // One terminal per session, so resuming twice focuses the running CLI instead of starting a second one.
-  const sessionTerminals = new Map<string, vscode.Terminal>();
   context.subscriptions.push(
     vscode.window.onDidCloseTerminal((t) => {
       for (const [id, term] of sessionTerminals) {
@@ -270,6 +332,9 @@ export function activate(context: vscode.ExtensionContext): void {
     if (sourceOf(session) === 'vscode-chat') {
       return openChat(session);
     }
+    if (!(await freeFromChat(session))) {
+      return false;
+    }
     const key = sessionKey(session);
     const existing = sessionTerminals.get(key);
     if (existing && existing.exitStatus === undefined) {
@@ -308,6 +373,9 @@ export function activate(context: vscode.ExtensionContext): void {
    * (see continueInCopilot), so a message that won't survive shell quoting goes in a file its prompt points at.
    */
   const resumeWithMessage = async (session: SessionInfo, message: string, overrides: Overrides): Promise<boolean> => {
+    if (!(await freeFromChat(session))) {
+      return false;
+    }
     const key = sessionKey(session);
     const existing = sessionTerminals.get(key);
     if (existing && existing.exitStatus === undefined) {
@@ -562,6 +630,9 @@ export function activate(context: vscode.ExtensionContext): void {
   const openInClaudeCode = async (session: SessionInfo, message?: string): Promise<boolean> => {
     if (!vscode.extensions.getExtension(CLAUDE_CODE_EXTENSION)) {
       vscode.window.showErrorMessage('The Claude Code extension (anthropic.claude-code) is not installed.');
+      return false;
+    }
+    if (!(await freeFromChat(session))) {
       return false;
     }
     const folders = vscode.workspace.workspaceFolders?.map((f) => f.uri.fsPath) ?? [];
@@ -1014,4 +1085,12 @@ async function searchSessions(model: SessionModel): Promise<void> {
   qp.show();
 }
 
-export function deactivate(): void {}
+/** Ends the transcript tabs' chat processes; set by activate. */
+let disposeChats: (() => Promise<void>) | undefined;
+
+/** The window is closing: every chat process gets its stdin closed, and is killed if it does not exit in time. */
+export function deactivate(): Promise<void> | undefined {
+  const done = disposeChats?.();
+  disposeChats = undefined;
+  return done;
+}

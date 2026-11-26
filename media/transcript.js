@@ -89,6 +89,15 @@
     let sending = false;
 
     const info = () => cfg.targets.find((t) => t.id === target) || cfg.targets[0];
+    // "Chat here" (Claude Code sessions): the reply streams into this tab from a Claude Code process in the background.
+    const chat = cfg.chat;
+    const chatBar = document.getElementById('chat-bar');
+    const chatMode = document.getElementById('chat-mode');
+    const chatState = document.getElementById('chat-state');
+    const chatStop = document.getElementById('chat-stop');
+    const chatEnd = document.getElementById('chat-end');
+    const chatLive = document.getElementById('chat-live');
+    let chatStatus = chat ? chat.state : null;
     /** An expired cache only tips the default to a handoff from this many tokens of context. */
     const LARGE_CONTEXT = 100_000;
     /**
@@ -102,11 +111,18 @@
         : cfg.cacheExpires && Date.now() >= cfg.cacheExpires && cfg.contextTokens >= LARGE_CONTEXT
           ? `The prompt cache has expired, so resuming would pay to cache all ${Math.round(cfg.contextTokens / 1000)}k tokens again.`
           : '';
-    const mode = () => (!info().same ? 'handoff' : chosenMode || (reason() ? 'handoff' : 'same'));
+    const mode = () => (target === 'here' ? 'same' : !info().same ? 'handoff' : chosenMode || (reason() ? 'handoff' : 'same'));
 
     function describe() {
       const t = info();
       let text;
+      if (target === 'here') {
+        // A full context or a cold cache is worth knowing, but chatting here is still this session.
+        const why = reason();
+        status.innerHTML = `<i class="codicon codicon-${t.icon}"></i><span>${esc('Chats with this session in this tab. Claude Code runs in the background; tools that need approval are declined for now.')}</span>${why ? `<span class="why">${esc(why)}</span>` : ''}`;
+        renderChat();
+        return;
+      }
       if (mode() === 'same') {
         text = t.id === 'claude-chat' ? 'Opens this session in the Claude Code chat, with your message in its input box.' : `Resumes this session in ${t.label} and sends your message.`;
       } else if (t.id === 'claude-chat') {
@@ -116,6 +132,44 @@
       }
       const why = mode() === 'handoff' && !chosenMode ? (t.same ? reason() : cfg.targets[0].id === t.id ? `${t.label} can't take a message into an existing chat.` : '') : '';
       status.innerHTML = `<i class="codicon codicon-${t.icon}"></i><span>${esc(text)}</span>${why ? `<span class="why">${esc(why)}</span>` : ''}`;
+      renderChat();
+    }
+
+    /** The chat bar: shown for "Chat here", and while a chat is still running whatever the target. */
+    function renderChat() {
+      if (!chat || !chatBar) return;
+      const s = chatStatus || {};
+      chatBar.hidden = !(target === 'here' || s.running || s.busy);
+      if (chatMode.value !== s.mode) chatMode.value = s.mode;
+      chatState.textContent = s.finishing
+        ? 'Chat ended: Claude is finishing its reply, then it stops.'
+        : s.busy
+        ? `Claude is working…${s.queued ? ` ${s.queued} queued.` : ''}`
+        : s.running
+          ? `Ready${s.last ? ` · ${s.last}` : ''}`
+          : s.last || '';
+      chatState.classList.toggle('busy', !!s.busy);
+      chatStop.hidden = !s.busy;
+      chatEnd.hidden = !(s.running || s.busy) || !!s.finishing;
+      sendBtn.querySelector('span').textContent = target === 'here' && s.busy ? 'Queue' : 'Send';
+      sendBtn.title = target === 'here' && s.busy ? 'Queue this message: it goes when the running turn ends (Enter)' : 'Send (Enter). Shift+Enter adds a line.';
+    }
+
+    /** The chat's pending messages, below the logged conversation; following along keeps the newest in view. */
+    function renderLive(html) {
+      if (!chatLive) return;
+      const following = document.documentElement.scrollHeight - (window.scrollY + window.innerHeight) <= 80;
+      chatLive.innerHTML = html;
+      if (following) window.scrollTo(0, document.documentElement.scrollHeight);
+    }
+
+    if (chat && chatMode) {
+      chatMode.innerHTML = chat.modes.map((m) => `<option value="${esc(m.id)}" title="${esc(m.title)}">${esc(m.label)}</option>`).join('');
+      chatMode.value = chat.mode;
+      chatMode.addEventListener('change', () => vscode.postMessage({ command: 'chatMode', mode: chatMode.value }));
+      chatStop.addEventListener('click', () => vscode.postMessage({ command: 'chatStop' }));
+      chatEnd.addEventListener('click', () => vscode.postMessage({ command: 'chatEnd' }));
+      if (chatLive) chatLive.innerHTML = chat.live || '';
     }
 
     function esc(s) {
@@ -141,6 +195,10 @@
       sending = true;
       sendBtn.disabled = true;
       setMenu(false);
+      if (target === 'here') {
+        vscode.postMessage({ command: 'chatSend', text, permissionMode: chatMode ? chatMode.value : undefined });
+        return;
+      }
       vscode.postMessage({ command: 'send', text, target, mode: mode(), pickModel: !!pickModel });
     }
 
@@ -152,7 +210,7 @@
       menu.innerHTML =
         `<div class="menu-label">Send to</div>` +
         item('data-mode="same"', 'blank', 'This session', m === 'same', !t.same, t.same ? '' : `${t.label} can't continue this session`) +
-        item('data-mode="handoff"', 'blank', 'A new session, with a handoff', m === 'handoff', false) +
+        item('data-mode="handoff"', 'blank', 'A new session, with a handoff', m === 'handoff', t.id === 'here', t.id === 'here' ? 'Chat here continues this session. Pick a tool below for a handoff.' : '') +
         `<div class="menu-label">In</div>` +
         cfg.targets.map((x) => item(`data-target="${x.id}"`, x.icon, x.label, x.id === target, false)).join('') +
         (t.cli ? `<div class="menu-sep"></div><button role="menuitem" data-pick-model${input.value.trim() ? '' : ' disabled'}><i class="codicon codicon-settings"></i><span>Send with a model and effort…</span></button>` : '');
@@ -228,6 +286,19 @@
         sending = false;
         grow();
         input.focus();
+      } else if (e.data?.type === 'chatLive') {
+        renderLive(e.data.html);
+      } else if (e.data?.type === 'chatState') {
+        chatStatus = e.data;
+        renderChat();
+      } else if (e.data?.type === 'chatRestore' && e.data.text) {
+        // Messages that never reached Claude (Stop, or Claude Code would not start) come back to the box.
+        input.value = input.value.trim() ? `${e.data.text}\n\n${input.value}` : e.data.text;
+        saveDraft();
+        grow();
+      } else if (e.data?.type === 'promoted') {
+        // Chatting keeps this tab, so it is no longer the shared preview tab.
+        document.querySelector('[data-cmd="keepOpen"]')?.remove();
       }
     });
 

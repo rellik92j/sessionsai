@@ -941,3 +941,79 @@ body.has-composer .fab { bottom: calc(var(--composer-h, 110px) + 12px); }
 .composer-menu button[disabled] { opacity: 0.5; cursor: default; }
 .composer-menu button .codicon { width: 14px; }
 .composer-menu button[aria-checked='true'] .codicon-check { color: var(--vscode-focusBorder); }
+
+/* ---------- Chat here ---------- */
+
+/* What the chat has sent and streamed, below the logged conversation until the log records it. */
+.chat-live { max-width: var(--content); margin: 0 auto; }
+.chat-live:empty { display: none; }
+.chat-pending .msg-meta .pill { margin-right: 2px; }
+.chat-tool {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0;
+  padding: 5px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--hairline);
+  background: var(--subtle);
+  font-size: 12.5px;
+}
+.chat-tool.denied { border-color: color-mix(in srgb, var(--red) 40%, transparent); }
+.chat-thinking { margin: 6px 0; color: var(--muted); font-size: 12.5px; font-style: italic; }
+.chat-thinking .codicon { margin-right: 6px; }
+.chat-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 8px 0;
+  padding: 7px 10px;
+  border-radius: 6px;
+  font-size: 12.5px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  background: color-mix(in srgb, var(--vscode-charts-blue, #3794ff) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--vscode-charts-blue, #3794ff) 30%, transparent);
+}
+.chat-notice .codicon { margin-top: 2px; flex: none; }
+.chat-notice.error {
+  background: var(--vscode-inputValidation-errorBackground, color-mix(in srgb, var(--red) 12%, transparent));
+  border-color: var(--vscode-inputValidation-errorBorder, color-mix(in srgb, var(--red) 45%, transparent));
+}
+.chat-typing { display: inline-flex; gap: 4px; padding: 8px 0; }
+.chat-typing span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--muted);
+  animation: chat-dot 1.2s infinite ease-in-out both;
+}
+.chat-typing span:nth-child(2) { animation-delay: 0.15s; }
+.chat-typing span:nth-child(3) { animation-delay: 0.3s; }
+@keyframes chat-dot { 0%, 80%, 100% { opacity: 0.25; } 40% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .chat-typing span { animation: none; opacity: 0.6; } }
+
+/* The chat bar above the message box: permission mode, what the chat is doing, Stop, End chat. */
+.chat-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  margin: 0 4px 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.chat-bar[hidden] { display: none; }
+.chat-mode { display: inline-flex; align-items: center; gap: 5px; }
+.chat-mode select {
+  padding: 2px 4px;
+  border-radius: 4px;
+  border: 1px solid var(--vscode-dropdown-border, var(--hairline));
+  background: var(--vscode-dropdown-background, var(--subtle));
+  color: var(--vscode-dropdown-foreground, var(--vscode-foreground));
+  font: inherit;
+}
+.chat-state { flex: 1; min-width: 0; }
+.chat-state.busy { color: var(--vscode-foreground); }
+.chat-bar .btn { padding-top: 2px; padding-bottom: 2px; font-size: 12px; }
+.chat-bar .btn[hidden] { display: none; }

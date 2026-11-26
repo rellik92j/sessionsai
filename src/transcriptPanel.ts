@@ -1,8 +1,12 @@
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import { randomBytes } from 'crypto';
+import { existsSync, statSync } from 'fs';
 import * as fs from 'fs/promises';
+import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { ClaudeChat, isPermissionMode, PermissionMode, resolveClaudeExecutable } from './claudeChat';
+import { chatModes, chatStateMessage, renderLive } from './chatView';
 import { escapeHtml, formatDateTime, formatTokens, formatUsd } from './format';
 import { collectInsights, editsAsDiff, FileTouch, SessionInsights, TodoStatus } from './insights';
 import { renderMarkdown } from './markdown';
@@ -36,13 +40,61 @@ interface TranscriptTab {
   /** Watches a subagent run's own log, which the extension's session watcher does not cover. */
   watcher?: { file: string; disposable: vscode.Disposable };
   disposed?: boolean;
+  /** "Chat here": the Claude Code process this tab talks to, once the first message is sent. */
+  chat?: ClaudeChat;
+  /** A chat ended during a turn, still shown here while its reply finishes and its process exits. */
+  ending?: ClaudeChat;
+  /** The permission mode the chat runs (or will run) in. */
+  chatMode: PermissionMode;
+  /** Streamed text arrives many times a second; the page is redrawn at most this often. */
+  liveTimer?: NodeJS.Timeout;
 }
 
 /** How long a subagent run's log must be quiet before its tab updates; runs write in bursts. */
 const RUN_UPDATE_DELAY = 500;
 
+/** How often the pending part of a chat is redrawn while a reply streams in. */
+const LIVE_REDRAW_MS = 60;
+
+/** A log written this recently by something other than this tab's chat may have another writer (doc section 8). */
+const RECENT_WRITE_MS = 10_000;
+
 /** Messages that act on the session as a whole: resuming, continuing, sending or renaming. A subagent tab ignores them. */
-const SESSION_ACTIONS = new Set(['resume', 'continueInNewSession', 'continueInNewSessionWithModel', 'openInClaudeCode', 'send', 'rename']);
+const SESSION_ACTIONS = new Set([
+  'resume',
+  'continueInNewSession',
+  'continueInNewSessionWithModel',
+  'openInClaudeCode',
+  'send',
+  'rename',
+  'chatSend',
+  'chatStop',
+  'chatMode',
+  'chatEnd',
+]);
+
+/** Where the message box can send: a tool, or "Chat here" in the transcript tab itself (Claude Code only). */
+export type ComposerTarget = ContinueTarget | 'here';
+
+/** What the extension lends the transcript tabs for the chat. */
+export interface ChatHooks {
+  /** Remembers the target last chosen in a message box, for this kind of session. */
+  rememberTarget?: (source: SessionSource, target: ComposerTarget) => void;
+  /** The terminal this extension resumed the session in, if one is still open. */
+  terminalFor?: (session: SessionInfo) => vscode.Terminal | undefined;
+}
+
+let chatLog: vscode.OutputChannel | undefined;
+
+/** The chat processes' stderr, starts and exits, in an output channel made on first use. */
+function logChat(line: string): void {
+  try {
+    chatLog ??= vscode.window.createOutputChannel?.('SessionsAI Chat');
+    chatLog?.appendLine(`[${new Date().toLocaleTimeString()}] ${line}`);
+  } catch {
+    // No output channel: diagnostics are not worth failing the chat for.
+  }
+}
 
 /** What a tab shows: a session, or one subagent run of it. */
 function tabKey(session: SessionInfo, run?: SubagentRun): string {
@@ -64,13 +116,21 @@ export class TranscriptPanels {
   /** Regular (kept) tabs by session key. */
   private readonly pinned = new Map<string, TranscriptTab>();
   private preview: TranscriptTab | undefined;
+  /**
+   * Chats let go of by End chat or a closed tab whose process has not exited yet, by session key. Until it has, the
+   * session still has that writer: the guards count it, and window close waits for it.
+   */
+  private readonly closing = new Map<ClaudeChat, { key: string; done: Promise<void> }>();
+  /** When a session's own ended chats last heard from their process, by session key: their log writes are not another writer's. */
+  private readonly ownActivity = new Map<string, number>();
 
   constructor(
     private readonly extensionUri: vscode.Uri,
     private readonly hasClaudeCode: () => boolean,
     private readonly model: SessionModel,
     /** The tool last chosen in a message box for this kind of session, if any. */
-    private readonly composerTarget: (source: SessionSource) => ContinueTarget | undefined = () => undefined,
+    private readonly composerTarget: (source: SessionSource) => ComposerTarget | undefined = () => undefined,
+    private readonly hooks: ChatHooks = {},
   ) {
     // The model re-reads changed logs (debounced) and then fires; each open tab whose log changed follows along.
     model.onDidChange(() => {
@@ -141,7 +201,7 @@ export class TranscriptPanels {
       retainContextWhenHidden: true,
       localResourceRoots: [this.codiconsUri, this.mediaUri],
     });
-    const tab: TranscriptTab = { panel, session, highlight, preview, run, queue: Promise.resolve() };
+    const tab: TranscriptTab = { panel, session, highlight, preview, run, queue: Promise.resolve(), chatMode: 'default' };
     if (preview) {
       this.preview = tab;
     } else {
@@ -151,6 +211,9 @@ export class TranscriptPanels {
       tab.disposed = true;
       tab.watcher?.disposable.dispose();
       tab.watcher = undefined;
+      // Closing the tab ends its chat: stdin closed, killed if it will not exit.
+      clearTimeout(tab.liveTimer);
+      void this.retire(tab);
       if (this.preview === tab) {
         this.preview = undefined;
       } else if (this.pinned.get(tabKey(tab.session, tab.run)) === tab) {
@@ -210,6 +273,25 @@ export class TranscriptPanels {
           }
           break;
         }
+        case 'chatSend': {
+          // "Chat here": the tab stays open whatever closeTranscriptOnResume says; the reply streams in below.
+          const ok = typeof msg.text === 'string' && !!msg.text.trim() && (await this.chatSend(tab, msg.text, msg.permissionMode));
+          panel.webview.postMessage({ type: ok ? 'sent' : 'sendFailed' });
+          break;
+        }
+        case 'chatStop':
+          (tab.chat ?? tab.ending)?.interrupt();
+          break;
+        case 'chatMode':
+          if (isPermissionMode(msg.mode)) {
+            tab.chatMode = msg.mode;
+            tab.chat?.setMode(msg.mode);
+            this.postChat(tab);
+          }
+          break;
+        case 'chatEnd':
+          await this.endTabChat(tab);
+          break;
         case 'copyId':
         case 'openRawFile':
         case 'openPr':
@@ -283,6 +365,200 @@ export class TranscriptPanels {
     this.pinned.set(tabKey(tab.session, tab.run), tab);
   }
 
+  // ---------- Chat here ----------
+
+  /**
+   * Sends a message to the session's chat process, starting it on the first message. Before a start, refuses when the
+   * session is open in a terminal this extension started, and asks when something else wrote its log moments ago: two
+   * writers fork the log (doc section 8). False when refused, so the message stays in the box.
+   */
+  private async chatSend(tab: TranscriptTab, text: string, mode: unknown): Promise<boolean> {
+    const session = tab.session;
+    if (tab.run || !isClaude(session)) {
+      return false;
+    }
+    if (isPermissionMode(mode)) {
+      tab.chatMode = mode;
+    }
+    if (!tab.chat?.active) {
+      // A chat with this session that is still shutting down (End chat a moment ago) exits before a new one starts.
+      await this.closed(sessionKey(session));
+      if (!(await this.mayStartChat(tab))) {
+        return false;
+      }
+    }
+    if (tab.disposed) {
+      return false;
+    }
+    if (!tab.chat) {
+      tab.chat = new ClaudeChat({
+        sessionId: session.id,
+        mode: tab.chatMode,
+        launch: () => chatLaunch(tab.session),
+        spawn: (exe, args, cwd) => spawn(exe, args, { cwd, shell: false, windowsHide: true, stdio: 'pipe' }),
+        onChange: () => this.scheduleLive(tab),
+        // After the page has heard "sent" (which empties the box) for the message that started this.
+        onUnsent: (texts) => setTimeout(() => panelPost(tab, { type: 'chatRestore', text: texts.join('\n\n') }), 0),
+        log: (line) => logChat(`${session.id.slice(0, 8)} ${line}`),
+      });
+    }
+    tab.chat.setMode(tab.chatMode);
+    this.hooks.rememberTarget?.(sourceOf(session), 'here');
+    // A chat keeps its tab: the shared preview tab would otherwise be taken over by the next transcript opened.
+    if (tab.preview) {
+      this.promote(tab);
+      panelPost(tab, { type: 'promoted' });
+    }
+    tab.chat.send(text);
+    return true;
+  }
+
+  private async mayStartChat(tab: TranscriptTab): Promise<boolean> {
+    const session = tab.session;
+    const terminal = this.hooks.terminalFor?.(session);
+    if (terminal) {
+      const choice = await vscode.window.showWarningMessage(
+        'This session is open in a terminal. Chatting here as well would put two Claude Code processes on one session, and they fork its log. Send your message in that terminal, or close it first.',
+        'Show Terminal',
+      );
+      if (choice === 'Show Terminal') {
+        terminal.show();
+      }
+      return false;
+    }
+    const mtime = statSync(session.filePath, { throwIfNoEntry: false })?.mtimeMs ?? 0;
+    const ownWrite = Math.max(tab.chat?.lastActivity ?? 0, this.ownActivity.get(sessionKey(session)) ?? 0) + 3000;
+    if (Date.now() - mtime < RECENT_WRITE_MS && mtime > ownWrite) {
+      const choice = await vscode.window.showWarningMessage(
+        `This session's log was written ${Math.max(1, Math.round((Date.now() - mtime) / 1000))}s ago, so it may be open somewhere else (a terminal or the Claude Code chat). Two Claude Code processes on one session fork its log.`,
+        { modal: true },
+        'Chat Anyway',
+      );
+      return choice === 'Chat Anyway';
+    }
+    return true;
+  }
+
+  /** Redraws the pending part of the chat soon, coalescing the many changes a streamed reply makes. */
+  private scheduleLive(tab: TranscriptTab): void {
+    if (tab.disposed || tab.liveTimer) {
+      return;
+    }
+    tab.liveTimer = setTimeout(() => {
+      tab.liveTimer = undefined;
+      this.postChat(tab);
+    }, LIVE_REDRAW_MS);
+  }
+
+  /** Sends the page the chat's pending messages and its state. */
+  private postChat(tab: TranscriptTab): void {
+    if (tab.disposed || tab.run) {
+      return;
+    }
+    const chat = tab.chat ?? tab.ending;
+    const status = chat?.status;
+    panelPost(tab, { type: 'chatLive', html: chat ? renderLive(chat.live.pieces, !!status?.busy) : '' });
+    panelPost(tab, chatStateMessage(status, tab.chatMode));
+  }
+
+  /** End chat: a running reply finishes (the tab shows it), then the process exits. Resolves once it has. */
+  private async endTabChat(tab: TranscriptTab, end?: (chat: ClaudeChat) => Promise<void>): Promise<void> {
+    if (!tab.chat) {
+      return;
+    }
+    clearTimeout(tab.liveTimer);
+    tab.liveTimer = undefined;
+    const done = this.retire(tab, end);
+    this.postChat(tab);
+    await done;
+  }
+
+  /**
+   * Takes the tab's chat off it and ends its process, by default letting a running reply finish first (`end`). Until
+   * the process has exited the chat stays in `closing`, so the session still counts as held and window close waits for
+   * it; meanwhile the tab (if still open) keeps showing the finishing reply. Resolves once it has exited.
+   */
+  private retire(tab: TranscriptTab, end: (chat: ClaudeChat) => Promise<void> = (c) => c.end()): Promise<void> {
+    const chat = tab.chat;
+    if (!chat) {
+      return Promise.resolve();
+    }
+    tab.chat = undefined;
+    tab.ending = chat;
+    const key = sessionKey(tab.session);
+    const done = end(chat).finally(() => {
+      this.closing.delete(chat);
+      if (chat.lastActivity) {
+        this.ownActivity.set(key, Math.max(this.ownActivity.get(key) ?? 0, chat.lastActivity));
+      }
+      if (tab.ending === chat) {
+        tab.ending = undefined;
+        this.postChat(tab);
+      }
+    });
+    this.closing.set(chat, { key, done });
+    return done;
+  }
+
+  /** Resolves once every ended chat with the session (by key) has exited. */
+  private closed(key: string): Promise<void> {
+    return Promise.all([...this.closing.values()].filter((c) => c.key === key).map((c) => c.done)).then(() => undefined);
+  }
+
+  /** Whether the session has a chat writer: a tab with a process up or a turn pending, or an ended chat still exiting. */
+  chatHolds(session: SessionInfo): boolean {
+    const key = sessionKey(session);
+    return (
+      this.tabs().some((t) => !t.run && sessionKey(t.session) === key && !!t.chat?.active) ||
+      [...this.closing.values()].some((c) => c.key === key)
+    );
+  }
+
+  /** Whether a chat with the session is in the middle of a reply: a tab's, or one ended and finishing its last turn. */
+  chatReplying(session: SessionInfo): boolean {
+    const key = sessionKey(session);
+    return (
+      this.tabs().some((t) => !t.run && sessionKey(t.session) === key && !!t.chat?.replying) ||
+      [...this.closing].some(([chat, c]) => c.key === key && chat.replying)
+    );
+  }
+
+  /**
+   * Ends every chat with the session, so it can be resumed elsewhere; resolves once every process has exited. `stop`
+   * interrupts a running reply (also one already finishing); otherwise the reply finishes first.
+   */
+  async endChat(session: SessionInfo, stop = false): Promise<void> {
+    const key = sessionKey(session);
+    const end = stop ? (c: ClaudeChat) => c.stopNow() : undefined;
+    const ending = this.tabs()
+      .filter((t) => !t.run && sessionKey(t.session) === key)
+      .map((t) => this.endTabChat(t, end));
+    if (stop) {
+      for (const [chat, c] of this.closing) {
+        if (c.key === key) {
+          void chat.stopNow();
+        }
+      }
+    }
+    await Promise.all(ending);
+    await this.closed(key);
+  }
+
+  /**
+   * Ends every chat process (the window is closing): a running reply gets `turnGraceMs` to finish and is then
+   * interrupted, and a process not gone `graceMs` after its stdin closed is killed. Also covers the chats already
+   * shutting down, from tabs closed or chats ended just before, and waits for all of them.
+   */
+  dispose(turnGraceMs = 1500, graceMs = 1500): Promise<void> {
+    for (const chat of [...this.closing.keys()]) {
+      void chat.dispose(turnGraceMs, graceMs);
+    }
+    for (const t of this.tabs()) {
+      void this.retire(t, (c) => c.dispose(turnGraceMs, graceMs));
+    }
+    return Promise.all([...this.closing.values()].map((c) => c.done)).then(() => undefined);
+  }
+
   private get codiconsUri() {
     return vscode.Uri.joinPath(this.extensionUri, 'node_modules', '@vscode', 'codicons', 'dist');
   }
@@ -351,13 +627,15 @@ export class TranscriptPanels {
           : new vscode.ThemeIcon(isClaude(session) ? 'comment-discussion' : SOURCES[sourceOf(session)].icon);
     }
     let entries: TranscriptEntry[];
+    let logText = '';
     try {
       if (run?.file) {
         // The run's own log; its nested subagents, if any, show as the tool calls that started them.
         entries = parseTranscript(await fs.readFile(run.file, 'utf8'), { sidechain: true });
       } else {
         const subagents = isClaude(session) ? await readSubagentRuns(session.filePath, session.id) : [];
-        entries = parseTranscriptFor(session, await fs.readFile(session.filePath, 'utf8'), subagents);
+        logText = await fs.readFile(session.filePath, 'utf8');
+        entries = parseTranscriptFor(session, logText, subagents);
       }
     } catch (err) {
       // A live update that cannot read the log (moved, mid-rewrite) keeps the page as it is.
@@ -371,6 +649,9 @@ export class TranscriptPanels {
     if (tab.disposed && !full) {
       return;
     }
+    // What the log now records leaves the chat's pending part.
+    const shownChat = tab.chat ?? tab.ending;
+    const forgot = !!shownChat?.live.forget(logText);
     tab.insights = insights;
     const showThinking = vscode.workspace.getConfiguration('claudeSessions').get<boolean>('showThinking', false);
     const webview = panel.webview;
@@ -381,6 +662,15 @@ export class TranscriptPanels {
       showThinking,
       lineWidth: lineWidthSetting(),
       composerTarget: this.composerTarget(sourceOf(session)),
+      // A rebuilt page starts with the chat as it stands, since a message posted while it loads can be lost.
+      chat:
+        !run && isClaude(session)
+          ? {
+              mode: tab.chatMode,
+              live: shownChat ? renderLive(shownChat.live.pieces, shownChat.status.busy) : '',
+              state: chatStateMessage(shownChat?.status, tab.chatMode),
+            }
+          : undefined,
       highlight: tab.highlight,
       preview: tab.preview,
       insights,
@@ -399,6 +689,10 @@ export class TranscriptPanels {
     }
     tab.shown = { file, sig, blocks: parts.blocks, shape: parts.shape };
     this.watchRun(tab);
+    if (forgot && !full && shown && shown.shape === parts.shape) {
+      // Right after the update that brought the same messages in from the log, so nothing shows twice.
+      this.postChat(tab);
+    }
   }
 
   /**
@@ -433,6 +727,30 @@ export class TranscriptPanels {
       },
     };
   }
+}
+
+function panelPost(tab: TranscriptTab, message: unknown): void {
+  if (!tab.disposed) {
+    void tab.panel.webview.postMessage(message);
+  }
+}
+
+/** Where the chat process starts: claude.exe (never a shell shim) in the session's own folder, or why it cannot. */
+function chatLaunch(session: SessionInfo): { exe: string; cwd?: string } | { error: string } {
+  const cwd = projectPath(session);
+  if (!cwd || !existsSync(cwd)) {
+    return {
+      error: `The session's folder no longer exists (${cwd || 'unknown'}). Claude Code finds a session by the folder it ran in, so it cannot be resumed from here.`,
+    };
+  }
+  const command = vscode.workspace.getConfiguration('claudeSessions').get<string>('claudeCommand', 'claude') || 'claude';
+  const found = resolveClaudeExecutable(command, {
+    platform: process.platform,
+    pathEnv: process.env.PATH ?? process.env.Path ?? '',
+    home: os.homedir(),
+    isFile: (p) => !!statSync(p, { throwIfNoEntry: false })?.isFile(),
+  });
+  return 'error' in found ? found : { exe: found.exe, cwd };
 }
 
 /** The message that brings an open page from `blocks` to `parts` in place (see transcript.js). */
@@ -598,7 +916,12 @@ interface HtmlOptions {
   /** How wide prose gets; full when omitted. */
   lineWidth?: LineWidth;
   /** The tool last chosen in a message box for this kind of session; the session's own tool when omitted. */
-  composerTarget?: ContinueTarget;
+  composerTarget?: ComposerTarget;
+  /**
+   * Offer "Chat here" (a Claude Code session's own tab): the permission mode, and the chat's pending part and state
+   * as they stand.
+   */
+  chat?: { mode: PermissionMode; live: string; state: ReturnType<typeof chatStateMessage> };
   /** What the session did, for the side panel; collected from `entries` when omitted. */
   insights?: SessionInsights;
   /** Search words for transcript.js to mark. */
@@ -902,7 +1225,10 @@ function renderEntry(e: TranscriptEntry, showThinking: boolean, source: SourceIn
 const CONTEXT_WARN = 0.8;
 
 /** Display names for where the message box can send. */
-function targetInfo(target: ContinueTarget, hasClaudeCode: boolean): { label: string; icon: string } {
+function targetInfo(target: ComposerTarget, hasClaudeCode: boolean): { label: string; icon: string } {
+  if (target === 'here') {
+    return { label: 'Chat here', icon: 'comment' };
+  }
   if (target === 'claude-chat') {
     return { label: 'Claude Code chat', icon: 'comment-discussion' };
   }
@@ -917,16 +1243,21 @@ function targetInfo(target: ContinueTarget, hasClaudeCode: boolean): { label: st
 function composerData(session: SessionInfo, o: HtmlOptions) {
   const own = sourceOf(session);
   const all: ContinueTarget[] = ['claude', 'claude-chat', 'copilot-cli', 'vscode-chat'];
-  const targets = [own, ...all.filter((t) => t !== own)].filter((t) => t !== 'claude-chat' || o.hasClaudeCode);
+  const tools = [own, ...all.filter((t) => t !== own)].filter((t) => t !== 'claude-chat' || o.hasClaudeCode);
+  const targets: ComposerTarget[] = o.chat ? ['here', ...tools] : tools;
   const fill = session.usage?.context ? session.usage.context.tokens / session.usage.context.limit : 0;
+  // "Chat here" is the default for a Claude Code session. A remembered "claude" (the CLI in a terminal) predates it,
+  // when it was the only way to send to the session, so it counts as no choice.
+  const remembered = o.chat && o.composerTarget === own ? undefined : o.composerTarget;
   return {
-    target: o.composerTarget && targets.includes(o.composerTarget) ? o.composerTarget : own,
+    target: remembered && targets.includes(remembered) ? remembered : targets[0],
     targets: targets.map((id) => ({
       id,
       ...targetInfo(id, o.hasClaudeCode),
-      same: canResumeIn(own, id),
-      cli: id !== 'claude-chat' && id !== 'vscode-chat',
+      same: id === 'here' || canResumeIn(own, id),
+      cli: id !== 'claude-chat' && id !== 'vscode-chat' && id !== 'here',
     })),
+    chat: o.chat && { mode: o.chat.mode, modes: chatModes(), live: o.chat.live, state: o.chat.state },
     context: fill >= CONTEXT_WARN ? Math.round(fill * 100) : 0,
     // When the prompt cache lapses (ms since epoch); 0 when unknown, as for sources without usage.
     cacheExpires: session.usage?.cache ? session.usage.cache.lastRequest + session.usage.cache.ttlMs : 0,
@@ -938,7 +1269,17 @@ function composerData(session: SessionInfo, o: HtmlOptions) {
 
 function renderComposer(session: SessionInfo, o: HtmlOptions): string {
   const data = composerData(session, o);
+  // "Chat here" only: the permission mode, what the chat is doing, Stop while a turn runs, and a way to end the chat.
+  const chatBar = o.chat
+    ? `<div class="chat-bar" id="chat-bar" hidden>
+    <label class="chat-mode" title="Permission mode for Claude Code in this chat. Changing it restarts Claude Code between turns."><i class="codicon codicon-shield"></i><select id="chat-mode" aria-label="Permission mode"></select></label>
+    <span class="chat-state" id="chat-state" aria-live="polite"></span>
+    <button class="btn" id="chat-stop" title="Stop the running turn" hidden><i class="codicon codicon-debug-stop"></i><span>Stop</span></button>
+    <button class="btn" id="chat-end" title="End the chat: closes the Claude Code process behind it" hidden><i class="codicon codicon-close"></i><span>End chat</span></button>
+  </div>`
+    : '';
   return `<footer class="composer" id="composer" data-composer="${escapeHtml(JSON.stringify(data))}">
+  ${chatBar}
   <div class="composer-box">
     <textarea id="composer-input" rows="1" placeholder="Message to continue this session" aria-label="Message to continue this session" aria-describedby="composer-status"></textarea>
     <div class="composer-actions">
@@ -1413,6 +1754,7 @@ function buildPage(session: SessionInfo, o: HtmlOptions, parts: PageParts): stri
 <main class="conversation">
 ${blocks}${placeholder}
 </main>
+${o.chat && !sub ? '<section class="chat-live" id="chat-live" aria-label="Chat in progress" aria-live="polite"></section>' : ''}
 ${sub ? '' : renderComposer(session, o)}
 ${renderSide(parts.side)}
 <button class="fab" id="jump" title="Jump to latest"><i class="codicon codicon-arrow-down"></i></button>
