@@ -1148,6 +1148,41 @@ test('New Claude Code Session: folder, model, effort and agent, started as argv 
   }
 });
 
+test('a reply from the other branch of a forked log renders under its own prompt, marked as the other branch', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-sessions-forked-'));
+  const projectsDir = path.join(root, 'claude');
+  const ID = '2b2b2b2b-1111-4222-8333-944455556666';
+  try {
+    fs.mkdirSync(path.join(projectsDir, 'C--repo'), { recursive: true });
+    fs.copyFileSync(path.join(__dirname, 'fixtures', 'claude-code', 'forked-session.jsonl'), path.join(projectsDir, 'C--repo', `${ID}.jsonl`));
+    relocate(projectsDir, 'C:\\repo', path.join(root, 'repo'));
+    const state = {
+      projectsDir,
+      config: { copilotDir: path.join(root, 'none'), vscodeUserDir: path.join(root, 'none') },
+      providers: {},
+      commands: {},
+      panels: [],
+      panelPosts: [],
+      errors: [],
+      terminals: [],
+      infos: [],
+    };
+    await activateWithSidebar(state);
+    await state.commands['claudeSessions.openTranscript']({ sessionKey: `claude:${ID}` });
+    const html = state.panels[0].webview.html;
+    const mark = 'codicon-git-branch"></i>other branch</span>';
+    const pill = html.indexOf(mark);
+    assert.ok(pill > 0, 'the forked reply is marked');
+    assert.equal(html.indexOf(mark, pill + 1), -1, 'only the forked reply is marked');
+    const order = ['Explain the whole config pipeline', 'No response requested.', 'other branch</span>', 'reads, merges, then validates', 'Which file holds the defaults?', 'defaults.ts'].map((s) => html.indexOf(s));
+    assert.ok(order.every((at) => at > 0), String(order));
+    assert.deepEqual([...order].sort((a, b) => a - b), order);
+    assert.deepEqual(state.errors, []);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('a prompt typed while Claude was mid-turn renders as a user message marked as sent mid-turn', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-sessions-queued-'));
   const projectsDir = path.join(root, 'claude');

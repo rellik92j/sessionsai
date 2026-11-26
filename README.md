@@ -19,6 +19,7 @@ Each card also shows what the session cost, plus a couple of [usage badges](#see
 - **Source chips** under the search box filter by tool (Claude Code, Copilot CLI, VS Code Chat). See [below](#github-copilot-cli-and-vs-code-chat-sessions-too).
 - Hover a card for quick actions: resume, continue in a new session, open in Claude Code chat, read the transcript, or copy the session ID. Right-click for more.
 - **Rename** a Claude Code session from its right-click menu or the pencil in its transcript. It's the same as `/rename` inside Claude Code, so the new name shows up there and in the Claude Code extension too.
+- **Agent-team sessions** often all carry the agent's name (several called "Project Lead", say). When a session's name is its agent's name and it has received a message from another Claude session, its title adds what it was about, as **Project Lead — *topic***. The topic is Claude Code's own title for the session, or else its first prompt, or else the first message it received. A session with no prompt or title of its own, only a message from another session, is titled with the sender's name and that message.
 
 The sidebar refreshes on its own as sessions change, and everything follows your VS Code color theme.
 
@@ -26,7 +27,7 @@ The sidebar refreshes on its own as sessions change, and everything follows your
 
 ![Searching sessions, with the matching passage shown under each card](docs/images/search.png)
 
-Press `/` to search. The search covers the card details and the full conversation: your prompts and Claude's replies, and the paths of files Claude's tools read or edited, but not tool output. When a session matches inside its conversation, its card shows the matching passage.
+Press `/` to search. The search covers the card details and the full conversation: your prompts, Claude's replies, messages from other Claude sessions, and the paths of files Claude's tools read or edited, but not tool output. When a session matches inside its conversation, its card shows the matching passage.
 
 To find the sessions that worked on a file, right-click it in the Explorer or right-click its editor tab and choose **Search Sessions for This File**. The sidebar opens with the file name in the search box.
 
@@ -50,6 +51,7 @@ Click a session to open its transcript. Your prompts are on the right and Claude
 - Each tool call is a compact row with a ✓ or ✗. Click it to see the input and output. File edits show as a red/green diff.
 - Hide tool calls to read just the conversation, or jump straight to the latest message.
 - A message you sent while Claude was still working shows where Claude read it, marked **sent mid-turn**. Its cost stays with the prompt Claude was answering.
+- A message another Claude session sent to this one (from an agent team, for example) shows as a **session message** card on the left: the sender's name and initials, the time, and the message itself. It appears where Claude read it, whether it arrived between turns or while Claude was working, and one that Claude Code logged twice shows once. These messages aren't counted as prompts. On the session's sidebar card, the message count includes them (hover it to see how many came from other sessions), and search finds their text.
 - Subagents show as their own green speaker with the prompt Claude gave them and their reply. One that ran in the background shows twice: where Claude started it, and where its reply reached Claude, so you can see what Claude was doing in between and what it did with the reply. Click **Open run** on a subagent, or its row under Subagents in **Session details**, to read its whole run read-only: every tool call, command and message.
 - If you opened the transcript from a search, your search words are highlighted and it starts at the first match. Step through matches with F3 / Shift+F3.
 - The **Session details** panel (the sidebar button at the top right) lists what the session did: files changed, commits (click for the diff), pull requests, its to-do list as it left it, skills and slash commands, subagents, MCP servers, web lookups, files read, tool calls with failures, and every prompt so you can jump between them.

@@ -1125,11 +1125,14 @@ function renderEntry(e: TranscriptEntry, showThinking: boolean, source: SourceIn
     return '';
   }
   const role = e.role === 'tool' ? 'Tools' : escapeHtml(speakers?.assistant ?? source.assistant);
+  const branch = e.branch
+    ? '<span class="pill" title="Two Claude Code processes wrote to this session at the same time, so the log holds two branches of the conversation. This reply answers the prompt above; it was logged after the other branch went on."><i class="codicon codicon-git-branch"></i>other branch</span>'
+    : '';
   return `
     <div class="msg assistant">
       <div class="avatar ${source.id === 'claude' ? 'claude-avatar' : 'source-avatar'}">${assistantMark(source)}</div>
       <div class="msg-main">
-        <div class="msg-meta"><strong>${role}</strong>${time(e.timestamp)}</div>
+        <div class="msg-meta"><strong>${role}</strong>${branch}${time(e.timestamp)}</div>
         ${body}
       </div>
     </div>`;
