@@ -94,6 +94,12 @@ export interface TranscriptEntry {
    * unless a user record repeating it later started a turn.
    */
   queued?: true;
+  /**
+   * On an assistant entry: a reply from another branch of the conversation. Two Claude Code processes wrote to the
+   * same session at once, and this reply, logged after the other process's later prompts, is shown under the prompt it
+   * answers (Claude Code only).
+   */
+  branch?: true;
   /** On a subagent entry: who ran and what it was asked (Claude Code only). */
   subagent?: {
     name?: string;
@@ -952,22 +958,58 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
   const toolUses = new Map<string, Extract<TranscriptPart, { kind: 'tool_use' }>>();
   // The entry each tool call went into, for runs whose call never got a result.
   const callEntries = new Map<string, TranscriptEntry>();
-  // The prompt being answered, with the requests made since it, to give each prompt its cost.
-  let turn: { entry: TranscriptEntry; usage: UsageCollector; start?: number; last?: number } | undefined;
+  /**
+   * A prompt and what answered it, with the requests made since it, to give each prompt its cost. `tail` is the last
+   * entry shown for it and `fork` the reply entry a second writer's branch is filling (see `place`).
+   */
+  interface Turn {
+    entry: TranscriptEntry;
+    usage: UsageCollector;
+    start?: number;
+    last?: number;
+    tail: TranscriptEntry;
+    fork?: TranscriptEntry;
+  }
+  const turns: Turn[] = [];
+  /** The latest prompt's turn: where records whose parent is unknown go. */
+  let turn: Turn | undefined;
+  /**
+   * The turn each record belongs to, by uuid, found through its `parentUuid`. Two Claude Code processes resuming the
+   * same session both append to its log, so one writer's reply can land after the other's next prompt, parented on
+   * the record it answers. Following the parent keeps that reply with its own prompt.
+   */
+  const owners = new Map<string, Turn | undefined>();
   /** Prompts queued mid-turn since the last typed prompt, so a user record repeating one shows once. */
   let queuedEntries: TranscriptEntry[] = [];
-  const endTurn = () => {
-    const u = turn?.usage.summary();
-    if (turn && u) {
-      const start = turn.start;
-      turn.entry.turn = {
-        cost: u.cost,
-        requests: u.requests,
-        outputTokens: u.tokens.output,
-        durationMs: start !== undefined && turn.last !== undefined && turn.last >= start ? turn.last - start : undefined,
-      };
+  /**
+   * Shows an entry for a turn: at the end when it is the latest turn, as before; otherwise right after what is already
+   * shown for that turn (before the next prompt), so an answer from the other branch sits under its own question.
+   */
+  const place = (entry: TranscriptEntry, owner: Turn | undefined) => {
+    if (!owner || owner === turn) {
+      entries.push(entry);
+      if (owner) {
+        owner.tail = entry;
+      }
+      return;
     }
-    turn = undefined;
+    const at = entries.indexOf(owner.tail) + 1;
+    entries.splice(at > 0 ? at : entries.length, 0, entry);
+    owner.tail = entry;
+  };
+  const endTurns = () => {
+    for (const t of turns) {
+      const u = t.usage.summary();
+      if (u) {
+        const start = t.start;
+        t.entry.turn = {
+          cost: u.cost,
+          requests: u.requests,
+          outputTokens: u.tokens.output,
+          durationMs: start !== undefined && t.last !== undefined && t.last >= start ? t.last - start : undefined,
+        };
+      }
+    }
   };
 
   // In a subagent's own log: its SubagentHandback calls, shown as its reply, whose "delivered" results are dropped.
@@ -977,13 +1019,17 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
     if (!r || typeof r !== 'object' || (r.isSidechain && !options.sidechain)) {
       continue;
     }
-    if (r.type === 'assistant' && turn) {
-      turn.usage.add(r, false);
-      turn.last = parseTime(r.timestamp) ?? turn.last;
+    const owner = (typeof r.parentUuid === 'string' ? owners.get(r.parentUuid) : undefined) ?? turn;
+    if (typeof r.uuid === 'string') {
+      owners.set(r.uuid, owner);
+    }
+    if (r.type === 'assistant' && owner) {
+      owner.usage.add(r, false);
+      owner.last = parseTime(r.timestamp) ?? owner.last;
     }
 
     if (r.type === 'system' && r.subtype === 'compact_boundary') {
-      entries.push({ role: 'system', timestamp: r.timestamp, parts: [{ kind: 'text', text: 'Conversation compacted' }] });
+      place({ role: 'system', timestamp: r.timestamp, parts: [{ kind: 'text', text: 'Conversation compacted' }] }, owner);
       continue;
     }
 
@@ -1030,12 +1076,25 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
       // Claude Code writes one line per content block and one message per tool round trip;
       // merge everything Claude does between two user prompts into a single turn.
       // A subagent's reply in between starts a new one, so the conversation reads main AI, subagent, main AI.
-      let target = entries[entries.length - 1];
-      if (target?.role === 'assistant') {
+      let target: TranscriptEntry | undefined;
+      if (!owner || owner === turn) {
+        target = entries[entries.length - 1];
+        if (target?.role === 'assistant') {
+          target.parts.push(...parts);
+        } else {
+          target = { role: 'assistant', timestamp: r.timestamp, parts };
+          place(target, owner);
+        }
+      } else if (owner.fork && owner.tail === owner.fork) {
+        // The other branch's reply goes on: kept in one entry, as a reply on the main line would be.
+        target = owner.fork;
         target.parts.push(...parts);
       } else {
-        target = { role: 'assistant', timestamp: r.timestamp, parts };
-        entries.push(target);
+        // A reply from the other branch, never merged into what is shown for its prompt already (which may be the
+        // other writer's "No response requested." or a later prompt's reply).
+        target = { role: 'assistant', timestamp: r.timestamp, parts, branch: true };
+        place(target, owner);
+        owner.fork = target;
       }
       if (runs.length) {
         for (const p of parts) {
@@ -1053,7 +1112,7 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
       if (msg) {
         const entry = handbackEntry(msg, r.timestamp ?? r.attachment?.timestamp);
         if (entry) {
-          entries.push(entry);
+          place(entry, owner);
         }
         continue;
       }
@@ -1064,7 +1123,7 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
         if (peer) {
           const entry = peerEntry(peer, r.timestamp ?? r.attachment?.timestamp);
           if (entry) {
-            entries.push(entry);
+            place(entry, owner);
           }
           continue;
         }
@@ -1074,7 +1133,7 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
       const queued = parseQueuedPrompt(r);
       if (queued) {
         const entry: TranscriptEntry = { role: 'user', timestamp: r.timestamp ?? r.attachment?.timestamp, parts: [{ kind: 'text', text: queued }], queued: true };
-        entries.push(entry);
+        place(entry, owner);
         queuedEntries.push(entry);
         continue;
       }
@@ -1086,7 +1145,7 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
       const peer = parsePeerRecord(r);
       const entry = peer ? peerEntry(peer, r.timestamp) : undefined;
       if (entry) {
-        entries.push(entry);
+        place(entry, owner);
       }
       continue;
     }
@@ -1121,9 +1180,9 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
         }
       }
       if (orphans.length) {
-        entries.push({ role: 'tool', timestamp: r.timestamp, parts: orphans });
+        place({ role: 'tool', timestamp: r.timestamp, parts: orphans }, owner);
       }
-      entries.push(...answered);
+      answered.forEach((e) => place(e, owner));
       continue;
     }
 
@@ -1141,10 +1200,13 @@ export function parseTranscript(text: string, options: TranscriptOptions = {}): 
     if (!repeated) {
       entries.push(entry);
     }
-    endTurn();
-    turn = { entry, usage: new UsageCollector(), start: parseTime(r.timestamp) };
+    turn = { entry, usage: new UsageCollector(), start: parseTime(r.timestamp), tail: entries[entries.length - 1] ?? entry };
+    turns.push(turn);
+    if (typeof r.uuid === 'string') {
+      owners.set(r.uuid, turn);
+    }
   }
-  endTurn();
+  endTurns();
   // A call whose result was never logged (interrupted): its run goes right after the call.
   for (const [id, entry] of callEntries) {
     const run = runFor(id, undefined);
