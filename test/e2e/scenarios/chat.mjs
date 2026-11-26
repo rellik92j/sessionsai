@@ -32,10 +32,10 @@ const sendLabel = async (ctx) => (await transcript(ctx)).$eval('#composer-send s
 const waitingShown = async (ctx) => (await transcript(ctx)).$$eval('#chat-live .chat-pending.waiting', (els) => els.map((el) => el.textContent || ''));
 
 /** Starts a slow reply in Chat here and presses End chat during it; returns once the bar says it is finishing. */
-async function endMidReply(ctx) {
+async function endMidReply(ctx, message = 'Tell me twelve lines.') {
   const frame = await openTranscript(ctx);
   await chatHere(frame);
-  await send(frame, 'Tell me twelve lines.');
+  await send(frame, message);
   await midReply(ctx);
   await click(ctx, '#chat-end');
   await waitFor('the chat bar to say the reply is finishing', async () => /Chat ended: Claude is finishing/.test(await chatState(ctx)), 5_000);
@@ -450,6 +450,13 @@ const SCENARIOS = [
       await waitFor('the chat bar to count 2 messages', async () => /Your 2 messages start a new chat after it/.test(await chatState(ctx)), 5_000);
       const shown = await waitingShown(ctx);
       assert(shown.length === 2 && shown[0].includes(first) && shown[1].includes(second), `the waiting messages show as ${JSON.stringify(shown)}`);
+      const below = await (await transcript(ctx)).evaluate(() => {
+        const reply = document.querySelector('#chat-live .msg.assistant.chat-pending');
+        const waiting = document.querySelector('#chat-live .chat-pending.waiting');
+        return { reply: !!reply, below: !!(reply && waiting && reply.compareDocumentPosition(waiting) & Node.DOCUMENT_POSITION_FOLLOWING) };
+      });
+      assert(below.reply, 'the finishing reply is not shown');
+      assert(below.below, 'the waiting messages are not below the finishing reply');
       await waitEvent(ctx.s, ctx.id, 'turn-end', (e) => e.how === 'completed', 30_000);
       assert(!events(ctx.s, ctx.id).some((e) => e.event === 'interrupt'), 'sending while it finished interrupted the reply');
       await newChatGets(ctx, [first, second]);
@@ -475,12 +482,38 @@ const SCENARIOS = [
       const text = 'Sent once the stopped chat is gone.';
       await endMidReply(ctx);
       await sendWhileFinishing(ctx, text);
+      const stoppedAt = Date.now();
       await click(ctx, '#chat-stop');
       await waitEvent(ctx.s, ctx.id, 'interrupt', undefined, 5_000);
       await waitEvent(ctx.s, ctx.id, 'turn-end', (e) => e.how === 'interrupted', 5_000);
       assert(!events(ctx.s, ctx.id).some((e) => e.event === 'turn-end' && e.how === 'completed'), 'the reply ran to the end after Stop');
-      // At once: the new chat gets the message within seconds of Stop, not after the reply would have finished.
-      await newChatGets(ctx, [text], 5_000);
+      await newChatGets(ctx, [text]);
+      // At once: the new chat gets the message within a couple of seconds of Stop (a new process takes about one to
+      // start). About 4 s of the reply are left when Stop is pressed, so waiting for it to finish would take longer.
+      const got = events(ctx.s, ctx.id).find((e) => e.event === 'turn-start' && e.text === text);
+      const took = got.t - stoppedAt;
+      assert(took < 2_500, `the new chat got the message ${took} ms after Stop, not at once`);
+    },
+  },
+  {
+    name: 'waiting-message-after-reply-before-exit',
+    prompt: 'E2E send after the reply ends, before the chat process exits',
+    async run(ctx) {
+      const text = 'Sent once the lingering chat has gone.';
+      // "lingering": the stand-in stays up for a few seconds after the reply, so the gap can be looked at.
+      await endMidReply(ctx, 'Tell me twelve lines, lingering.');
+      // The gap is short (the extension kills a process 3 s after its stdin closed), so no waiting on anything else.
+      await waitFor('the chat bar to stop saying the reply is finishing', async () => !/finishing/.test(await chatState(ctx)), 15_000);
+      const frame = await transcript(ctx);
+      await send(frame, text);
+      await waitFor('the chat bar to say the message starts a new chat once the ended one has stopped', async () => /Your message starts a new chat once the ended one has stopped/.test(await chatState(ctx)), 5_000);
+      assert((await sendLabel(ctx)) === 'Queue', `the Send button reads "${await sendLabel(ctx)}", not Queue`);
+      const shown = await waitingShown(ctx);
+      assert(shown.length === 1 && shown[0].includes(text) && shown[0].includes(WAITING_PILL), `the waiting message shows as ${JSON.stringify(shown)}`);
+      const ev = events(ctx.s, ctx.id);
+      assert(ev.some((e) => e.event === 'turn-end' && e.how === 'completed'), 'the reply had not ended in the gap');
+      assert(!ev.some((e) => e.event === 'exit'), 'the chat process exited before the gap could be checked');
+      await newChatGets(ctx, [text]);
     },
   },
   {
