@@ -50,7 +50,12 @@ function fakeVscode(state) {
         this.id = id;
       }
     },
-    RelativePattern: class {},
+    RelativePattern: class {
+      constructor(base, pattern) {
+        this.base = base;
+        this.pattern = pattern;
+      }
+    },
     ViewColumn: { Active: -1, Beside: -2 },
     TerminalLocation: { Panel: 1 },
     ConfigurationTarget: { Global: 1 },
@@ -63,7 +68,17 @@ function fakeVscode(state) {
         get: (k, d) => (k === 'projectsDir' ? state.projectsDir : k in (state.config ?? {}) ? state.config[k] : d),
         update: async () => {},
       }),
-      createFileSystemWatcher: () => ({ onDidCreate() {}, onDidChange() {}, onDidDelete() {}, dispose() {} }),
+      // Watchers are kept in state.watchers, so a test can fire one as if its files had changed on disk.
+      createFileSystemWatcher: (pattern) => {
+        const w = { pattern, change: [], create: [], disposed: false };
+        (state.watchers ??= []).push(w);
+        return {
+          onDidCreate: (f) => (w.create.push(f), disposable),
+          onDidChange: (f) => (w.change.push(f), disposable),
+          onDidDelete: () => disposable,
+          dispose: () => (w.disposed = true),
+        };
+      },
       onDidChangeConfiguration: () => disposable,
       onDidChangeWorkspaceFolders: () => disposable,
       registerTextDocumentContentProvider: () => disposable,
@@ -1188,6 +1203,155 @@ test('a message from another session that arrived mid-turn renders as a session 
 
     send({ type: 'search', query: '"start on the parser scope now"' });
     assert.deepEqual(last('searchResults').ids, [`claude:${ID}`]);
+    assert.deepEqual(state.errors, []);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('an open transcript follows its log as it grows, redrawing only what changed', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-sessions-live-'));
+  const projectsDir = path.join(root, 'claude');
+  const ID = '1a1a1a1a-1111-4222-8333-944455556666';
+  const log = path.join(projectsDir, 'C--repo', `${ID}.jsonl`);
+  try {
+    // The session so far: a prompt, a Read with its result, and an Edit still waiting for its result.
+    const lines = fs.readFileSync(path.join(__dirname, 'fixtures', 'claude-code', 'live-session.jsonl'), 'utf8').trimEnd().split('\n');
+    fs.mkdirSync(path.dirname(log), { recursive: true });
+    fs.writeFileSync(log, lines.slice(0, 5).join('\n') + '\n');
+    relocate(projectsDir, 'C:\\repo', path.join(root, 'repo'));
+    const repo = JSON.stringify(path.join(root, 'repo')).slice(1, -1);
+    const rest = lines.slice(5).map((l) => l.split('C:\\\\repo').join(repo));
+    const state = {
+      projectsDir,
+      config: { copilotDir: path.join(root, 'none'), vscodeUserDir: path.join(root, 'none') },
+      providers: {},
+      commands: {},
+      panels: [],
+      panelPosts: [],
+      errors: [],
+      terminals: [],
+      infos: [],
+    };
+    const { posted } = await activateWithSidebar(state);
+    await state.commands['claudeSessions.openTranscript']({ sessionKey: `claude:${ID}` });
+    const panel = state.panels[0];
+    const page = panel.webview.html;
+    // The page's blocks as drawn: one per entry, a prompt and the reply so far.
+    const conversation = /<main class="conversation">\n([\s\S]*)\n<\/main>/.exec(page)[1];
+    const pageBlocks = conversation.split(/\n?<div class="block" data-block="\d+">/).slice(1).map((b) => b.replace(/<\/div>$/, ''));
+    const shown = pageBlocks.length;
+    assert.equal(shown, 2);
+    assert.match(page, /codicon-circle-large-outline status pending/, 'the Edit has no result yet');
+
+    // The session watcher fires; the model re-reads the logs, and each open tab looks at its own.
+    const sessionWatcher = state.watchers.find((w) => w.pattern.pattern === '*/*.jsonl');
+    const reload = async () => {
+      const before = posted.filter((m) => m.type === 'state').length;
+      sessionWatcher.change.forEach((f) => f());
+      await waitFor(() => posted.filter((m) => m.type === 'state').length > before, 'the model to reload', 5000);
+    };
+    const updates = () => state.panelPosts.filter((m) => m.type === 'update');
+
+    // Nothing changed on disk: the tab is left alone.
+    await reload();
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(updates().length, 0, 'a log that did not change is not redrawn');
+
+    // The Edit's result, the reply, the turn's end, a second prompt and its answer arrive.
+    fs.appendFileSync(log, rest.join('\n') + '\n');
+    await reload();
+    await waitFor(() => updates().length === 1, 'the tab to post an update');
+    assert.equal(panel.webview.html, page, 'the page is patched in place, not rebuilt');
+    const { patch, heroStats, side, composer, title } = updates()[0];
+    assert.ok(patch.length > shown, `new entries: ${patch.length} after ${shown}`);
+    assert.equal(patch.added, patch.length - shown);
+    const indexes = patch.blocks.map((b) => b.index);
+    assert.deepEqual(indexes, [...indexes].sort((a, b) => a - b), 'in order');
+    for (const b of patch.blocks.filter((x) => x.index < shown)) {
+      assert.notEqual(b.html, pageBlocks[b.index], `block ${b.index} is only resent because it changed`);
+    }
+    // An earlier entry changed: the Edit's result landed on the tool call already on the page, and the reply that
+    // followed it joined the same entry.
+    const edit = patch.blocks.find((b) => b.index < shown && /tool-name">Edit</.test(b.html));
+    assert.ok(edit, 'the Edit block is resent');
+    assert.match(edit.html, /codicon-check status ok/);
+    assert.match(edit.html, /<strong>loadConfig<\/strong>/);
+    const added = patch.blocks.filter((b) => b.index >= shown).map((b) => b.html).join('');
+    assert.match(added, /Now run the tests/);
+    assert.match(added, /All 12 tests pass\./);
+    // The rest of the page follows too: usage, side panel, the message box's view of the context.
+    assert.match(heroStats, /class="stats"/);
+    assert.match(side, /data-section="prompts"/);
+    assert.equal(typeof composer.contextTokens, 'number');
+    assert.equal(title, /<h1>(.*?)<\/h1>/.exec(page)[1]);
+
+    // And once it is up to date, another reload sends nothing.
+    await reload();
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(updates().length, 1);
+    assert.deepEqual(state.errors, []);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a subagent run's tab follows the run's own log", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-sessions-live-run-'));
+  const projectsDir = path.join(root, 'claude');
+  const ID = '5e1f0c2a-1111-4222-8333-944455556666';
+  const AGENT = 'a1111111111111111';
+  try {
+    fs.cpSync(path.join(__dirname, 'fixtures', 'claude-subagents'), projectsDir, { recursive: true });
+    relocate(projectsDir, 'C:\\repo', path.join(root, 'repo'));
+    const state = {
+      projectsDir,
+      config: { copilotDir: path.join(root, 'none'), vscodeUserDir: path.join(root, 'none') },
+      providers: {},
+      commands: {},
+      panels: [],
+      panelPosts: [],
+      errors: [],
+      terminals: [],
+      infos: [],
+    };
+    await activateWithSidebar(state);
+    await state.commands['claudeSessions.openTranscript']({ sessionKey: `claude:${ID}` });
+    const panel = state.panels[0];
+    await panel.onMessage({ command: 'openSubagent', arg: AGENT });
+    const page = panel.webview.html;
+    const runLog = path.join(projectsDir, 'C--repo', ID, 'subagents', `agent-${AGENT}.jsonl`);
+    const watcher = state.watchers.find((w) => w.pattern.pattern === path.basename(runLog) && !w.disposed);
+    assert.ok(watcher, "the tab watches the run's log");
+    assert.equal(watcher.pattern.base.fsPath, path.dirname(runLog));
+
+    const updates = () => state.panelPosts.filter((m) => m.type === 'update');
+    fs.appendFileSync(
+      runLog,
+      JSON.stringify({
+        type: 'assistant',
+        isSidechain: true,
+        agentId: AGENT,
+        sessionId: ID,
+        parentUuid: 'r1u4',
+        message: { role: 'assistant', id: 'msg_live_r9', model: 'claude-opus-5-5', content: [{ type: 'text', text: 'Release 1.2.0 handed over to the main session.' }] },
+        uuid: 'r1a9',
+        timestamp: '2026-11-20T10:02:00.000Z',
+      }) + '\n',
+    );
+    watcher.change.forEach((f) => f());
+    await waitFor(() => updates().length === 1, "the run's tab to post an update");
+    assert.equal(panel.webview.html, page);
+    const { patch, composer } = updates()[0];
+    // The reply joins the agent's last entry, after its tool call: that one block is redrawn.
+    assert.equal(patch.blocks.length, 1);
+    assert.equal(patch.blocks[0].index, patch.length - 1);
+    assert.match(patch.blocks[0].html, /Release 1\.2\.0 handed over to the main session\./);
+    assert.equal(composer, undefined, 'a run has no message box');
+
+    // Going back to the session stops watching the run.
+    await panel.onMessage({ command: 'openParent' });
+    assert.ok(watcher.disposed);
     assert.deepEqual(state.errors, []);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });

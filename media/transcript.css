@@ -599,6 +599,21 @@ body.hide-tools .tool-group { display: none; }
 }
 .fab.visible { opacity: 1; transform: none; pointer-events: auto; }
 .fab:hover { background: var(--subtle-2); }
+/* New messages arrived below the part being read (a live update, see transcript.js). */
+.fab.has-new::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--claude);
+  box-shadow: 0 0 0 2px var(--vscode-editor-background);
+}
+
+/* Wrappers that let a live update replace one entry; they take no part in layout. */
+.conversation > .block, .hero-stats, .side-body { display: contents; }
 
 /* ---------- search highlights ---------- */
 

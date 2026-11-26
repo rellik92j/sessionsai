@@ -37,6 +37,16 @@
     }
   });
 
+  // A block the reader opened or closed keeps that state when a live update redraws the message it is in.
+  document.addEventListener(
+    'click',
+    (e) => {
+      const summary = e.target.closest('.conversation summary');
+      if (summary) summary.parentElement.dataset.touched = '';
+    },
+    true,
+  );
+
   // ---------- new messages ----------
 
   // The page is rebuilt on every reload, so only messages added since the last render of this same session get the
@@ -203,7 +213,12 @@
     sendBtn.addEventListener('click', () => send(false));
 
     window.addEventListener('message', (e) => {
-      if (e.data?.type === 'sent') {
+      if (e.data?.type === 'update' && e.data.composer) {
+        // The session ran on: its context and cache, and with them the default route, may have changed.
+        Object.assign(cfg, e.data.composer);
+        describe();
+        if (!menu.hidden) renderMenu();
+      } else if (e.data?.type === 'sent') {
         sending = false;
         input.value = '';
         saveDraft();
@@ -258,9 +273,13 @@
       if (now !== wasDocked) setSide(now && saved.sideOpen !== false);
       wasDocked = now;
     });
-    // Which sections are expanded survives reloads of the tab.
+    wireSections();
+  }
+
+  /** Which sections are expanded survives reloads of the tab, and live updates that redraw them. */
+  function wireSections() {
     const sections = saved.sections || {};
-    side.querySelectorAll('details[data-section]').forEach((d) => {
+    side?.querySelectorAll('details[data-section]').forEach((d) => {
       if (d.dataset.section in sections) d.open = sections[d.dataset.section];
       d.addEventListener('toggle', () => {
         saved.sections = { ...(saved.sections || {}), [d.dataset.section]: d.open };
@@ -285,22 +304,33 @@
   applyTools(saved.showTools !== false);
 
   // Compact top bar gets a shadow once the hero scrolls away; the jump button shows when far from the bottom.
+  // While messages arrive below the part being read, the button also says so, until the reader reaches the bottom.
   const jump = document.getElementById('jump');
+  /** Within this many pixels of the bottom, the reader is following along and new messages scroll into view. */
+  const AT_BOTTOM = 80;
+  const fromBottom = () => document.documentElement.scrollHeight - (window.scrollY + window.innerHeight);
   const onScroll = () => {
-    const y = window.scrollY;
-    document.body.classList.toggle('scrolled', y > 8);
-    const fromBottom = document.documentElement.scrollHeight - (y + window.innerHeight);
-    jump.classList.toggle('visible', fromBottom > 600);
+    document.body.classList.toggle('scrolled', window.scrollY > 8);
+    const gap = fromBottom();
+    if (gap <= AT_BOTTOM) setNewBelow(false);
+    jump.classList.toggle('visible', gap > 600 || jump.classList.contains('has-new'));
   };
+  function setNewBelow(on) {
+    jump.classList.toggle('has-new', on);
+    jump.title = on ? 'New messages below' : 'Jump to latest';
+  }
   window.addEventListener('scroll', onScroll, { passive: true });
   jump.addEventListener('click', () => window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'smooth' }));
 
   // ---------- stats ----------
 
   // Widths are set here because the page's CSP doesn't allow inline style attributes.
-  document.querySelectorAll('.meter [data-fill], .side-bar [data-fill]').forEach((el) => {
-    el.style.width = `${Math.min(100, Number(el.dataset.fill) * 100)}%`;
-  });
+  function applyFills(root) {
+    root.querySelectorAll('.meter [data-fill], .side-bar [data-fill]').forEach((el) => {
+      el.style.width = `${Math.min(100, Number(el.dataset.fill) * 100)}%`;
+    });
+  }
+  applyFills(document);
 
   function duration(ms) {
     const min = Math.max(1, Math.round(ms / 60000));
@@ -309,10 +339,13 @@
     return hr < 48 ? `${hr}h` : `${Math.round(hr / 24)}d`;
   }
 
-  /** The prompt cache tile and its top-bar twin count down while the cache is warm, then say how long ago it expired. */
-  const cacheTile = document.querySelector('.stat.cache');
-  const cacheShort = document.querySelector('.topbar-stats .cache');
+  /**
+   * The prompt cache tile and its top-bar twin count down while the cache is warm, then say how long ago it expired.
+   * Looked up each time, since a live update replaces both.
+   */
   function updateCache() {
+    const cacheTile = document.querySelector('.stat.cache');
+    const cacheShort = document.querySelector('.topbar-stats .cache');
     const el = cacheTile || cacheShort;
     if (!el) return;
     const left = Number(el.dataset.expires) - Date.now();
@@ -423,6 +456,7 @@
     // A match in a subagent's prompt sits in two collapsed blocks; open every one around it.
     for (let d = mark.closest('details:not([open])'); d; d = d.parentElement?.closest('details:not([open])')) {
       d.setAttribute('open', '');
+      d.dataset.touched = '';
     }
     mark.scrollIntoView({ block: 'center' });
     findBar.querySelector('.find-count').textContent = `${current + 1} of ${hits.length}`;
@@ -457,4 +491,135 @@
     window.scrollTo(0, document.documentElement.scrollHeight);
   }
   onScroll();
+
+  // ---------- live updates ----------
+
+  // The session's log grew while the tab was open. Only what changed is redrawn, in place, so the scroll position,
+  // the message box, the find widget and the blocks the reader opened or closed all stay as they were.
+  window.addEventListener('message', (e) => {
+    if (e.data?.type === 'update') applyUpdate(e.data);
+  });
+
+  /** What the last update sent for each region, so a region that comes back the same is not redrawn. */
+  const lastSent = {};
+  const changed = (region, html) => {
+    if (typeof html !== 'string' || lastSent[region] === html) return false;
+    lastSent[region] = html;
+    return true;
+  };
+
+  function applyUpdate(u) {
+    const following = fromBottom() <= AT_BOTTOM;
+    const added = u.patch ? patchBlocks(u.patch) : 0;
+
+    setText('.hero h1', u.title);
+    setText('.topbar-title > span:last-child', u.title);
+    document.title = u.title;
+    setHtml('.hero .chips', u.chips);
+    setText('[data-tool-label]', u.toolLabel);
+    setHtml('.strip-stats', u.strip);
+
+    const heroStats = document.getElementById('hero-stats');
+    if (heroStats && changed('heroStats', u.heroStats)) {
+      const breakdownOpen = heroStats.querySelector('.cost-breakdown')?.open;
+      heroStats.innerHTML = u.heroStats;
+      const breakdown = heroStats.querySelector('.cost-breakdown');
+      if (breakdown && breakdownOpen) breakdown.open = true;
+      applyFills(heroStats);
+    }
+
+    const sideBody = document.getElementById('side-body');
+    if (sideBody && changed('side', u.side)) {
+      // Sections whose "Show more" was clicked stay expanded.
+      const expanded = Array.from(sideBody.querySelectorAll('details[data-section]'))
+        .filter((d) => !d.querySelector('[data-more]') && d.querySelector('[data-extra]'))
+        .map((d) => d.dataset.section);
+      sideBody.innerHTML = u.side;
+      for (const id of expanded) {
+        const d = sideBody.querySelector(`details[data-section="${id}"]`);
+        d?.querySelectorAll('[data-extra]').forEach((li) => (li.hidden = false));
+        d?.querySelector('[data-more]')?.remove();
+      }
+      applyFills(sideBody);
+      wireSections();
+    }
+    updateCache();
+
+    if (added) {
+      if (following) {
+        window.scrollTo(0, document.documentElement.scrollHeight);
+      } else {
+        setNewBelow(true);
+      }
+    }
+    onScroll();
+  }
+
+  /** Replaces the blocks that changed and adds the new ones; returns how many messages were added. */
+  function patchBlocks(patch) {
+    const conv = document.querySelector('.conversation');
+    if (!conv) return 0;
+    let added = 0;
+    for (const { index, html } of patch.blocks) {
+      const block = document.createElement('div');
+      block.className = 'block';
+      block.dataset.block = String(index);
+      block.innerHTML = html;
+      const old = conv.querySelector(`:scope > .block[data-block="${index}"]`);
+      if (old) {
+        keepTouched(old, block);
+        old.replaceWith(block);
+      } else {
+        // Blocks arrive in order, so a new one goes after every block before it.
+        const next = Array.from(conv.querySelectorAll(':scope > .block')).find((b) => Number(b.dataset.block) > index);
+        conv.insertBefore(block, next ?? conv.querySelector(':scope > .empty'));
+        block.querySelectorAll('.msg').forEach((m) => {
+          m.classList.add('new');
+          added++;
+        });
+      }
+    }
+    conv.querySelectorAll(':scope > .block').forEach((b) => {
+      if (Number(b.dataset.block) >= patch.length) b.remove();
+    });
+    if (conv.querySelector(':scope > .block > *')) conv.querySelector(':scope > .empty')?.remove();
+
+    // Matches in a redrawn message are gone with it; the find bar counts what is left.
+    if (hits.length) {
+      const kept = hits.filter((m) => m.isConnected);
+      if (kept.length !== hits.length) {
+        hits.splice(0, hits.length, ...kept);
+        current = Math.min(current, hits.length - 1);
+        if (!hits.length) clearHits();
+        else findBar.querySelector('.find-count').textContent = `${current + 1} of ${hits.length}`;
+      }
+    }
+
+    // The entrance animation is for messages that arrived since the page was drawn; remember how many there are now.
+    saved.seen = { key: document.body.dataset.session, count: conv.querySelectorAll('.msg').length };
+    vscode.setState({ ...saved });
+    return added;
+  }
+
+  /** Carries over the open state of the blocks the reader opened or closed, matched by their order in the message. */
+  function keepTouched(from, to) {
+    const before = from.querySelectorAll('details');
+    const after = to.querySelectorAll('details');
+    before.forEach((d, i) => {
+      if ('touched' in d.dataset && after[i]) {
+        after[i].open = d.open;
+        after[i].dataset.touched = '';
+      }
+    });
+  }
+
+  function setText(selector, text) {
+    const el = document.querySelector(selector);
+    if (el && typeof text === 'string' && el.textContent !== text) el.textContent = text;
+  }
+
+  function setHtml(selector, html) {
+    const el = document.querySelector(selector);
+    if (el && changed(selector, html)) el.innerHTML = html;
+  }
 })();

@@ -10,6 +10,7 @@ import { projectName, projectPath, SessionModel } from './model';
 import { parseTranscript, SessionInfo, SubagentRun, TranscriptEntry, TranscriptPart, TurnStats } from './sessionParser';
 import { findSubagentRun, readSubagentRuns } from './sessionStore';
 import { parseTranscriptFor } from './transcripts';
+import { diffBlocks, logSignature } from './transcriptUpdate';
 import { canResumeIn, ContinueTarget, isClaude, NO_FOLDER, sessionKey, SessionSource, SourceInfo, SOURCES, sourceOf } from './sources';
 import { UsageSummary } from './usage';
 
@@ -26,7 +27,19 @@ interface TranscriptTab {
   insights?: SessionInsights;
   /** Set when the tab shows one of the session's subagent runs instead of the session: read-only, no resume or send. */
   run?: SubagentRun;
+  /** What the page was last drawn from, so a live update can tell whether the log changed and send only what did. */
+  shown?: { file: string; sig: string; blocks: string[]; shape: string };
+  /** Draws run one at a time per tab, in order. */
+  queue: Promise<void>;
+  /** A live update is waiting in the queue, so another would find nothing new. */
+  updateQueued?: boolean;
+  /** Watches a subagent run's own log, which the extension's session watcher does not cover. */
+  watcher?: { file: string; disposable: vscode.Disposable };
+  disposed?: boolean;
 }
+
+/** How long a subagent run's log must be quiet before its tab updates; runs write in bursts. */
+const RUN_UPDATE_DELAY = 500;
 
 /** Messages that act on the session as a whole: resuming, continuing, sending or renaming. A subagent tab ignores them. */
 const SESSION_ACTIONS = new Set(['resume', 'continueInNewSession', 'continueInNewSessionWithModel', 'openInClaudeCode', 'send', 'rename']);
@@ -58,7 +71,18 @@ export class TranscriptPanels {
     private readonly model: SessionModel,
     /** The tool last chosen in a message box for this kind of session, if any. */
     private readonly composerTarget: (source: SessionSource) => ContinueTarget | undefined = () => undefined,
-  ) {}
+  ) {
+    // The model re-reads changed logs (debounced) and then fires; each open tab whose log changed follows along.
+    model.onDidChange(() => {
+      for (const tab of this.tabs()) {
+        this.update(tab);
+      }
+    });
+  }
+
+  private tabs(): TranscriptTab[] {
+    return [...this.pinned.values(), ...(this.preview ? [this.preview] : [])];
+  }
 
   /**
    * Opens the transcript; `highlight` words are marked and the page opens at the first match.
@@ -67,7 +91,7 @@ export class TranscriptPanels {
   /** Applies a changed transcriptLineWidth setting to the open tabs without rebuilding them. */
   applyLineWidth(): void {
     const value = lineWidthSetting();
-    for (const tab of [...this.pinned.values(), ...(this.preview ? [this.preview] : [])]) {
+    for (const tab of this.tabs()) {
       tab.panel.webview.postMessage({ type: 'lineWidth', value });
     }
   }
@@ -117,13 +141,16 @@ export class TranscriptPanels {
       retainContextWhenHidden: true,
       localResourceRoots: [this.codiconsUri, this.mediaUri],
     });
-    const tab: TranscriptTab = { panel, session, highlight, preview, run };
+    const tab: TranscriptTab = { panel, session, highlight, preview, run, queue: Promise.resolve() };
     if (preview) {
       this.preview = tab;
     } else {
       this.pinned.set(tabKey(session, run), tab);
     }
     panel.onDidDispose(() => {
+      tab.disposed = true;
+      tab.watcher?.disposable.dispose();
+      tab.watcher = undefined;
       if (this.preview === tab) {
         this.preview = undefined;
       } else if (this.pinned.get(tabKey(tab.session, tab.run)) === tab) {
@@ -264,15 +291,65 @@ export class TranscriptPanels {
     return vscode.Uri.joinPath(this.extensionUri, 'media');
   }
 
-  private async render(tab: TranscriptTab): Promise<void> {
-    const { panel, session, run } = tab;
-    // The preview tab switches sessions, and with them sources.
-    const claudeCode = vscode.extensions.getExtension('anthropic.claude-code');
-    panel.iconPath = run
-      ? new vscode.ThemeIcon('hubot')
-      : isClaude(session) && claudeCode
-        ? vscode.Uri.joinPath(claudeCode.extensionUri, 'resources', 'claude-logo.svg')
-        : new vscode.ThemeIcon(isClaude(session) ? 'comment-discussion' : SOURCES[sourceOf(session)].icon);
+  /** Rebuilds the whole page, after whatever draw of this tab is already under way. */
+  private render(tab: TranscriptTab): Promise<void> {
+    tab.queue = tab.queue.then(() => this.draw(tab, true));
+    return tab.queue;
+  }
+
+  /**
+   * Brings the page up to date with its log if the log changed since the page was drawn: new and changed entries go
+   * to the page in place, so its scroll position, message box and expanded blocks stay as they are.
+   */
+  private update(tab: TranscriptTab): void {
+    if (tab.updateQueued || tab.disposed) {
+      return;
+    }
+    tab.updateQueued = true;
+    tab.queue = tab.queue.then(() => {
+      tab.updateQueued = false;
+      return this.draw(tab, false);
+    });
+  }
+
+  /** Never rejects, so one failed draw does not stop the tab's later ones. */
+  private async draw(tab: TranscriptTab, full: boolean): Promise<void> {
+    try {
+      await this.drawUnsafe(tab, full);
+    } catch (err) {
+      if (full) {
+        vscode.window.showErrorMessage(`Could not show the transcript: ${(err as Error).message}`);
+      }
+    }
+  }
+
+  private async drawUnsafe(tab: TranscriptTab, full: boolean): Promise<void> {
+    if (tab.disposed && !full) {
+      return;
+    }
+    const { panel, run } = tab;
+    const file = run?.file ?? tab.session.filePath;
+    const sig = logSignature(await fs.stat(file).catch(() => undefined));
+    if (!full) {
+      // A tab whose log did not change is left alone; so is one not drawn yet, which a full draw is on its way to.
+      if (!tab.shown || tab.shown.file !== file || tab.shown.sig === sig) {
+        return;
+      }
+      // The session's stats come from the model, which has re-read the log by the time it fires.
+      if (!run) {
+        tab.session = this.model.find(sessionKey(tab.session)) ?? tab.session;
+      }
+    }
+    const session = tab.session;
+    if (full) {
+      // The preview tab switches sessions, and with them sources.
+      const claudeCode = vscode.extensions.getExtension('anthropic.claude-code');
+      panel.iconPath = run
+        ? new vscode.ThemeIcon('hubot')
+        : isClaude(session) && claudeCode
+          ? vscode.Uri.joinPath(claudeCode.extensionUri, 'resources', 'claude-logo.svg')
+          : new vscode.ThemeIcon(isClaude(session) ? 'comment-discussion' : SOURCES[sourceOf(session)].icon);
+    }
     let entries: TranscriptEntry[];
     try {
       if (run?.file) {
@@ -283,17 +360,23 @@ export class TranscriptPanels {
         entries = parseTranscriptFor(session, await fs.readFile(session.filePath, 'utf8'), subagents);
       }
     } catch (err) {
-      vscode.window.showErrorMessage(`Could not read ${run ? "the subagent run's" : 'session'} log: ${(err as Error).message}`);
+      // A live update that cannot read the log (moved, mid-rewrite) keeps the page as it is.
+      if (full) {
+        vscode.window.showErrorMessage(`Could not read ${run ? "the subagent run's" : 'session'} log: ${(err as Error).message}`);
+      }
       return;
     }
     const insights = collectInsights(entries);
     await resolveQuietCommits(session, insights);
+    if (tab.disposed && !full) {
+      return;
+    }
     tab.insights = insights;
     const showThinking = vscode.workspace.getConfiguration('claudeSessions').get<boolean>('showThinking', false);
     const webview = panel.webview;
     const name = run ? subagentName(run) : '';
     panel.title = run ? `${name}: ${run.description ?? session.title}` : session.title;
-    webview.html = buildHtml(session, entries, {
+    const options: HtmlOptions = {
       subagent: run ? { name, agentId: run.agentId ?? '', agentType: run.agentType, description: run.description } : undefined,
       showThinking,
       lineWidth: lineWidthSetting(),
@@ -306,8 +389,65 @@ export class TranscriptPanels {
       codiconCss: webview.asWebviewUri(vscode.Uri.joinPath(this.codiconsUri, 'codicon.css')).toString(),
       css: webview.asWebviewUri(vscode.Uri.joinPath(this.mediaUri, 'transcript.css')).toString(),
       js: webview.asWebviewUri(vscode.Uri.joinPath(this.mediaUri, 'transcript.js')).toString(),
-    });
+    };
+    const parts = pageParts(session, entries, options);
+    const shown = tab.shown;
+    if (full || !shown || shown.shape !== parts.shape) {
+      webview.html = buildPage(session, options, parts);
+    } else {
+      webview.postMessage(liveUpdate(shown.blocks, parts));
+    }
+    tab.shown = { file, sig, blocks: parts.blocks, shape: parts.shape };
+    this.watchRun(tab);
   }
+
+  /**
+   * A subagent run's log sits below the session's folder, where the extension's watcher does not look, so a tab
+   * showing one watches the file itself.
+   */
+  private watchRun(tab: TranscriptTab): void {
+    const file = tab.disposed ? undefined : tab.run?.file;
+    if (tab.watcher?.file === file) {
+      return;
+    }
+    tab.watcher?.disposable.dispose();
+    tab.watcher = undefined;
+    if (!file) {
+      return;
+    }
+    const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(vscode.Uri.file(path.dirname(file)), path.basename(file)));
+    let timer: NodeJS.Timeout | undefined;
+    const changed = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => this.update(tab), RUN_UPDATE_DELAY);
+    };
+    watcher.onDidChange(changed);
+    watcher.onDidCreate(changed);
+    tab.watcher = {
+      file,
+      disposable: {
+        dispose: () => {
+          clearTimeout(timer);
+          watcher.dispose();
+        },
+      },
+    };
+  }
+}
+
+/** The message that brings an open page from `blocks` to `parts` in place (see transcript.js). */
+export function liveUpdate(blocks: readonly string[], parts: PageParts) {
+  return {
+    type: 'update' as const,
+    patch: diffBlocks(blocks, parts.blocks),
+    title: parts.title,
+    chips: parts.chips,
+    heroStats: parts.heroStats,
+    strip: parts.strip,
+    toolLabel: parts.toolLabel,
+    side: parts.side,
+    composer: parts.composer,
+  };
 }
 
 /**
@@ -771,12 +911,12 @@ function targetInfo(target: ContinueTarget, hasClaudeCode: boolean): { label: st
  * The message box at the bottom of the page: type the next message and it goes to this session, or to a new one with
  * a handoff. What transcript.js needs to pick and describe the route goes in as JSON; the extension does the sending.
  */
-function renderComposer(session: SessionInfo, o: HtmlOptions): string {
+function composerData(session: SessionInfo, o: HtmlOptions) {
   const own = sourceOf(session);
   const all: ContinueTarget[] = ['claude', 'claude-chat', 'copilot-cli', 'vscode-chat'];
   const targets = [own, ...all.filter((t) => t !== own)].filter((t) => t !== 'claude-chat' || o.hasClaudeCode);
   const fill = session.usage?.context ? session.usage.context.tokens / session.usage.context.limit : 0;
-  const data = {
+  return {
     target: o.composerTarget && targets.includes(o.composerTarget) ? o.composerTarget : own,
     targets: targets.map((id) => ({
       id,
@@ -791,6 +931,10 @@ function renderComposer(session: SessionInfo, o: HtmlOptions): string {
     // with an expired cache defaults to a handoff.
     contextTokens: session.usage?.context?.tokens ?? 0,
   };
+}
+
+function renderComposer(session: SessionInfo, o: HtmlOptions): string {
+  const data = composerData(session, o);
   return `<footer class="composer" id="composer" data-composer="${escapeHtml(JSON.stringify(data))}">
   <div class="composer-box">
     <textarea id="composer-input" rows="1" placeholder="Message to continue this session" aria-label="Message to continue this session" aria-describedby="composer-status"></textarea>
@@ -877,7 +1021,18 @@ function renderStats(u: UsageSummary): string {
  * One-line version of the stats for the sticky top bar, shown once the full tiles scroll out of view.
  * Clicking it goes back to the top, where the tiles and the cost breakdown are.
  */
-function renderStatsStrip(session: SessionInfo, toolCount: number): string {
+function renderStatsStrip(items: string, toolCount: number): string {
+  if (!items && !toolCount) {
+    return '';
+  }
+  const toggle = toolCount
+    ? `<label class="switch"><input type="checkbox" data-tools-toggle><span class="track"><span class="thumb"></span></span>Tool calls</label>`
+    : '';
+  return `<div class="topbar-stats"><button class="strip-stats" id="to-top" title="Back to the top">${items}</button>${toggle}</div>`;
+}
+
+/** The compact stats themselves: model, context, cache, cost, tokens. */
+function stripItems(session: SessionInfo): string[] {
   const u = session.usage;
   const items: string[] = [];
   if (session.model) {
@@ -899,13 +1054,7 @@ function renderStatsStrip(session: SessionInfo, toolCount: number): string {
       `<span title="Tokens in and out"><i class="codicon codicon-symbol-numeric"></i>${formatTokens(t.input + t.cacheWrite5m + t.cacheWrite1h + t.cacheRead)} in · ${formatTokens(t.output)} out</span>`,
     );
   }
-  if (!items.length && !toolCount) {
-    return '';
-  }
-  const toggle = toolCount
-    ? `<label class="switch"><input type="checkbox" data-tools-toggle><span class="track"><span class="thumb"></span></span>Tool calls</label>`
-    : '';
-  return `<div class="topbar-stats"><button class="strip-stats" id="to-top" title="Back to the top">${items.join('')}</button>${toggle}</div>`;
+  return items;
 }
 
 const TODO_ICONS: Record<TodoStatus, string> = { done: 'pass-filled', active: 'circle-large-filled', pending: 'circle-large-outline' };
@@ -960,7 +1109,7 @@ const countBadge = (n: number) => (n > 1 ? `<span class="side-badge">×${n}</spa
  * The session's side panel: what it changed and committed, what it used, and its prompts to jump between.
  * Every list comes from the transcript, so it shows what the log records, not what is on disk now.
  */
-function renderSide(ins: SessionInsights, cwd: string): string {
+function renderSideSections(ins: SessionInsights, cwd: string): string {
   const fileRow = (f: FileTouch, changed: boolean) => {
     const rel = shortPath(f.path, cwd);
     const name = rel.split('/').pop() ?? rel;
@@ -1078,25 +1227,29 @@ function renderSide(ins: SessionInsights, cwd: string): string {
     ),
   ].filter(Boolean);
 
+  return sections.join('') || '<p class="side-empty">Nothing recorded yet: no files, commits, skills or tools.</p>';
+}
+
+/** The side panel around its sections, which a live update replaces on their own. */
+function renderSide(sections: string): string {
   return `
 <aside class="side" id="side" aria-label="Session details">
   <div class="side-head"><span>Session details</span><button class="icon-btn" id="side-close" title="Close" aria-label="Close session details"><i class="codicon codicon-close"></i></button></div>
-  ${sections.join('') || '<p class="side-empty">Nothing recorded yet: no files, commits, skills or tools.</p>'}
+  <div class="side-body" id="side-body">${sections}</div>
 </aside>`;
 }
 
-export function buildHtml(session: SessionInfo, entries: TranscriptEntry[], o: HtmlOptions): string {
-  const nonce = randomBytes(16).toString('base64');
+/** The header chips: folder, branch, dates, prompts, model, PR; for a subagent run, its agent and the parent session. */
+function renderChips(session: SessionInfo, entries: TranscriptEntry[], sub: HtmlOptions['subagent']): string {
   const proj = projectPath(session);
   const source = SOURCES[sourceOf(session)];
   const claude = source.id === 'claude';
-  const sub = o.subagent;
   const times = entries
     .map((e) => (e.timestamp ? Date.parse(e.timestamp) : NaN))
     .filter((t) => !Number.isNaN(t))
     .sort((a, b) => a - b);
   const prompts = entries.filter((e) => e.role === 'user').length;
-  const chips = sub
+  return sub
     ? [
         `<span class="chip agent" title="Agent type"><i class="codicon codicon-hubot"></i>${escapeHtml(sub.agentType ?? sub.name)}</span>`,
         `<button class="chip parent" data-cmd="openParent" title="Back to the session that ran this agent"><i class="codicon codicon-arrow-left"></i>${escapeHtml(session.title)}</button>`,
@@ -1121,20 +1274,85 @@ export function buildHtml(session: SessionInfo, entries: TranscriptEntry[], o: H
       ? `<button class="chip pr" data-cmd="openPr" title="${escapeHtml(session.prUrl)}"><i class="codicon codicon-git-pull-request"></i>${escapeHtml(session.prRepository ?? 'PR')}#${session.prNumber ?? ''}</button>`
       : '',
   ].join('');
+}
 
-  const body: string[] = [];
+/**
+ * One block per entry: the entry, after a day divider when it starts a new day. A block can be empty (an entry with
+ * nothing to show). Each is wrapped in a `.block` element on the page so a live update can replace it alone.
+ */
+function renderBlocks(session: SessionInfo, entries: TranscriptEntry[], o: HtmlOptions): string[] {
+  const source = SOURCES[sourceOf(session)];
+  const speakers = o.subagent ? { user: 'Main session', assistant: o.subagent.name } : undefined;
+  const blocks: string[] = [];
   let lastDay: string | undefined;
   for (const [index, e] of entries.entries()) {
+    let html = '';
     const day = dayKey(e.timestamp);
     if (day && day !== lastDay && e.timestamp) {
-      body.push(`<div class="divider day"><span>${escapeHtml(dayLabel(e.timestamp))}</span></div>`);
+      html = `<div class="divider day"><span>${escapeHtml(dayLabel(e.timestamp))}</span></div>`;
       lastDay = day;
     }
-    body.push(renderEntry(e, o.showThinking, source, index, sub ? { user: 'Main session', assistant: sub.name } : undefined));
+    blocks.push(html + renderEntry(e, o.showThinking, source, index, speakers));
   }
-  const conversation = body.filter(Boolean).join('\n');
+  return blocks;
+}
+
+const toolLabelText = (n: number) => `Show ${n} tool call${n === 1 ? '' : 's'}`;
+
+/**
+ * The parts of the page a live update replaces in place, built by the same code that builds the whole page. When
+ * `shape` differs from the page's, the page has gained or lost a whole region (the usage tiles, the tool switches)
+ * and is rebuilt instead.
+ */
+export interface PageParts {
+  title: string;
+  blocks: string[];
+  chips: string;
+  /** The usage tiles and cost breakdown under the title; empty for a run or a source without usage. */
+  heroStats: string;
+  /** The compact stats in the sticky top bar. */
+  strip: string;
+  toolCount: number;
+  toolLabel: string;
+  /** The side panel's sections. */
+  side: string;
+  /** The message box's view of the session's context and cache, which change as it runs; absent for a run. */
+  composer?: { context: number; cacheExpires: number; contextTokens: number };
+  shape: string;
+}
+
+export function pageParts(session: SessionInfo, entries: TranscriptEntry[], o: HtmlOptions): PageParts {
+  const sub = o.subagent;
   const toolCount = entries.reduce((n, e) => n + e.parts.filter((p) => p.kind === 'tool_use').length, 0);
-  const title = sub ? `${sub.name}: ${sub.description ?? 'subagent run'}` : session.title;
+  // The parent's usage covers the whole session; a run shows only its per-prompt cost, beside each prompt.
+  const usage = sub ? undefined : session.usage;
+  const strip = stripItems(sub ? { ...session, usage: undefined, model: undefined } : session).join('');
+  const composer = sub ? undefined : composerData(session, o);
+  return {
+    title: sub ? `${sub.name}: ${sub.description ?? 'subagent run'}` : session.title,
+    blocks: renderBlocks(session, entries, o),
+    chips: renderChips(session, entries, sub),
+    heroStats: usage ? renderStats(usage) : '',
+    strip,
+    toolCount,
+    toolLabel: toolLabelText(toolCount),
+    side: renderSideSections(o.insights ?? collectInsights(entries), projectPath(session)),
+    composer: composer && { context: composer.context, cacheExpires: composer.cacheExpires, contextTokens: composer.contextTokens },
+    shape: JSON.stringify([!!usage, toolCount > 0, !!strip]),
+  };
+}
+
+export function buildHtml(session: SessionInfo, entries: TranscriptEntry[], o: HtmlOptions): string {
+  return buildPage(session, o, pageParts(session, entries, o));
+}
+
+function buildPage(session: SessionInfo, o: HtmlOptions, parts: PageParts): string {
+  const nonce = randomBytes(16).toString('base64');
+  const source = SOURCES[sourceOf(session)];
+  const claude = source.id === 'claude';
+  const sub = o.subagent;
+  const { title, toolCount } = parts;
+  const blocks = parts.blocks.map((b, i) => `<div class="block" data-block="${i}">${b}</div>`).join('\n');
   const keepOpen = o.preview
     ? '<button class="btn" data-cmd="keepOpen" title="This tab is reused for the next transcript you open. Keep this one in its own tab."><i class="codicon codicon-pinned"></i><span>Keep open</span></button>'
     : '';
@@ -1157,9 +1375,9 @@ export function buildHtml(session: SessionInfo, entries: TranscriptEntry[], o: H
     <button class="icon-btn" data-cmd="copyId" title="Copy session ID"><i class="codicon codicon-copy"></i></button>
     <button class="icon-btn" data-cmd="openRawFile" title="Open the raw session log"><i class="codicon codicon-json"></i></button>`;
   const mark = sub ? '<span class="subagent-dot"><i class="codicon codicon-hubot"></i></span>' : `<span class="${claude ? 'claude-dot' : 'source-dot'}">${assistantMark(source)}</span>`;
-  // The parent's usage covers the whole session; a run shows only its per-prompt cost, beside each prompt.
-  const usage = sub ? undefined : session.usage;
   const empty = sub ? 'This subagent run has no messages.' : 'This session has no messages yet.';
+  // Shown while no block has anything in it; transcript.js removes it once a live update brings one.
+  const placeholder = parts.blocks.some(Boolean) ? '' : `<div class="empty"><i class="codicon codicon-comment-discussion"></i><p>${empty}</p></div>`;
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -1177,23 +1395,23 @@ export function buildHtml(session: SessionInfo, entries: TranscriptEntry[], o: H
   <div class="topbar-actions">${actions}
     <button class="icon-btn" id="side-toggle" title="Session details" aria-controls="side" aria-expanded="false"><i class="codicon codicon-layout-sidebar-right"></i></button>
   </div>
-  ${renderStatsStrip(sub ? { ...session, usage: undefined, model: undefined } : session, toolCount)}
+  ${renderStatsStrip(parts.strip, toolCount)}
 </nav>
 <header class="hero">
   <h1>${escapeHtml(title)}</h1>
-  <div class="chips">${chips}</div>
-  ${usage ? renderStats(usage) : ''}
+  <div class="chips">${parts.chips}</div>
+  <div class="hero-stats" id="hero-stats">${parts.heroStats}</div>
   ${
     toolCount
-      ? `<label class="switch"><input type="checkbox" id="show-tools" data-tools-toggle checked><span class="track"><span class="thumb"></span></span>Show ${toolCount} tool call${toolCount === 1 ? '' : 's'}</label>`
+      ? `<label class="switch"><input type="checkbox" id="show-tools" data-tools-toggle checked><span class="track"><span class="thumb"></span></span><span data-tool-label>${parts.toolLabel}</span></label>`
       : ''
   }
 </header>
 <main class="conversation">
-${conversation || `<div class="empty"><i class="codicon codicon-comment-discussion"></i><p>${empty}</p></div>`}
+${blocks}${placeholder}
 </main>
 ${sub ? '' : renderComposer(session, o)}
-${renderSide(o.insights ?? collectInsights(entries), proj)}
+${renderSide(parts.side)}
 <button class="fab" id="jump" title="Jump to latest"><i class="codicon codicon-arrow-down"></i></button>
 <script nonce="${nonce}" src="${o.js}"></script>
 </body>
