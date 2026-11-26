@@ -382,8 +382,11 @@ const scenarios = [
         const frame = await sidebar(ctx);
         await frame.waitForSelector('#sources:not([hidden])');
         // Two tools have sessions, so there is a chip for each, with its count, and All. The window starts on Claude Code.
-        assert((await frame.locator('#sources .chip').count()) === 3, 'the source chips are not All, Claude and Copilot CLI');
-        assert((await frame.locator('#sources .chip[data-source="copilot-cli"] .n').textContent()).trim() === '1', 'the Copilot CLI chip does not count its session');
+        // (Other areas may add sessions of their own, so a chip for another tool, or more Copilot CLI sessions, is fine.)
+        for (const source of ['*', 'claude', 'copilot-cli']) {
+          assert((await frame.locator(`#sources .chip[data-source="${source}"]`).count()) === 1, `there is no ${source} source chip`);
+        }
+        assert(Number((await frame.locator('#sources .chip[data-source="copilot-cli"] .n').textContent()).trim()) >= 1, 'the Copilot CLI chip does not count its session');
         assert(await chipPressed(frame, 'claude'), 'the Claude chip is not lit on a window that starts on Claude Code');
         assert(!(await chipPressed(frame, 'copilot-cli')), 'the Copilot CLI chip is lit on a window that starts on Claude Code');
         await expectSeeds(frame, CLAUDE_SEEDS, 'the starting sources');
@@ -391,6 +394,11 @@ const scenarios = [
           // Adding the other source turns everything on, and All lights.
           await chip(frame, 'copilot-cli');
           await expectSeeds(frame, ALL_SEEDS, 'every source');
+          // With these two tools only, All lights now; a chip for another area's tool needs All itself.
+          if (!(await chipPressed(frame, '*')) && (await frame.locator('#sources .chip').count()) > 3) {
+            await chip(frame, '*');
+            await waitFor('All to light', () => chipPressed(frame, '*'));
+          }
           assert(await chipPressed(frame, '*'), 'All is not lit with every source shown');
           const copilot = frame.locator(cardSel(COPILOT));
           await openGroup(frame, 'beta-web');
