@@ -123,6 +123,11 @@ Watch the cost fields:
 
 So read `is_error`, not `subtype`. Stderr carries human-readable diagnostics and should be logged, not parsed.
 
+An interrupted turn's `result` also carries `terminal_reason: "aborted_streaming"` and an `errors` entry that is a
+diagnostic (`"[ede_diagnostic] result_type=user …"`), not a message for the user (seen while building SA-25). The chat
+treats a turn it asked to interrupt, or one whose `terminal_reason` starts with `aborted`, as stopped rather than
+failed. After an error result, closing stdin makes the process exit with code 1.
+
 Other events seen and safe to ignore for a chat view: `system`/`status` (`"status":"requesting"`),
 `rate_limit_event`, `system`/`thinking_tokens`. Anything unknown should be skipped.
 
