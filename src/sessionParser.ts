@@ -275,8 +275,6 @@ export interface AgentMessage {
   /** Its agent type as Claude Code recorded it ("reviewer", "general-purpose"), if it did. */
   name?: string;
   text: string;
-  /** Names this delivery in one string: its tool-use id, or else its sender and words. */
-  key: string;
   /** The SubagentHandback call that sent it, when Claude Code recorded one. */
   toolUseId?: string;
 }
@@ -337,7 +335,7 @@ export function parseAgentMessage(r: any): AgentMessage | undefined {
     return undefined;
   }
   const toolUseId = str(origin.handbackToolUseId);
-  const msg: AgentMessage = { from, name: str(origin.name), text, key: toolUseId ?? `${from}\n${text}` };
+  const msg: AgentMessage = { from, name: str(origin.name), text };
   if (toolUseId) {
     msg.toolUseId = toolUseId;
   }
@@ -348,6 +346,8 @@ export function parseAgentMessage(r: any): AgentMessage | undefined {
  * Tells repeat deliveries of a hand-back from new ones. A tool-use id names one delivery, however many times it is
  * logged. A log of it without the id (only the framed text, say) has the same sender and words, so it pairs with
  * one delivery of those words not yet paired. Two logs without an id and with the same words are one delivery.
+ * A log without an id also folds into an earlier delivery from the same sender with the same words that did have one;
+ * only a session that mixes Claude Code versions (2.1.296 logs have no id, 2.1.330 and later do) can show this.
  */
 export class HandbackDeliveries {
   private readonly ids = new Set<string>();

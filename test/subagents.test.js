@@ -270,7 +270,7 @@ test('parseAgentMessage reads both shapes and skips what it does not know', () =
     type: 'user',
     message: { content: '<agent-message from="a1">\n[Subagent hand-back] Frame. The report follows:\n  line one\n    nested\n</agent-message>' },
   });
-  assert.deepEqual(m, { from: 'a1', name: undefined, text: 'line one\n  nested', key: 'a1\nline one\n  nested' });
+  assert.deepEqual(m, { from: 'a1', name: undefined, text: 'line one\n  nested' });
   assert.equal(parseAgentMessage({ type: 'user', message: { content: '<agent-message from="a2">cut off mid-wri' } }).text, 'cut off mid-wri');
 });
 
