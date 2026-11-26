@@ -44,6 +44,11 @@ interface TranscriptTab {
   chat?: ClaudeChat;
   /** A chat ended during a turn, still shown here while its reply finishes and its process exits. */
   ending?: ClaudeChat;
+  /**
+   * Messages sent while a chat with the session was still ending: shown as waiting until its process has exited, then
+   * sent to a new chat, in order.
+   */
+  waiting?: string[];
   /** The permission mode the chat runs (or will run) in. */
   chatMode: PermissionMode;
   /** Streamed text arrives many times a second; the page is redrawn at most this often. */
@@ -275,9 +280,21 @@ export class TranscriptPanels {
           break;
         }
         case 'chatSend': {
-          // "Chat here": the tab stays open whatever closeTranscriptOnResume says; the reply streams in below.
-          const ok = typeof msg.text === 'string' && !!msg.text.trim() && (await this.chatSend(tab, msg.text, msg.permissionMode));
-          panel.webview.postMessage({ type: ok ? 'sent' : 'sendFailed' });
+          // "Chat here": the tab stays open whatever closeTranscriptOnResume says; the reply streams in below. A message
+          // that has to wait for an ended chat is taken (the box empties) before the wait, and only once.
+          let answered = false;
+          const accepted = () => {
+            if (!answered) {
+              answered = true;
+              panel.webview.postMessage({ type: 'sent' });
+            }
+          };
+          const ok = typeof msg.text === 'string' && !!msg.text.trim() && (await this.chatSend(tab, msg.text, msg.permissionMode, accepted));
+          if (ok) {
+            accepted();
+          } else if (!answered) {
+            panel.webview.postMessage({ type: 'sendFailed' });
+          }
           break;
         }
         case 'chatStop':
@@ -378,8 +395,12 @@ export class TranscriptPanels {
    * Sends a message to the session's chat process, starting it on the first message. Before a start, refuses when the
    * session is open in a terminal this extension started, and asks when something else wrote its log moments ago: two
    * writers fork the log (doc section 8). False when refused, so the message stays in the box.
+   *
+   * While a chat with the session is still ending (End chat during a reply), the message waits for its process to exit
+   * and then starts a new chat. It is `accepted` at once and shown as waiting meanwhile; if the start is then refused,
+   * it goes back to the box. A tab closed meanwhile sends nothing.
    */
-  private async chatSend(tab: TranscriptTab, text: string, mode: unknown): Promise<boolean> {
+  private async chatSend(tab: TranscriptTab, text: string, mode: unknown, accepted: () => void = () => undefined): Promise<boolean> {
     const session = tab.session;
     if (tab.run || !isClaude(session)) {
       return false;
@@ -387,10 +408,35 @@ export class TranscriptPanels {
     if (isPermissionMode(mode)) {
       tab.chatMode = mode;
     }
+    if (tab.waiting) {
+      // Already waiting for an ended chat: this one goes after the others, with the new chat.
+      tab.waiting.push(text);
+      accepted();
+      this.postChat(tab);
+      return true;
+    }
+    // Messages sent while this one waits join it here.
+    const texts = [text];
     if (!tab.chat?.active) {
       // A chat with this session that is still shutting down (End chat a moment ago) exits before a new one starts.
-      await this.closed(sessionKey(session));
-      if (!(await this.mayStartChat(tab))) {
+      const key = sessionKey(session);
+      const waits = [...this.closing.values()].some((c) => c.key === key);
+      if (waits) {
+        tab.waiting = texts;
+        accepted();
+        this.postChat(tab);
+      }
+      await this.closed(key);
+      // A waiting message can be taken back meanwhile (the session was let go of elsewhere): it is in the box again.
+      const ok = (!waits || tab.waiting === texts) && !tab.disposed && (await this.mayStartChat(tab));
+      if (waits && tab.waiting === texts) {
+        tab.waiting = undefined;
+        if (!ok && !tab.disposed) {
+          this.postChat(tab);
+          panelPost(tab, { type: 'chatRestore', text: texts.join('\n\n') });
+        }
+      }
+      if (!ok) {
         return false;
       }
     }
@@ -416,7 +462,9 @@ export class TranscriptPanels {
       this.promote(tab);
       panelPost(tab, { type: 'promoted' });
     }
-    tab.chat.send(text);
+    for (const t of texts) {
+      tab.chat.send(t);
+    }
     return true;
   }
 
@@ -464,8 +512,9 @@ export class TranscriptPanels {
     }
     const chat = tab.chat ?? tab.ending;
     const status = chat?.status;
-    panelPost(tab, { type: 'chatLive', html: chat ? renderLive(chat.live.pieces, !!status?.busy) : '' });
-    panelPost(tab, chatStateMessage(status, tab.chatMode));
+    const waiting = tab.waiting ?? [];
+    panelPost(tab, { type: 'chatLive', html: chat || waiting.length ? renderLive(chat?.live.pieces ?? [], !!status?.busy, waiting) : '' });
+    panelPost(tab, chatStateMessage(status, tab.chatMode, waiting.length));
   }
 
   /** End chat: a running reply finishes (the tab shows it), then the process exits. Resolves once it has. */
@@ -537,9 +586,17 @@ export class TranscriptPanels {
   async endChat(session: SessionInfo, stop = false): Promise<void> {
     const key = sessionKey(session);
     const end = stop ? (c: ClaudeChat) => c.stopNow() : undefined;
-    const ending = this.tabs()
-      .filter((t) => !t.run && sessionKey(t.session) === key)
-      .map((t) => this.endTabChat(t, end));
+    const tabs = this.tabs().filter((t) => !t.run && sessionKey(t.session) === key);
+    for (const t of tabs) {
+      // A message waiting to start a new chat would take the session straight back: it returns to the box instead.
+      if (t.waiting) {
+        const texts = t.waiting;
+        t.waiting = undefined;
+        this.postChat(t);
+        panelPost(t, { type: 'chatRestore', text: texts.join('\n\n') });
+      }
+    }
+    const ending = tabs.map((t) => this.endTabChat(t, end));
     if (stop) {
       for (const [chat, c] of this.closing) {
         if (c.key === key) {
@@ -674,8 +731,11 @@ export class TranscriptPanels {
         !run && isClaude(session)
           ? {
               mode: tab.chatMode,
-              live: shownChat ? renderLive(shownChat.live.pieces, shownChat.status.busy) : '',
-              state: chatStateMessage(shownChat?.status, tab.chatMode),
+              live:
+                shownChat || tab.waiting?.length
+                  ? renderLive(shownChat?.live.pieces ?? [], !!shownChat?.status.busy, tab.waiting)
+                  : '',
+              state: chatStateMessage(shownChat?.status, tab.chatMode, tab.waiting?.length),
             }
           : undefined,
       highlight: tab.highlight,

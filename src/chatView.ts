@@ -151,9 +151,9 @@ function renderPiece(p: LivePiece, activeRequest?: string): string {
 /**
  * The pending part of the conversation: the user's messages (marked queued while they wait), then Claude's reply as it
  * streams in, with what the log will not show (declined tools, errors). While Claude has said nothing yet, a typing
- * indicator.
+ * indicator. Last, the messages `waiting` for an ended chat to finish its reply and exit, which start a new chat.
  */
-export function renderLive(pieces: LivePiece[], busy: boolean): string {
+export function renderLive(pieces: LivePiece[], busy: boolean, waiting: readonly string[] = []): string {
   const out: string[] = [];
   let reply: string[] = [];
   // Requests are answered in order: only the oldest open card has its buttons.
@@ -183,11 +183,16 @@ export function renderLive(pieces: LivePiece[], busy: boolean): string {
     reply.push('<div class="chat-typing" aria-label="Claude is working"><span></span><span></span><span></span></div>');
   }
   flush();
+  for (const text of waiting) {
+    out.push(
+      `<div class="msg user chat-pending waiting"><div class="msg-meta"><span class="pill" title="Sent once the ended chat has finished its reply and stopped; it starts a new chat"><i class="codicon codicon-watch"></i>waits for the previous reply to finish</span>You</div><div class="bubble"><div class="md">${renderMarkdown(text, 'user')}</div></div></div>`,
+    );
+  }
   return out.join('');
 }
 
-/** The chat bar's state, as the page gets it. */
-export function chatStateMessage(status: ChatStatus | undefined, mode: PermissionMode) {
+/** The chat bar's state, as the page gets it. `waiting`: messages held until an ended chat has exited. */
+export function chatStateMessage(status: ChatStatus | undefined, mode: PermissionMode, waiting = 0) {
   const t = status?.lastTurn;
   const last = t
     ? t.interrupted
@@ -203,6 +208,7 @@ export function chatStateMessage(status: ChatStatus | undefined, mode: Permissio
     queued: status?.queued ?? 0,
     awaiting: status?.awaiting ?? 0,
     finishing: !!status?.finishing,
+    waiting,
     mode: status?.mode ?? mode,
     last,
   };

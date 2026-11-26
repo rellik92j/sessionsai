@@ -141,10 +141,15 @@
     function renderChat() {
       if (!chat || !chatBar) return;
       const s = chatStatus || {};
-      chatBar.hidden = !(target === 'here' || s.running || s.busy);
+      chatBar.hidden = !(target === 'here' || s.running || s.busy || s.waiting);
       if (chatMode.value !== s.mode) chatMode.value = s.mode;
+      const yours = s.waiting > 1 ? `Your ${s.waiting} messages start` : 'Your message starts';
       chatState.textContent = s.finishing
-        ? 'Chat ended: Claude is finishing its reply, then it stops.'
+        ? s.waiting
+          ? `Chat ended: Claude is finishing its reply. ${yours} a new chat after it.`
+          : 'Chat ended: Claude is finishing its reply, then it stops.'
+        : s.waiting
+        ? `${yours} a new chat once the ended one has stopped…`
         : s.awaiting
         ? `Waiting for your answer${s.awaiting > 1 ? ` (${s.awaiting} requests)` : ''}…${s.queued ? ` ${s.queued} queued.` : ''}`
         : s.busy
@@ -152,11 +157,16 @@
         : s.running
           ? `Ready${s.last ? ` · ${s.last}` : ''}`
           : s.last || '';
-      chatState.classList.toggle('busy', !!s.busy);
+      chatState.classList.toggle('busy', !!s.busy || !!s.waiting);
       chatStop.hidden = !s.busy;
       chatEnd.hidden = !(s.running || s.busy) || !!s.finishing;
-      sendBtn.querySelector('span').textContent = target === 'here' && s.busy ? 'Queue' : 'Send';
-      sendBtn.title = target === 'here' && s.busy ? 'Queue this message: it goes when the running turn ends (Enter)' : 'Send (Enter). Shift+Enter adds a line.';
+      const later = target === 'here' && (s.busy || s.waiting);
+      sendBtn.querySelector('span').textContent = later ? 'Queue' : 'Send';
+      sendBtn.title = !later
+        ? 'Send (Enter). Shift+Enter adds a line.'
+        : s.finishing || s.waiting
+          ? 'Queue this message: it starts a new chat once the ended one has finished its reply (Enter)'
+          : 'Queue this message: it goes when the running turn ends (Enter)';
     }
 
     /** The chat's pending messages, below the logged conversation; following along keeps the newest in view. */

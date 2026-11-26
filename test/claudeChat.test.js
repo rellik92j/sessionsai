@@ -551,6 +551,27 @@ test('the pending part shows the message at once, a typing indicator, and the re
   assert.equal(renderLive([], false), '');
 });
 
+test('messages waiting for an ended chat show after its finishing reply, marked as waiting (SA-32)', () => {
+  const live = new LiveChat();
+  live.addUser('Finish this', false);
+  live.markSent();
+  let html = renderLive(live.pieces, true, ['Next **one**', 'and another']);
+  const typing = html.indexOf('chat-typing');
+  const first = html.indexOf('Next <strong>one</strong>');
+  assert.ok(html.indexOf('Finish this') < typing && typing < first, 'the reply in progress, then the waiting messages');
+  assert.ok(first < html.indexOf('and another'), 'in the order sent');
+  assert.equal(html.match(/waits for the previous reply to finish/g).length, 2);
+  assert.equal(html.match(/chat-pending waiting/g).length, 2);
+  assert.doesNotMatch(html, /queued/);
+  // Once the ended chat has gone, only the waiting messages are left.
+  html = renderLive([], false, ['Next one']);
+  assert.match(html, /waits for the previous reply to finish/);
+  assert.doesNotMatch(html, /chat-typing/);
+  assert.doesNotMatch(renderLive(live.pieces, true), /waits for the previous reply/);
+  assert.equal(chatStateMessage(undefined, 'ask', 2).waiting, 2);
+  assert.equal(chatStateMessage(undefined, 'ask').waiting, 0);
+});
+
 // ---------- permission cards (SA-26) ----------
 
 const readStream = (name) =>
