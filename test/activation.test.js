@@ -1174,7 +1174,9 @@ test('a reply from the other branch of a forked log renders under its own prompt
     const pill = html.indexOf(mark);
     assert.ok(pill > 0, 'the forked reply is marked');
     assert.equal(html.indexOf(mark, pill + 1), -1, 'only the forked reply is marked');
-    const order = ['Explain the whole config pipeline', 'No response requested.', 'other branch</span>', 'reads, merges, then validates', 'Which file holds the defaults?', 'defaults.ts'].map((s) => html.indexOf(s));
+    // The other writer's "No response requested." is not shown above the real answer; the later one, closing an
+    // interrupted turn that nothing else answered, still is.
+    const order = ['Explain the whole config pipeline', 'other branch</span>', 'reads, merges, then validates', 'Which file holds the defaults?', 'defaults.ts', 'Now run the config tests', 'No response requested.', 'Try the tests again'].map((s) => html.indexOf(s));
     assert.ok(order.every((at) => at > 0), String(order));
     assert.deepEqual([...order].sort((a, b) => a - b), order);
     assert.deepEqual(state.errors, []);
