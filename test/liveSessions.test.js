@@ -53,18 +53,21 @@ test('a dead pid, a reused pid and another system\'s pid are not live; a checked
   // 41000 runs and is the process that wrote its file; 41001 runs, but its pid now belongs to a later process; 41002 has
   // no start time to check; 41004 is a Linux pid in a folder this Windows machine shares.
   const os1 = probe([41000, 41001, 41002, 41004], { 41000: '134400000000300000', 41001: '134409999999999999' });
-  const verified = new Map();
-  const alive = await live.liveOnly(entries, os1, verified);
+  const cache = live.newStartCheckCache();
+  const alive = await live.liveOnly(entries, os1, cache);
   assert.deepEqual(alive.map((e) => e.pid).sort(), [41000, 41002]);
   assert.deepEqual(os1.calls, [[41000, 41001]], 'only entries with a start time are looked up, together');
-  assert.deepEqual([...verified.keys()], [41000]);
-  await live.liveOnly(entries, os1, verified);
-  assert.deepEqual(os1.calls[1], [41001], 'the verified pid is not looked up again');
+  assert.deepEqual([...cache.verified.keys()], [41000]);
+  assert.deepEqual([...cache.rejected.keys()], [41001]);
+  const again = await live.liveOnly(entries, os1, cache);
+  assert.deepEqual(again.map((e) => e.pid).sort(), [41000, 41002], 'the reused pid stays rejected');
+  assert.equal(os1.calls.length, 1, 'neither the verified nor the rejected pid is looked up again');
 
   // The process exited (its file left behind): dropped, and forgotten.
-  const gone = await live.liveOnly(entries, probe([41002], {}), verified);
+  const gone = await live.liveOnly(entries, probe([41002], {}), cache);
   assert.deepEqual(gone.map((e) => e.pid), [41002]);
-  assert.equal(verified.has(41000), false);
+  assert.equal(cache.verified.has(41000), false);
+  assert.equal(cache.rejected.has(41001), false, 'a dead pid is forgotten, so a later process with it is looked up afresh');
 
   // Start times that cannot be looked up leave a running pid counted rather than hidden.
   const unknown = await live.liveOnly(entries, probe([41000, 41001], 'unknown'));
@@ -72,6 +75,29 @@ test('a dead pid, a reused pid and another system\'s pid are not live; a checked
   // Where start times are not checked at all (not Windows), a running pid counts.
   const posix = await live.liveOnly(entries.map((e) => ({ ...e, pidDomain: undefined })), probe([41000, 41001], undefined, 'linux'));
   assert.deepEqual(posix.map((e) => e.pid).sort(), [41000, 41001]);
+});
+
+test('a failed start-time lookup is not retried on every refresh, and is retried after the backoff', async () => {
+  const entries = await live.readRegistry(registry);
+  const cache = live.newStartCheckCache();
+  const failing = probe([41000, 41001], 'unknown');
+  const t0 = 1_800_000_000_000;
+  const first = await live.liveOnly(entries, failing, cache, t0);
+  assert.deepEqual(first.map((e) => e.pid).sort(), [41000, 41001], 'unchecked entries count while the lookup fails');
+  await live.liveOnly(entries, failing, cache, t0 + 10_000);
+  assert.equal(failing.calls.length, 1, 'no second lookup inside the backoff');
+
+  const throwing = { platform: 'win32', isAlive: () => true, calls: 0, startTimes: async () => (throwing.calls++, Promise.reject(new Error('spawn failed'))) };
+  const c2 = live.newStartCheckCache();
+  await live.liveOnly(entries, throwing, c2, t0);
+  await live.liveOnly(entries, throwing, c2, t0 + 1000);
+  assert.equal(throwing.calls, 1, 'a lookup that throws backs off too');
+
+  const working = probe([41000, 41001], { 41000: '134400000000000000', 41001: '134409999999999999' });
+  const later = await live.liveOnly(entries, working, cache, t0 + live.START_LOOKUP_BACKOFF_MS);
+  assert.deepEqual(working.calls, [[41000, 41001]], 'looked up again once the backoff is over');
+  assert.deepEqual(later.map((e) => e.pid), [41000]);
+  assert.equal(cache.retryAt, undefined);
 });
 
 test('on this machine: a running pid is live and the pid of an exited process is not', async (t) => {

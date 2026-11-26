@@ -166,11 +166,30 @@ function sameStart(a: string, b: string): boolean {
 }
 
 /**
- * The entries whose process is still the one that wrote them. A dead pid is dropped; so is a live pid whose start
- * time differs from the entry's (the pid was reused after a crash). `verified` remembers the pids already checked, so
- * the start time is looked up once per process; a pid found dead is forgotten.
+ * What earlier start-time checks found, so a process is looked up once rather than on every refresh (on Windows a
+ * lookup is a PowerShell spawn of about a second).
  */
-export async function liveOnly(entries: LiveProcess[], probe: ProcessProbe, verified = new Map<number, string>()): Promise<LiveProcess[]> {
+export interface StartCheckCache {
+  /** pid -> the procStart found to be that running process's own. */
+  verified: Map<number, string>;
+  /** pid -> a procStart found not to be (the pid was reused after a crash). Kept until the pid dies. */
+  rejected: Map<number, string>;
+  /** After a failed lookup, no new one is tried before this time (ms since epoch). */
+  retryAt?: number;
+}
+
+export const newStartCheckCache = (): StartCheckCache => ({ verified: new Map(), rejected: new Map() });
+
+/** How long a failed start-time lookup is not retried. Entries count as live meanwhile, as they do on failure. */
+export const START_LOOKUP_BACKOFF_MS = 60_000;
+
+/**
+ * The entries whose process is still the one that wrote them. A dead pid is dropped; so is a live pid whose start
+ * time differs from the entry's (the pid was reused after a crash). `cache` remembers both answers until the pid dies,
+ * so each process is looked up once, and backs off after a failed lookup.
+ */
+export async function liveOnly(entries: LiveProcess[], probe: ProcessProbe, cache = newStartCheckCache(), now = Date.now()): Promise<LiveProcess[]> {
+  const { verified, rejected } = cache;
   const alive: LiveProcess[] = [];
   for (const e of entries) {
     // A registry folder shared with another system (a synced home folder, WSL) holds pids that mean nothing here.
@@ -179,27 +198,45 @@ export async function liveOnly(entries: LiveProcess[], probe: ProcessProbe, veri
     }
     if (probe.isAlive(e.pid)) {
       alive.push(e);
-    } else {
-      verified.delete(e.pid);
     }
   }
-  const unchecked = alive.filter((e) => e.procStart && verified.get(e.pid) !== e.procStart);
-  if (!unchecked.length || !probe.startTimes) {
-    return alive;
+  // A pid that died, or whose file is gone, is forgotten: a later process may get it.
+  const alivePids = new Set(alive.map((e) => e.pid));
+  for (const m of [verified, rejected]) {
+    for (const pid of m.keys()) {
+      if (!alivePids.has(pid)) {
+        m.delete(pid);
+      }
+    }
   }
-  const times = await probe.startTimes([...new Set(unchecked.map((e) => e.pid))]).catch(() => undefined);
-  if (!times) {
-    return alive;
+  const known = (e: LiveProcess) => !e.procStart || verified.get(e.pid) === e.procStart || rejected.get(e.pid) === e.procStart;
+  const unchecked = alive.filter((e) => !known(e));
+  let times: Map<number, string> | undefined;
+  if (unchecked.length && probe.startTimes && !(cache.retryAt !== undefined && now < cache.retryAt)) {
+    times = await probe.startTimes([...new Set(unchecked.map((e) => e.pid))]).catch(() => undefined);
+    cache.retryAt = times ? undefined : now + START_LOOKUP_BACKOFF_MS;
   }
   return alive.filter((e) => {
     if (!e.procStart || verified.get(e.pid) === e.procStart) {
       return true;
     }
+    if (rejected.get(e.pid) === e.procStart) {
+      return false;
+    }
+    if (!times) {
+      // Not checked (no lookup on this system, or it failed): counted rather than hidden.
+      return true;
+    }
     const actual = times.get(e.pid);
-    if (actual !== undefined && sameStart(actual, e.procStart)) {
+    if (actual === undefined) {
+      // Not running by the time of the lookup, or its start time is not readable; asked again next time.
+      return false;
+    }
+    if (sameStart(actual, e.procStart)) {
       verified.set(e.pid, e.procStart);
       return true;
     }
+    rejected.set(e.pid, e.procStart);
     return false;
   });
 }
@@ -438,7 +475,7 @@ export function renderLiveNotice(elsewhere: LiveProcess[], own: LiveProcess | un
 export class LiveSessions {
   private procs: LiveProcess[] = [];
   private shown = '';
-  private readonly verified = new Map<number, string>();
+  private readonly checked = newStartCheckCache();
   private readonly listeners = new Set<() => void>();
   private running?: Promise<void>;
   private again = false;
@@ -462,7 +499,7 @@ export class LiveSessions {
     this.running = (async () => {
       do {
         this.again = false;
-        const procs = await liveOnly(await readRegistry(this.dir()), this.probe, this.verified).catch(() => this.procs);
+        const procs = await liveOnly(await readRegistry(this.dir()), this.probe, this.checked).catch(() => this.procs);
         const key = JSON.stringify(procs.map((p) => [p.pid, p.sessionId, p.status, p.kind, p.entrypoint, p.startedAt]).sort());
         this.procs = procs;
         if (key !== this.shown) {
