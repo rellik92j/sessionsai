@@ -1,12 +1,12 @@
 // The end-to-end harness: an isolated VS Code with this extension, driven by Playwright, with a stand-in claude behind
 // the transcript view's chat. See docs/dev/e2e.md for how to run it and how to write a scenario.
 //
-// Isolation: a VS Code downloaded into .vscode-test/, a throwaway user-data and extensions folder, a throwaway
+// Isolation: a VS Code downloaded once into a shared folder outside the checkout (see cacheDir), a throwaway user-data and extensions folder, a throwaway
 // CLAUDE_CONFIG_DIR holding synthetic sessions, and settings that point every source of sessions into that sandbox.
 // The user's own VS Code, settings and ~/.claude are never read or written, and the real claude CLI is never run: the
 // chat starts the stand-in (SESSIONSAI_E2E_CLAUDE) and Resume's terminal runs a stub that only records it was called.
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync, existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -126,10 +126,64 @@ function vscodeEnv(s) {
   };
 }
 
-/** Downloads VS Code into .vscode-test/ once (stable, or E2E_VSCODE_VERSION) and returns its executable. */
+/**
+ * Where the downloaded VS Code lives: one folder shared by every checkout and worktree, outside all of them (about
+ * 1 GB, and its deep paths break `git worktree remove` on Windows when it sits inside one). SESSIONSAI_E2E_CACHE
+ * overrides it.
+ */
+export function cacheDir() {
+  if (process.env.SESSIONSAI_E2E_CACHE) return path.resolve(process.env.SESSIONSAI_E2E_CACHE);
+  const base = process.platform === 'win32' ? process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local') : path.join(os.homedir(), '.cache');
+  return path.join(base, 'sessionsai-e2e', 'vscode');
+}
+
+const LOCK_STALE_MS = 60_000;
+const LOCK_BEAT_MS = 10_000;
+
+/**
+ * Runs `fn` while holding a lock on the cache folder, so two runs (two worktrees) never unpack into the same folder
+ * at once: @vscode/test-electron unpacks in place and marks it complete only at the end, with no lock of its own. The
+ * lock is a folder whose mtime is refreshed while it is held; one not refreshed for a minute belongs to a run that
+ * died, and is taken over.
+ */
+export async function withCacheLock(dir, fn) {
+  mkdirSync(dir, { recursive: true });
+  const lock = path.join(dir, '.lock');
+  for (;;) {
+    try {
+      mkdirSync(lock);
+      break;
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+      let age = 0;
+      try {
+        age = Date.now() - statSync(lock).mtimeMs;
+      } catch {
+        continue; // released between the two calls
+      }
+      if (age > LOCK_STALE_MS) rmSync(lock, { recursive: true, force: true });
+      else await sleep(500);
+    }
+  }
+  const beat = setInterval(() => {
+    try {
+      const now = new Date();
+      utimesSync(lock, now, now);
+    } catch {}
+  }, LOCK_BEAT_MS);
+  try {
+    return await fn();
+  } finally {
+    clearInterval(beat);
+    rmSync(lock, { recursive: true, force: true });
+  }
+}
+
+/** Downloads VS Code into the shared cache once (stable, or E2E_VSCODE_VERSION) and returns its executable. */
 export async function vscodeExecutable() {
   const { downloadAndUnzipVSCode } = await import('@vscode/test-electron');
-  return downloadAndUnzipVSCode({ cachePath: path.join(ROOT, '.vscode-test'), version: process.env.E2E_VSCODE_VERSION || 'stable' });
+  const cachePath = cacheDir();
+  return withCacheLock(cachePath, () => downloadAndUnzipVSCode({ cachePath, version: process.env.E2E_VSCODE_VERSION || 'stable' }));
 }
 
 /** Starts the isolated VS Code on the sandbox's work folder and waits for the workbench. */
