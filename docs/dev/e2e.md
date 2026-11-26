@@ -10,9 +10,20 @@ It is local and opt-in. It is not part of `npm test` or of the `test` CI check, 
 ## Running it
 
 ```
-npm run test:e2e                      # every scenario, about three minutes after the first run
+npm run test:e2e                      # every area, about three minutes after the first run
+npm run test:e2e -- --area chat       # only the chat area; --area chat,sidebar for several
+npm run test:e2e -- --only stream     # one scenario, by its exact name (comma-separate for several)
 npm run test:e2e -- stop permission   # only scenarios whose name contains one of the words
 ```
+
+An unknown area or scenario name exits 2 and lists the valid ones. The flags combine: `--area chat --only stop` runs
+`stop` if it is in chat.
+
+### When to run what
+
+The e2e suite is for UI changes, and a PR runs only the area it changes: a change to the transcript chat runs
+`--area chat`, a sidebar change runs `--area sidebar`. The full suite (no flag) runs before each release. It is not in
+CI, and a change with no UI (parsers, data, docs, scripts) runs none. Give the count from the last line in the PR body.
 
 It bundles `dist/extension.js` first, so it tests the working tree as it is. A VS Code window opens on the desktop
 while it runs; leave it alone until it closes. The first run downloads VS Code (stable), about 1 GB on disk once
@@ -26,7 +37,8 @@ while no e2e run is open); the next run downloads again. It is kept outside the 
 a lock not refreshed for a minute is taken over. Old checkouts may still have an unused `.vscode-test/`, which is
 safe to delete.
 
-The output ends with one line per scenario and a count, and the command exits 1 if any scenario failed. For each
+The output has one line per scenario (`ok   chat/stream`), then one count per area, and ends with
+`Total: N passed, M failed`. The command exits 1 if any scenario failed. For each
 failure, `.e2e-out/` holds `<scenario>.png`, a screenshot of the window at the moment it failed (an agent can Read
 it), and `<scenario>.events.json`, what the stand-in recorded. `E2E_KEEP=1` keeps the sandbox folder (settings,
 session logs, the events file) and prints its path.
@@ -80,9 +92,35 @@ It writes what happened to it to the events file (`SESSIONSAI_E2E_EVENTS`), one 
 Code stub `claude-code-open`. Scenarios assert on these, because they show what the process actually saw, which the
 page alone cannot.
 
+## Areas
+
+Scenarios are grouped by what they exercise, one module per area in `test/e2e/scenarios/`: `chat` today, with
+`sidebar`, `transcript`, `resume`, `overview` and `other-tools` to come. The runner finds areas by file name, so an
+area's name is its file name and no list needs editing. Two people adding scenarios to different areas never touch the
+same file. Shared steps (`openTranscript`, `chatHere`, `send`, `click`, `sidebarMenu`, `modal`, `assert`, `waitFor`,
+`waitEvent`, ...) live in `harness.mjs`; a helper only one area uses stays in that area's module.
+
+An area module exports `{ name, scenarios, sessions? }` as its default. Each scenario's `prompt` creates its own
+synthetic session. An area that needs more sessions (a project with several, a log with a particular shape) lists them
+in `sessions: [{ key, prompt }]`; they are created for the area alone, and a scenario reads them from
+`ctx.fixtures[key]` as `{ id, title }`. To add an area, create `test/e2e/scenarios/<area>.mjs`:
+
+```js
+import { assert, openTranscript } from '../harness.mjs';
+
+export default {
+  name: 'sidebar', // must equal the file name
+  sessions: [{ key: 'second', prompt: 'E2E sidebar, a second session' }], // optional
+  scenarios: [{ name: 'sidebar-opens', prompt: 'E2E sidebar opens', async run(ctx) { /* ... */ } }],
+};
+```
+
+Scenario names stay unique across areas, since `--only` and the failure screenshots use them. Session ids are numbered
+over every area, so a scenario's session does not change with the areas chosen.
+
 ## The scenarios
 
-`test/e2e/scenarios.mjs`, each on its own session:
+Area `chat`, `test/e2e/scenarios/chat.mjs`, each on its own session:
 
 | Name | What it checks |
 |---|---|
@@ -108,11 +146,11 @@ page alone cannot.
 
 ## Writing a scenario
 
-Add an entry to `SCENARIOS` in `test/e2e/scenarios.mjs`:
+Add an entry to `scenarios` in the area's module under `test/e2e/scenarios/` (or make a new area, above):
 
 ```js
 {
-  name: 'my-scenario',              // what `npm run test:e2e -- my` matches
+  name: 'my-scenario',              // what `--only my-scenario` and `npm run test:e2e -- my` match
   prompt: 'E2E my scenario',        // the session's first prompt, which is its title in the sidebar and the tab
   async run(ctx) {                  // ctx: { page, s (the sandbox), id (session id), title }
     const frame = await openTranscript(ctx);
@@ -148,10 +186,10 @@ In the PR's worktree:
 git fetch origin
 git switch --detach origin/<branch>
 npm ci
-npm run test:e2e
+npm run test:e2e -- --area <the area the PR changes>
 ```
 
 `npm ci` is needed when the branch changed `package-lock.json`; the VS Code download is shared, so a new worktree
-reuses it. Report the pass count from the last line. For a failure,
+reuses it. Report the `Total` line. For a failure,
 Read `.e2e-out/<scenario>.png` and `.e2e-out/<scenario>.events.json`, and say which step timed out (the message
 names it). A PR that changes the chat's behaviour on purpose may need its scenario changed in the same PR.
