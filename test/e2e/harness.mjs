@@ -299,3 +299,81 @@ export function resetOut() {
   rmSync(OUT, { recursive: true, force: true });
   mkdirSync(OUT, { recursive: true });
 }
+
+// ---------- steps scenarios share, whatever the area ----------
+
+/** Shows the SessionsAI sidebar and returns its webview frame once the session's card is in it. */
+export async function sidebar(ctx) {
+  const { page, id } = ctx;
+  const selector = `.card[data-id$=":${id}"]`;
+  const visible = async () => {
+    for (const f of page.frames()) {
+      if (!f.isDetached() && (await f.$(selector).catch(() => null))) return f;
+    }
+    return undefined;
+  };
+  const frame = await visible();
+  if (frame) return frame;
+  // Clicking the activity bar icon of a view that is already showing hides it, so only click when it is not.
+  const item = page.locator('.activitybar .action-item', { has: page.locator('[aria-label^="SessionsAI"]') }).first();
+  if (!/\bchecked\b/.test((await item.getAttribute('class')) ?? '')) {
+    await item.click();
+  }
+  return frameWith(page, selector, `the sidebar card of ${ctx.title}`);
+}
+
+/** Opens the session's transcript from its sidebar card and returns the transcript's webview frame. */
+export async function openTranscript(ctx) {
+  const side = await sidebar(ctx);
+  await side.click(`.card[data-id$=":${ctx.id}"]`);
+  return transcript(ctx);
+}
+
+/** The session's open transcript frame. */
+export function transcript(ctx) {
+  return frameWith(ctx.page, `body[data-session*="${ctx.id}"] #composer`, `the transcript of ${ctx.title}`);
+}
+
+/** Picks "Chat here" in the message box's ⌄ menu, unless it is the target already. */
+export async function chatHere(frame) {
+  if (await frame.$eval('#chat-bar', (el) => !el.hidden)) return;
+  await frame.click('#composer-more');
+  await frame.click('#composer-menu [data-target="here"]');
+  await frame.click('#composer-more');
+  await waitFor('the chat bar to show', () => frame.$eval('#chat-bar', (el) => !el.hidden));
+}
+
+/** Types `text` in the message box and sends it with Enter. */
+export async function send(frame, text) {
+  await frame.fill('#composer-input', text);
+  await frame.press('#composer-input', 'Enter');
+}
+
+export const click = async (ctx, selector) => (await transcript(ctx)).click(selector);
+
+/** True when the logged conversation (not the chat's pending part) shows `needle`. */
+export const logged = async (ctx, needle) =>
+  (await transcript(ctx)).evaluate((n) => [...document.querySelectorAll('.msg')].some((m) => !m.closest('#chat-live') && (m.textContent || '').includes(n)), needle);
+
+/** The tab of the session's transcript in the editor area. */
+export const tab = (ctx) => ctx.page.locator('.tabs-container .tab', { hasText: ctx.title }).first();
+
+/** Right-clicks the session's card in the sidebar and picks `label` from the context menu. */
+export async function sidebarMenu(ctx, label) {
+  const side = await sidebar(ctx);
+  await side.click(`.card[data-id$=":${ctx.id}"]`, { button: 'right' });
+  const item = ctx.page.locator('.monaco-menu .action-item', { hasText: label }).first();
+  await item.waitFor({ state: 'visible', timeout: 10_000 });
+  await item.click();
+}
+
+/** Waits for the in-page modal (window.dialogStyle custom) and returns it. */
+export async function modal(ctx, text) {
+  const box = ctx.page.locator('.monaco-dialog-box', { hasText: text }).first();
+  await box.waitFor({ state: 'visible', timeout: 10_000 });
+  return box;
+}
+
+export function assert(ok, message) {
+  if (!ok) throw new Error(message);
+}
