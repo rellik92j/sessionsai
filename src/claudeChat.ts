@@ -57,6 +57,25 @@ export function chatArgs(sessionId: string, mode: PermissionMode): string[] {
   ];
 }
 
+/**
+ * Why a Claude Code session id cannot be typed into a terminal, or undefined when it can. The id is the log's file name
+ * under projects/<folder>/, and Resume types `<claudeCommand> --resume <id>` into the terminal's shell (Copy Resume
+ * Command puts the same line on the clipboard). A log named `x&calc.jsonl` would run calc, so anything beyond letters,
+ * digits, `_`, `-` and `.` is refused before a terminal starts, the same rule as unsafeCopilotSessionId. Claude Code
+ * names its logs with UUIDs, so a real id always passes. Chat here passes the id as an argument with no shell.
+ */
+export function unsafeClaudeSessionId(sessionId: string): string | undefined {
+  if (/^[\w.-]+$/.test(sessionId)) {
+    return undefined;
+  }
+  return (
+    `This Claude Code session's id, ${JSON.stringify(sessionId)}, has characters a shell could run as a command, ` +
+    `so it is not put on a command line and no terminal is started. Only letters, digits, "_", "-" and "." are ` +
+    `allowed. The id is the name of the session's log file under Claude Code's projects folder, which Claude Code ` +
+    `names with a UUID, so something else made or renamed it.`
+  );
+}
+
 /** One user turn, as a stdin line. */
 export function userLine(text: string): string {
   return JSON.stringify({ type: 'user', message: { role: 'user', content: text }, parent_tool_use_id: null, session_id: '' }) + '\n';
