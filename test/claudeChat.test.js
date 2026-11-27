@@ -13,6 +13,8 @@ const {
   ENDED_DENY_MESSAGE,
   LiveChat,
   PLAN_DENY_MESSAGE,
+  pickerMode,
+  sessionGrants,
   STOP_DENY_MESSAGE,
   USER_DENY_MESSAGE,
   resolveClaudeExecutable,
@@ -670,6 +672,268 @@ test('plan mode: ExitPlanMode shows the plan with Approve plan and Keep planning
     );
     assert.match(renderLive(live.pieces, true), approve ? /Plan approved/ : /Plan not approved/);
   }
+});
+
+test('"Allow for this session" sends the suggestions scoped to the process, never to a settings file', () => {
+  // Real shapes from Claude Code 2.1.332 (doc section 6a): a Bash rule offered for localSettings, and a Write outside
+  // the working folder offering Accept edits and the folder.
+  assert.deepEqual(
+    sessionGrants([
+      { type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'git tag *' }], behavior: 'allow', destination: 'localSettings' },
+      { type: 'setMode', mode: 'acceptEdits', destination: 'session' },
+      { type: 'addDirectories', directories: ['/work/notes'], destination: 'userSettings' },
+      { type: 'addRules', rules: [{ toolName: 'Read' }], behavior: 'allow', destination: 'projectSettings' },
+    ]),
+    [
+      { type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'git tag *' }], behavior: 'allow', destination: 'session' },
+      { type: 'setMode', mode: 'acceptEdits', destination: 'session' },
+      { type: 'addDirectories', directories: ['/work/notes'], destination: 'session' },
+      { type: 'addRules', rules: [{ toolName: 'Read' }], behavior: 'allow', destination: 'session' },
+    ],
+  );
+  // What it does not know or would not grant is left out; a bad entry is skipped, not a crash.
+  assert.deepEqual(
+    sessionGrants([
+      { type: 'replaceRules', rules: [{ toolName: 'Bash' }], behavior: 'allow', destination: 'session' },
+      { type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'rm *' }], behavior: 'deny', destination: 'session' },
+      { type: 'addRules', rules: [{ ruleContent: 'x' }, 7], behavior: 'allow', destination: 'session' },
+      { type: 'setMode', mode: 'bypassPermissions', destination: 'session' },
+      { type: 'setMode', mode: 'plan', destination: 'session' },
+      { type: 'addDirectories', directories: [], destination: 'session' },
+      null,
+      'addRules',
+    ]),
+    [],
+  );
+  assert.deepEqual(sessionGrants(undefined), []);
+  assert.deepEqual(sessionGrants({ type: 'setMode' }), []);
+
+  const events = readStream('session-permissions.jsonl');
+  const live = new LiveChat();
+  live.addUser('Tag this commit v1, then write a note in /work/notes.', false);
+  const at = (id) => events.findIndex((e) => e.type === 'control_request' && e.request_id === id);
+  for (const ev of events.slice(0, at('req-g1') + 1)) {
+    assert.equal(live.apply(ev).reply, undefined);
+  }
+  let html = renderLive(live.pieces, true);
+  assert.match(html, /data-perm="allow" data-request="req-g1"[\s\S]*data-perm="session" data-request="req-g1"[\s\S]*data-perm="deny" data-request="req-g1"/, 'Allow, then for this session, then Deny');
+  assert.match(html, /Allow for this session/);
+  assert.match(html, /For this session: allows Bash\(git tag \*\) without asking\./);
+  assert.match(html, /Nothing is written to settings files/, 'the button says it writes no settings file');
+
+  const g1 = JSON.parse(live.answer('req-g1', true, true));
+  assert.deepEqual(g1.response.response, {
+    behavior: 'allow',
+    updatedInput: { command: 'git tag v1', description: 'Create git tag v1' },
+    updatedPermissions: [{ type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'git tag *' }], behavior: 'allow', destination: 'session' }],
+  });
+  assert.match(renderLive(live.pieces, true), /perm-outcome allowed[\s\S]*Allowed for this session: allows Bash\(git tag \*\) without asking/);
+
+  for (const ev of events.slice(at('req-g1') + 1, at('req-w1') + 1)) {
+    assert.equal(live.apply(ev).reply, undefined);
+  }
+  html = renderLive(live.pieces, true);
+  assert.match(html, /For this session: switches the permission mode to Accept edits; lets Claude use \/work\/notes\./);
+  const w1 = live.answerLine('req-w1', true, true);
+  assert.equal(w1.cliMode, 'acceptEdits', 'the process leaves default mode');
+  assert.deepEqual(JSON.parse(w1.line).response.response.updatedPermissions, [
+    { type: 'setMode', mode: 'acceptEdits', destination: 'session' },
+    { type: 'addDirectories', directories: ['/work/notes'], destination: 'session' },
+  ]);
+
+  // The second turn asks nothing: the grants hold for the process, and its init reports the new mode.
+  let init;
+  for (const ev of events.slice(at('req-w1') + 1)) {
+    const r = live.apply(ev);
+    assert.equal(r.reply, undefined);
+    if (r.init) init = r.init;
+  }
+  assert.equal(init.permissionMode, 'acceptEdits');
+  assert.deepEqual(live.pendingPermissions(), []);
+  assert.deepEqual(
+    live.pieces.filter((p) => p.kind === 'tool').map((t) => t.status),
+    ['ok', 'ok', 'ok', 'ok'],
+  );
+
+  // Plain Allow on a card with grants sends none; a card without grants has no third button.
+  const once = new LiveChat();
+  once.apply(events[at('req-g1')]);
+  assert.deepEqual(JSON.parse(once.answer('req-g1', true)).response.response, { behavior: 'allow', updatedInput: { command: 'git tag v1', description: 'Create git tag v1' } });
+  assert.doesNotMatch(renderLive(once.pieces, false), /for this session/i);
+  const bare = new LiveChat();
+  bare.apply({ type: 'control_request', request_id: 'r', request: { subtype: 'can_use_tool', tool_name: 'Bash', input: { command: 'ls' }, permission_suggestions: [{ type: 'replaceRules' }] } });
+  assert.doesNotMatch(renderLive(bare.pieces, true), /data-perm="session"/);
+  // Asked for the session anyway (a stale page): allowed once, with nothing to grant.
+  assert.equal(JSON.parse(bare.answer('r', true, true)).response.response.updatedPermissions, undefined);
+});
+
+test('the picker follows the mode Claude Code switches to: a session grant, an approved plan, or what init reports', async () => {
+  // "Allow for this session" with Accept edits: the picker says so at once, and the process is not restarted for it.
+  const a = makeChat();
+  a.chat.send('Write a note.');
+  await tick();
+  const aChild = a.spawns[0].child;
+  const events = readStream('session-permissions.jsonl');
+  aChild.say(events.find((e) => e.request_id === 'req-w1'));
+  assert.equal(a.chat.status.mode, 'ask');
+  assert.equal(a.chat.answer('req-w1', true, true), true);
+  assert.equal(a.chat.status.mode, 'acceptEdits');
+  assert.equal(chatStateMessage(a.chat.status, 'ask').mode, 'acceptEdits', 'the page is told the new mode');
+  aChild.say(result());
+  await tick();
+  await tick();
+  assert.equal(aChild.ended, false, 'already in acceptEdits: no restart');
+  // Picking "Ask me" again does restart it: the session grants go with the process.
+  a.chat.setMode('ask');
+  await tick();
+  assert.equal(aChild.ended, true);
+
+  // An approved plan: Claude Code leaves plan mode for default (doc section 6a), so the picker says "Ask me".
+  const b = makeChat({ mode: 'plan' });
+  b.chat.send('Plan a greeting module.');
+  await tick();
+  const bChild = b.spawns[0].child;
+  bChild.say(...readStream('plan.jsonl'));
+  assert.equal(b.chat.status.mode, 'plan');
+  b.chat.answer('req-plan', true);
+  assert.equal(b.chat.status.mode, 'ask');
+  bChild.say(result());
+  await tick();
+  b.chat.send('Go on.');
+  await tick();
+  bChild.say({ type: 'system', subtype: 'init', session_id: 'sess-0003', permissionMode: 'default' });
+  assert.equal(b.chat.status.mode, 'ask');
+  assert.equal(bChild.ended, false, 'no restart: the process is already in default');
+  assert.equal(b.spawns.length, 1);
+
+  // A plan not approved stays in plan mode.
+  const c = makeChat({ mode: 'plan' });
+  c.chat.send('Plan it.');
+  await tick();
+  c.spawns[0].child.say(...readStream('plan.jsonl'));
+  c.chat.answer('req-plan', false);
+  assert.equal(c.chat.status.mode, 'plan');
+
+  // init is the CLI's word on it, whatever changed it; a mode the picker has no entry for leaves the picker alone.
+  const d = makeChat();
+  d.chat.send('hi');
+  await tick();
+  const dChild = d.spawns[0].child;
+  dChild.say({ type: 'system', subtype: 'init', session_id: 's', permissionMode: 'default' });
+  assert.equal(d.chat.status.mode, 'ask');
+  dChild.say({ type: 'system', subtype: 'init', session_id: 's', permissionMode: 'auto' });
+  assert.equal(d.chat.status.mode, 'auto');
+  dChild.say({ type: 'system', subtype: 'init', session_id: 's', permissionMode: 'dontAsk' });
+  assert.equal(d.chat.status.mode, 'auto');
+  assert.ok(d.logs.some((l) => /now in dontAsk mode/.test(l)));
+
+  // Decline-prompts runs as default too: an init saying default keeps it.
+  const e = makeChat({ mode: 'deny' });
+  e.chat.send('hi');
+  await tick();
+  e.spawns[0].child.say({ type: 'system', subtype: 'init', session_id: 's', permissionMode: 'default' });
+  assert.equal(e.chat.status.mode, 'deny');
+
+  // A mode the user picked during the turn wins over one the CLI switched to: it restarts into it after the turn.
+  const f = makeChat();
+  f.chat.send('Write a note.');
+  await tick();
+  const fChild = f.spawns[0].child;
+  fChild.say(events.find((ev) => ev.request_id === 'req-w1'));
+  f.chat.setMode('plan');
+  f.chat.answer('req-w1', true, true);
+  assert.equal(f.chat.status.mode, 'plan');
+  fChild.say(result());
+  await tick();
+  await tick();
+  assert.equal(fChild.ended, true, 'restarted into the mode the user picked');
+
+  assert.equal(pickerMode('acceptEdits', 'ask'), 'acceptEdits');
+  assert.equal(pickerMode('default', 'deny'), 'deny');
+  assert.equal(pickerMode('default', 'plan'), 'ask');
+  assert.equal(pickerMode('bypassPermissions', 'ask'), undefined);
+});
+
+test('a mode Claude Code switched to ends with its process: the next one starts in the mode the user picked', async () => {
+  const events = readStream('session-permissions.jsonl');
+  const modeArg = (spawn) => spawn.args[spawn.args.indexOf('--permission-mode') + 1];
+  const grantAcceptEdits = async (h) => {
+    h.chat.send('Write a note.');
+    await tick();
+    const child = h.spawns.at(-1).child;
+    child.say(events.find((e) => e.request_id === 'req-w1'));
+    h.chat.answer('req-w1', true, true);
+    assert.equal(h.chat.status.mode, 'acceptEdits');
+    return child;
+  };
+
+  // End chat during the turn: the picker shows Accept edits while the process finishes, then goes back to "Ask me".
+  const a = makeChat();
+  const aChild = await grantAcceptEdits(a);
+  const done = a.chat.end();
+  assert.equal(a.chat.status.mode, 'acceptEdits', 'the process still runs in Accept edits');
+  aChild.say(result());
+  await done;
+  assert.equal(a.chat.status.mode, 'ask');
+  assert.ok(a.logs.some((l) => /Back to the picked mode, ask/.test(l)));
+
+  // The process exits on its own and the next message starts another: back in "Ask me", the grant gone with it.
+  const b = makeChat();
+  const bChild = await grantAcceptEdits(b);
+  bChild.say(result());
+  await tick();
+  bChild.emit('exit', 0, null);
+  assert.equal(b.chat.status.mode, 'ask');
+  b.chat.send('Another note.');
+  await tick();
+  assert.equal(b.spawns.length, 2);
+  assert.equal(modeArg(b.spawns[1]), 'default');
+  assert.equal(b.chat.status.mode, 'ask');
+
+  // A mode the user picks while the grant's mode is shown is theirs, and the next process starts in it.
+  const c = makeChat();
+  const cChild = await grantAcceptEdits(c);
+  c.chat.setMode('acceptEdits');
+  cChild.say(result());
+  await tick();
+  assert.equal(cChild.ended, false, 'picking the mode it is already in restarts nothing');
+  cChild.emit('exit', 0, null);
+  c.chat.send('Another note.');
+  await tick();
+  assert.equal(modeArg(c.spawns[1]), 'acceptEdits');
+  assert.equal(c.chat.status.mode, 'acceptEdits');
+
+  // An approved plan leaves plan mode for the rest of its process only: the next process plans again.
+  const d = makeChat({ mode: 'plan' });
+  d.chat.send('Plan a greeting module.');
+  await tick();
+  const dChild = d.spawns[0].child;
+  dChild.say(...readStream('plan.jsonl'));
+  d.chat.answer('req-plan', true);
+  assert.equal(d.chat.status.mode, 'ask');
+  dChild.say(result());
+  await tick();
+  dChild.emit('exit', 0, null);
+  assert.equal(d.chat.status.mode, 'plan');
+  d.chat.send('Next task.');
+  await tick();
+  assert.equal(modeArg(d.spawns[1]), 'plan');
+
+  // Decline-prompts comes back with its declining: a card in the next process is answered at once.
+  const e = makeChat({ mode: 'deny' });
+  e.chat.send('hi');
+  await tick();
+  const eChild = e.spawns[0].child;
+  eChild.say({ type: 'system', subtype: 'init', session_id: 's', permissionMode: 'auto' });
+  assert.equal(e.chat.status.mode, 'auto');
+  eChild.say(result());
+  await tick();
+  eChild.emit('exit', 0, null);
+  assert.equal(e.chat.status.mode, 'deny');
+  e.chat.send('again');
+  await tick();
+  e.spawns[1].child.say({ type: 'control_request', request_id: 'r-d', request: { subtype: 'can_use_tool', tool_name: 'Bash', input: { command: 'ls' }, tool_use_id: 'toolu_d' } });
+  assert.deepEqual(e.spawns[1].child.controls(), [JSON.parse(denyLine('r-d', DENY_MESSAGE))]);
 });
 
 test('a card never hangs the turn: Stop, ending the chat, switching to decline, or the process exiting resolves it', async () => {

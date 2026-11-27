@@ -9,7 +9,10 @@
 //
 // Scripts, picked by the first matching word in the user's message:
 //   "permission"  a Bash call that asks for permission (can_use_tool); the reply depends on Allow or Deny, and with
-//                 "slowly" in the message as well, it goes on for REPLY_LINES more lines after the answer
+//                 "slowly" in the message as well, it goes on for REPLY_LINES more lines after the answer; with
+//                 "session" as well, the request offers Claude Code's suggestions (a Bash rule, Accept edits), and
+//                 those granted for the process by Allow for this session hold until it exits
+//                 (a later "permission" turn runs without asking, and the next init reports the mode)
 //   anything else a slow reply: REPLY_LINES lines, one every LINE_MS
 // "lingering" in a message (either script) makes the process wait LINGER_MS after its last turn ends and stdin has
 // closed, before it exits: a window in which the reply is over but the process is still there.
@@ -28,7 +31,15 @@ const VERSION = '2.1.332';
 
 const args = process.argv.slice(2);
 const sessionId = args[args.indexOf('--resume') + 1];
-const permissionMode = args.includes('--permission-mode') ? args[args.indexOf('--permission-mode') + 1] : 'default';
+// A `setMode` grant (Allow for this session) changes it for the rest of the process, as Claude Code does.
+let permissionMode = args.includes('--permission-mode') ? args[args.indexOf('--permission-mode') + 1] : 'default';
+/** `Bash(<rule>)` allow rules granted for this process by Allow for this session. */
+const sessionRules = new Set();
+/** What a "session" request offers: Claude Code's own suggestion shapes (doc section 6a). */
+const SESSION_SUGGESTIONS = [
+  { type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'echo *' }], behavior: 'allow', destination: 'localSettings' },
+  { type: 'setMode', mode: 'acceptEdits', destination: 'session' },
+];
 const eventsFile = process.env.SESSIONSAI_E2E_EVENTS;
 
 function note(event, extra = {}) {
@@ -190,7 +201,7 @@ async function slowReply(started, n) {
   note('turn-end', { how: 'completed' });
 }
 
-async function permissionReply(started, n, slowly) {
+async function permissionReply(started, n, slowly, offer) {
   const messageId = `msg_e2e_${n}a`;
   const toolUseId = `toolu_e2e_${n}`;
   const requestId = `req-e2e-${n}`;
@@ -200,20 +211,45 @@ async function permissionReply(started, n, slowly) {
   finishBlock(messageId, { type: 'tool_use', id: toolUseId, name: 'Bash', input }, 'tool_use');
   stream({ type: 'content_block_stop', index: 0 }, messageId);
   stream({ type: 'message_stop' }, messageId);
-  const answer = new Promise((resolve) => (turn.answer = { requestId, resolve }));
-  out({
-    type: 'control_request',
-    request_id: requestId,
-    request: { subtype: 'can_use_tool', tool_name: 'Bash', display_name: 'Bash', input, description: input.description, tool_use_id: toolUseId, permission_suggestions: [] },
-  });
-  note('permission-asked', { requestId });
-  const response = await answer;
-  turn.answer = undefined;
-  if (!response) {
-    return interrupted(started, messageId, '');
+  let response;
+  if (sessionRules.has('echo *')) {
+    // Granted for this process by an earlier Allow for this session: it runs without asking.
+    note('permission-skipped', { rule: 'Bash(echo *)' });
+    response = { behavior: 'allow' };
+  } else {
+    const answer = new Promise((resolve) => (turn.answer = { requestId, resolve }));
+    out({
+      type: 'control_request',
+      request_id: requestId,
+      request: {
+        subtype: 'can_use_tool',
+        tool_name: 'Bash',
+        display_name: 'Bash',
+        input,
+        description: input.description,
+        tool_use_id: toolUseId,
+        permission_suggestions: offer ? SESSION_SUGGESTIONS : [],
+      },
+    });
+    note('permission-asked', { requestId });
+    response = await answer;
+    turn.answer = undefined;
+    if (!response) {
+      return interrupted(started, messageId, '');
+    }
+    note('permission-answered', { behavior: response.behavior, message: response.message, updatedPermissions: response.updatedPermissions });
   }
   const allowed = response.behavior === 'allow';
-  note('permission-answered', { behavior: response.behavior, message: response.message });
+  // Only grants scoped to the process are kept; one for a settings file would be written there, which this never does.
+  for (const g of allowed && Array.isArray(response.updatedPermissions) ? response.updatedPermissions : []) {
+    if (g.destination !== 'session') {
+      note('settings-write', { grant: g });
+    } else if (g.type === 'addRules') {
+      g.rules?.forEach((r) => r.toolName === 'Bash' && sessionRules.add(r.ruleContent));
+    } else if (g.type === 'setMode') {
+      permissionMode = g.mode;
+    }
+  }
   const toolResult = allowed
     ? { type: 'tool_result', tool_use_id: toolUseId, content: 'stand-in\n', is_error: false }
     : { type: 'tool_result', tool_use_id: toolUseId, content: String(response.message ?? 'Denied.'), is_error: true };
@@ -250,7 +286,7 @@ async function runTurn(text) {
   await sleep(150);
   out({ type: 'user', message: { role: 'user', content: text }, session_id: sessionId, parent_tool_use_id: null, uuid, timestamp: now(), isReplay: true });
   if (/permission/i.test(text)) {
-    await permissionReply(started, n, /slowly/i.test(text));
+    await permissionReply(started, n, /slowly/i.test(text), /session/i.test(text));
   } else {
     await slowReply(started, n);
   }

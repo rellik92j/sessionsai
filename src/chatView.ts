@@ -1,7 +1,7 @@
 // The in-view chat's pending messages, drawn below the logged transcript until the log catches up with them.
 // No VS Code imports here, so it can be unit-tested with plain Node.
 
-import { ChatStatus, LivePiece, PERMISSION_MODES, PermissionMode, PermissionPiece } from './claudeChat';
+import { ChatStatus, LivePiece, PERMISSION_MODES, PermissionMode, PermissionPiece, pickerMode, SessionGrant } from './claudeChat';
 import { COPILOT_MODES, CopilotMode } from './copilotChat';
 import type { SessionSource } from './sessionParser';
 import { escapeHtml, formatUsd } from './format';
@@ -153,7 +153,26 @@ export function permissionDetail(toolName: string, input: Record<string, unknown
   return json && json !== '{}' ? pre(clip(json)) : '';
 }
 
-/** A permission card: what Claude wants to run, with Allow and Deny while it is the one waiting (`active`). */
+/** What one "Allow for this session" grant does, in words. */
+export function describeGrant(g: SessionGrant): string {
+  switch (g.type) {
+    case 'addRules':
+      return `allows ${g.rules.map((r) => (r.ruleContent !== undefined ? `${r.toolName}(${r.ruleContent})` : `every ${r.toolName} call`)).join(', ')} without asking`;
+    case 'addDirectories':
+      return `lets Claude use ${g.directories.join(', ')}`;
+    case 'setMode': {
+      const mode = pickerMode(g.mode, 'ask');
+      return `switches the permission mode to ${mode ? MODE_LABELS[mode].label : g.mode}`;
+    }
+  }
+}
+
+const grantsText = (grants: SessionGrant[]) => grants.map(describeGrant).join('; ');
+
+/**
+ * A permission card: what Claude wants to run, with Allow and Deny while it is the one waiting (`active`), and Allow
+ * for this session when the request offers grants Claude Code keeps for the running process (doc section 6a).
+ */
 function renderPermission(p: PermissionPiece, active: boolean): string {
   const plan = p.toolName === 'ExitPlanMode';
   const head = plan
@@ -165,12 +184,17 @@ function renderPermission(p: PermissionPiece, active: boolean): string {
   const body = plan ? (planText ? `<div class="perm-plan md">${renderMarkdown(planText, 'assistant')}</div>` : '') : permissionDetail(p.toolName, p.input);
   const rid = escapeHtml(p.requestId);
   let foot: string;
+  const grants = !plan && p.grants?.length ? grantsText(p.grants) : '';
   if (p.state === 'pending') {
+    const session = grants
+      ? `<button class="btn" data-perm="session" data-request="${rid}" title="${escapeHtml(`Let it run, and for as long as this chat runs: ${grants}. Ends when the tab closes, End chat, or the permission mode changes. Nothing is written to settings files.`)}"><i class="codicon codicon-check-all"></i><span>Allow for this session</span></button>`
+      : '';
     foot = active
-      ? `<div class="perm-actions"><button class="btn primary" data-perm="allow" data-request="${rid}" title="${plan ? 'Approve the plan: Claude starts on it' : 'Let it run this once'}"><i class="codicon codicon-check"></i><span>${plan ? 'Approve plan' : 'Allow'}</span></button><button class="btn" data-perm="deny" data-request="${rid}" title="${plan ? 'Keep planning: Claude waits for your feedback' : 'Decline it: Claude carries on without it'}"><i class="codicon codicon-close"></i><span>${plan ? 'Keep planning' : 'Deny'}</span></button></div>`
+      ? `<div class="perm-actions"><button class="btn primary" data-perm="allow" data-request="${rid}" title="${plan ? 'Approve the plan: Claude starts on it' : 'Let it run this once'}"><i class="codicon codicon-check"></i><span>${plan ? 'Approve plan' : 'Allow'}</span></button>${session}<button class="btn" data-perm="deny" data-request="${rid}" title="${plan ? 'Keep planning: Claude waits for your feedback' : 'Decline it: Claude carries on without it'}"><i class="codicon codicon-close"></i><span>${plan ? 'Keep planning' : 'Deny'}</span></button></div>${grants ? `<div class="perm-sub perm-grants">For this session: ${escapeHtml(grants)}.</div>` : ''}`
       : '<div class="perm-outcome waiting"><i class="codicon codicon-history"></i><span>Waiting: answer the request above first.</span></div>';
   } else if (p.state === 'allowed') {
-    foot = `<div class="perm-outcome allowed"><i class="codicon codicon-check"></i><span>${plan ? 'Plan approved' : 'Allowed'}</span></div>`;
+    const what = plan ? 'Plan approved' : p.forSession && grants ? `Allowed for this session: ${grants}` : 'Allowed';
+    foot = `<div class="perm-outcome allowed"><i class="codicon codicon-${p.forSession ? 'check-all' : 'check'}"></i><span>${escapeHtml(what)}</span></div>`;
   } else {
     foot = `<div class="perm-outcome denied"><i class="codicon codicon-circle-slash"></i><span>${plan ? 'Plan not approved' : 'Denied'}${p.why ? `. ${escapeHtml(p.why)}` : ''}</span></div>`;
   }

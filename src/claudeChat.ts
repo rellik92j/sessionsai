@@ -72,9 +72,68 @@ export function denyLine(requestId: string, message = DENY_MESSAGE): string {
   return JSON.stringify({ type: 'control_response', response: { subtype: 'success', request_id: requestId, response: { behavior: 'deny', message } } }) + '\n';
 }
 
-/** Allows a `can_use_tool` request: the tool runs with `input`, the input it asked for (doc section 6). */
-export function allowLine(requestId: string, input: Record<string, unknown>): string {
-  return JSON.stringify({ type: 'control_response', response: { subtype: 'success', request_id: requestId, response: { behavior: 'allow', updatedInput: input } } }) + '\n';
+/**
+ * Allows a `can_use_tool` request: the tool runs with `input`, the input it asked for (doc section 6). `grants` go along
+ * as `updatedPermissions` (doc section 6a): the "Allow for this session" button.
+ */
+export function allowLine(requestId: string, input: Record<string, unknown>, grants?: SessionGrant[]): string {
+  const response: Record<string, unknown> = { behavior: 'allow', updatedInput: input };
+  if (grants?.length) {
+    response.updatedPermissions = grants;
+  }
+  return JSON.stringify({ type: 'control_response', response: { subtype: 'success', request_id: requestId, response } }) + '\n';
+}
+
+/** A permission suggestion as the chat sends it back: one Claude Code honours, scoped to the running process. */
+export type SessionGrant =
+  | { type: 'addRules'; rules: { toolName: string; ruleContent?: string }[]; behavior: 'allow'; destination: 'session' }
+  | { type: 'addDirectories'; directories: string[]; destination: 'session' }
+  | { type: 'setMode'; mode: string; destination: 'session' };
+
+/** The CLI modes a `setMode` grant may switch to: the ones the picker can show. */
+const GRANTABLE_MODES = new Set(['acceptEdits', 'default', 'auto']);
+
+/**
+ * The request's `permission_suggestions` that "Allow for this session" sends: allow rules, directories and a mode
+ * switch, each with `destination` rewritten to `session` so nothing is written to a settings file (doc section 6a).
+ * Anything else (another type, a deny rule, a mode the picker does not know, a malformed entry) is left out.
+ */
+export function sessionGrants(suggestions: unknown): SessionGrant[] {
+  const out: SessionGrant[] = [];
+  for (const raw of Array.isArray(suggestions) ? suggestions : []) {
+    const s = obj(raw);
+    if (s?.type === 'addRules' && s.behavior === 'allow' && Array.isArray(s.rules)) {
+      const rules = s.rules
+        .map((r) => obj(r))
+        .filter((r): r is Record<string, unknown> => typeof r?.toolName === 'string' && !!r.toolName)
+        .map((r) => (typeof r.ruleContent === 'string' ? { toolName: r.toolName as string, ruleContent: r.ruleContent } : { toolName: r.toolName as string }));
+      if (rules.length) {
+        out.push({ type: 'addRules', rules, behavior: 'allow', destination: 'session' });
+      }
+    } else if (s?.type === 'addDirectories' && Array.isArray(s.directories)) {
+      const directories = s.directories.filter((d): d is string => typeof d === 'string' && !!d);
+      if (directories.length) {
+        out.push({ type: 'addDirectories', directories, destination: 'session' });
+      }
+    } else if (s?.type === 'setMode' && typeof s.mode === 'string' && GRANTABLE_MODES.has(s.mode)) {
+      out.push({ type: 'setMode', mode: s.mode, destination: 'session' });
+    }
+  }
+  return out;
+}
+
+/**
+ * The picker's mode for the CLI mode a process reports (or was switched to), keeping `current` when it already maps to
+ * it ("Ask me" and decline-prompts both run as `default`). Undefined for a mode the picker has no entry for.
+ */
+export function pickerMode(cliMode: string, current: PermissionMode): PermissionMode | undefined {
+  if (cliPermissionMode(current) === cliMode) {
+    return current;
+  }
+  if (cliMode === 'default') {
+    return 'ask';
+  }
+  return isPermissionMode(cliMode) && cliMode !== 'ask' && cliMode !== 'deny' ? cliMode : undefined;
 }
 
 /** The answer to a control request this chat does not handle, so the CLI is never left waiting on it. */
@@ -242,7 +301,11 @@ export interface PermissionPiece {
   description?: string;
   /** A path outside what the session may touch, when that is why it asks. */
   blockedPath?: string;
+  /** What "Allow for this session" grants: the request's suggestions, scoped to the process. None: no such button. */
+  grants?: SessionGrant[];
   state: 'pending' | 'allowed' | 'denied';
+  /** Allowed with its grants, for the rest of the process. */
+  forSession?: boolean;
   /** Why a card was denied without the user pressing Deny: Stop, the chat closing, the process exiting. */
   why?: string;
   expire?: boolean;
@@ -316,18 +379,31 @@ export class LiveChat {
 
   /**
    * The user's answer to a card: the reply line for the process, or undefined when the card is not the one waiting
-   * (already answered, or a later one while an earlier is still open).
+   * (already answered, or a later one while an earlier is still open). `forSession` allows with the card's grants (a
+   * card without any is allowed once). `cliMode` is the mode the process switches to with this answer, if it does: the
+   * grants' `setMode`, or `default` once a plan is approved (doc section 6a).
    */
-  answer(requestId: string, allow: boolean): string | undefined {
+  answerLine(requestId: string, allow: boolean, forSession = false): { line: string; cliMode?: string } | undefined {
     const card = this.pendingPermissions()[0];
     if (!card || card.requestId !== requestId) {
       return undefined;
     }
     if (allow) {
       card.state = 'allowed';
-      return allowLine(card.requestId, card.input);
+      const grants = forSession && card.grants?.length ? card.grants : undefined;
+      card.forSession = !!grants || undefined;
+      const setMode = grants?.find((g): g is Extract<SessionGrant, { type: 'setMode' }> => g.type === 'setMode');
+      return {
+        line: allowLine(card.requestId, card.input, grants),
+        cliMode: setMode ? setMode.mode : card.toolName === 'ExitPlanMode' ? 'default' : undefined,
+      };
     }
-    return this.denyCard(card, card.toolName === 'ExitPlanMode' ? PLAN_DENY_MESSAGE : USER_DENY_MESSAGE);
+    return { line: this.denyCard(card, card.toolName === 'ExitPlanMode' ? PLAN_DENY_MESSAGE : USER_DENY_MESSAGE) };
+  }
+
+  /** answerLine's reply line alone. */
+  answer(requestId: string, allow: boolean, forSession = false): string | undefined {
+    return this.answerLine(requestId, allow, forSession)?.line;
   }
 
   /** Denies every open card with `message` (Stop, the chat ending), noting `why` on each; the reply lines, in order. */
@@ -568,6 +644,7 @@ export class LiveChat {
       // The same request twice: the card is already up.
       return { changed: false };
     }
+    const grants = sessionGrants(request.permission_suggestions);
     this.pieces.push({
       kind: 'permission',
       id: this.nextId++,
@@ -577,6 +654,7 @@ export class LiveChat {
       toolUseId,
       description: str(request.description),
       blockedPath: str(request.blocked_path),
+      grants: grants.length ? grants : undefined,
       state: 'pending',
     });
     return { changed: true };
@@ -732,8 +810,8 @@ export interface SessionChat {
   /** When this chat last heard from its process; its own writes to the log are not another writer's. */
   readonly lastActivity: number;
   send(text: string): void;
-  /** The user's answer to a permission card; false when nothing was waiting on it. */
-  answer(requestId: string, allow: boolean): boolean;
+  /** The user's answer to a permission card, `forSession` for "Allow for this session"; false when nothing was waiting on it. */
+  answer(requestId: string, allow: boolean, forSession?: boolean): boolean;
   /** Stop: ends the running turn; messages still waiting go back to the message box. */
   interrupt(): void;
   setMode(mode: string): void;
@@ -782,12 +860,19 @@ export class ClaudeChat implements SessionChat {
   private heard = false;
   /** When this chat last heard from its process; its own writes to the log are not another writer's. */
   lastActivity = 0;
+  /** The mode the picker shows: the one picked, or one the running process switched itself to (followCliMode). */
   mode: PermissionMode;
+  /**
+   * The mode the user picked. Every new process starts in it: a mode Claude Code switched to by itself (an "Allow for
+   * this session" grant, a plan approved) ends with the process that switched (doc section 6a).
+   */
+  private picked: PermissionMode;
   /** The --permission-mode the running process was started with. */
   private runningCliMode?: string;
 
   constructor(private readonly opts: ChatOptions) {
     this.mode = opts.mode;
+    this.picked = opts.mode;
     this.live.decline = opts.mode === 'deny' ? DENY_MESSAGE : undefined;
   }
 
@@ -830,16 +915,64 @@ export class ClaudeChat implements SessionChat {
 
   /**
    * The user answered a permission card: Allow lets the tool run, Deny declines it and Claude carries on. Only the
-   * oldest open card can be answered, so requests go in order; an answer to any other is ignored.
+   * oldest open card can be answered, so requests go in order; an answer to any other is ignored. "Allow for this
+   * session" (`forSession`) also sends the card's grants, which last as long as this process.
    */
-  answer(requestId: string, allow: boolean): boolean {
-    const line = this.live.answer(requestId, allow);
-    if (!line) {
+  answer(requestId: string, allow: boolean, forSession = false): boolean {
+    const answered = this.live.answerLine(requestId, allow, forSession);
+    if (!answered) {
       return false;
     }
-    this.write(line);
+    this.write(answered.line);
+    if (answered.cliMode) {
+      this.followCliMode(answered.cliMode);
+    }
     this.opts.onChange();
     return true;
+  }
+
+  /**
+   * The process is now in `cliMode`, by its own doing: a `setMode` grant, a plan approved, or what a turn's `init`
+   * reports. The picker follows it (doc section 6a), so it does not say Plan once the plan is approved, and so a mode
+   * change that matches it does not restart the process. A change the user picked during the turn still wins: the
+   * process restarts into it after the turn. The picked mode stays as it was, so the next process starts in it
+   * (backToPicked). True when the picker's mode changed.
+   */
+  private followCliMode(cliMode: string): boolean {
+    if (cliMode === this.runningCliMode || !this.child) {
+      return false;
+    }
+    this.opts.log(`Claude Code is now in ${cliMode} mode (was ${this.runningCliMode}).`);
+    this.runningCliMode = cliMode;
+    if (this.restartAfterTurn) {
+      this.restartAfterTurn = cliPermissionMode(this.mode) !== cliMode;
+      return false;
+    }
+    const mode = pickerMode(cliMode, this.mode);
+    if (!mode || mode === this.mode) {
+      return false;
+    }
+    this.mode = mode;
+    if (!this.disposed) {
+      // Never decline-prompts here (that runs as `default`, which keeps it), so cards are shown again.
+      this.live.decline = undefined;
+    }
+    return true;
+  }
+
+  /**
+   * The process that followCliMode followed is gone: the picker goes back to the mode the user picked, the one the next
+   * process starts in. A grant's mode or an approved plan's never carries over to a new process.
+   */
+  private backToPicked(): void {
+    if (this.mode === this.picked) {
+      return;
+    }
+    this.opts.log(`Back to the picked mode, ${this.picked}: the process that switched to ${this.mode} has ended.`);
+    this.mode = this.picked;
+    if (!this.disposed) {
+      this.live.decline = this.picked === 'deny' ? DENY_MESSAGE : undefined;
+    }
   }
 
   /**
@@ -867,9 +1000,12 @@ export class ClaudeChat implements SessionChat {
    */
   setMode(mode: PermissionMode): void {
     if (mode === this.mode) {
+      // Already the running process's mode, maybe by its own doing: now it is the user's pick too.
+      this.picked = mode;
       return;
     }
     this.mode = mode;
+    this.picked = mode;
     if (!this.disposed) {
       this.live.decline = mode === 'deny' ? DENY_MESSAGE : undefined;
       if (mode === 'deny') {
@@ -967,6 +1103,7 @@ export class ClaudeChat implements SessionChat {
       this.failStart(where.error, false);
       return false;
     }
+    this.backToPicked();
     const args = chatArgs(this.opts.sessionId, this.mode);
     this.opts.log(`Starting: ${where.exe} ${args.join(' ')}${where.cwd ? ` (in ${where.cwd})` : ''}`);
     let child: ChatChild;
@@ -1023,6 +1160,8 @@ export class ClaudeChat implements SessionChat {
       return;
     }
     this.child = undefined;
+    // What the process switched itself to ended with it.
+    this.backToPicked();
     // A card still open can no longer be answered: nothing hangs on it, and it says why.
     this.live.abandonPending('Claude Code exited before it was answered.');
     const expected = !!this.closing || this.disposed;
@@ -1072,6 +1211,9 @@ export class ClaudeChat implements SessionChat {
       }
       const r = this.live.apply(ev);
       changed ||= r.changed;
+      if (r.init?.permissionMode && this.followCliMode(r.init.permissionMode)) {
+        changed = true;
+      }
       if (r.reply) {
         this.write(r.reply);
       }

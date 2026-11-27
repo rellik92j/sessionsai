@@ -373,8 +373,9 @@ export class TranscriptPanels {
           await this.endTabChat(tab);
           break;
         case 'chatPermission':
-          // Allow or Deny on a permission card. An answer to a card that is no longer the open one changes nothing.
-          if (typeof msg.requestId === 'string' && !(tab.chat ?? tab.ending)?.answer(msg.requestId, msg.allow === true)) {
+          // Allow, Allow for this session, or Deny on a permission card. An answer to a card that is no longer the open
+          // one changes nothing.
+          if (typeof msg.requestId === 'string' && !(tab.chat ?? tab.ending)?.answer(msg.requestId, msg.allow === true, msg.session === true)) {
             this.postChat(tab);
           }
           break;
@@ -467,7 +468,14 @@ export class TranscriptPanels {
     if (tab.run || !canChatHere(session)) {
       return false;
     }
-    tab.chatMode = chatModeFor(session, mode) ?? tab.chatMode;
+    // The page sends the mode its picker shows. While a chat runs that can be a mode Claude Code switched to by itself
+    // (an "Allow for this session" grant, a plan approved), which ends with its process and is not the tab's mode. So
+    // only a mode other than the one shown is a new pick.
+    const sent = chatModeFor(session, mode);
+    const picked = !!sent && sent !== ((tab.chat ?? tab.ending)?.status.mode ?? tab.chatMode);
+    if (picked) {
+      tab.chatMode = sent;
+    }
     if (tab.waiting) {
       // Already waiting for an ended chat: this one goes after the others, with the new chat.
       tab.waiting.push(text);
@@ -517,7 +525,9 @@ export class TranscriptPanels {
           ? new CopilotChat({ ...common, mode: isCopilotMode(mode) ? mode : DEFAULT_COPILOT_MODE, launch: () => copilotLaunch(tab.session), spawn: spawnCopilot })
           : new ClaudeChat({ ...common, mode: isPermissionMode(mode) ? mode : 'ask', launch: () => chatLaunch(tab.session), spawn: spawnChat });
     }
-    tab.chat.setMode(tab.chatMode);
+    if (picked) {
+      tab.chat.setMode(tab.chatMode);
+    }
     this.hooks.rememberTarget?.(sourceOf(session), 'here');
     // A chat keeps its tab: the shared preview tab would otherwise be taken over by the next transcript opened.
     if (tab.preview) {
