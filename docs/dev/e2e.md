@@ -105,12 +105,12 @@ The reset leaves the sidebar's own state (grouping, chips, search box) alone. Sc
 it back themselves.
 
 One side effect to know when writing a scenario: with no preview tab left to reuse, the first transcript a scenario
-opens from the sidebar is a new tab, and a new webview tab does not take the keyboard. The workbench's focus is left on
-nothing. Without the reset, a click usually only switched the shared preview tab to another session, so the keyboard
-stayed in that webview. Typing into the page still works, because Playwright focuses an input before it types. A key
-pressed on the page itself (`frame.press('body', 'F3')`) does not, because `body` cannot take focus, so the key goes to
-the workbench and the page never sees it. A scenario that presses keys in a transcript clicks inside the page first, as
-`transcript-search-highlights` does before F3.
+opens from the sidebar is a new tab. The workbench focuses a new webview tab before its page has loaded, and that focus
+is lost, so the extension focuses the tab again once its first page has loaded (the page's `pageLoaded` message in
+`src/transcriptPanel.ts`). A key pressed on the page itself (`frame.press('body', 'F3')`) only reaches the page once
+that has happened, since `body` cannot take focus, so a scenario that presses keys in a new transcript first waits until
+the page's `document.hasFocus()` is true, as `transcript-search-highlights` does before F3. It does not click into the
+page: that would hide a tab that never took the keyboard.
 
 Opening a new tab also takes longer than switching the preview tab, so what a click or double-click sets off lands
 later. A double-click is two clicks and then the double-click: the first click opens the preview tab, and the
@@ -241,7 +241,7 @@ Area `transcript`, `test/e2e/scenarios/transcript.mjs`, reading a session as a c
 | `transcript-jump-to-latest` | A transcript opens at its bottom with no jump button; scrolled up, the button shows, and clicking it goes back to the bottom. |
 | `transcript-mid-turn-and-session-messages` | A prompt logged as a queued command shows with the "sent mid-turn" pill (a typed one does not); another session's message is a card with its sender, "session message" pill and text. |
 | `transcript-subagent-run` | A subagent block in the session has Open run; it opens the run's own log with no message box and a Back to session button, which returns to the session. |
-| `transcript-search-highlights` | Searching in the sidebar and opening the session marks every match in message text (not in a tool call), starts at the first ("1 of 3", in view), F3 and Shift+F3 move and wrap, Escape clears. |
+| `transcript-search-highlights` | Searching in the sidebar and opening the session into an empty editor area marks every match in message text (not in a tool call), starts at the first ("1 of 3", in view); the new tab takes the keyboard without a click, F3 and Shift+F3 move and wrap, Escape clears. |
 | `transcript-details-panel` | The panel's sections count and list changed files (with New), to-dos, skills and prompts; a section folds and opens; a folded one (Web) opens; clicking a prompt scrolls to it and flashes it. |
 | `transcript-prompt-cost` | Each prompt shows `$0.10 · 2m` style cost and duration beside it, and the details panel's prompts show the same figures. |
 | `transcript-live-update` | Records appended to an open session's log appear in the tab in place (the page is not rebuilt, the reader's scroll stays), the new-messages dot shows when scrolled up and clears on Jump to latest, and at the bottom the page follows along. |

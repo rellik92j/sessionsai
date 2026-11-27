@@ -410,6 +410,8 @@ export default {
             const ids = await (await sidebar(ctx)).$$eval('.card', (cs) => cs.map((c) => c.dataset.id));
             return ids.length === 1 && ids[0].endsWith(`:${ctx.id}`);
           });
+          // The reset before the scenario left no tab to reuse, so the click opens a new one.
+          assert((await ctx.page.locator('.part.editor .tabs-container .tab').count()) === 0, 'the editor area is empty before the click');
           await (await sidebar(ctx)).click(`.card[data-id$=":${ctx.id}"]`);
           await frameWith(ctx.page, `body[data-session*="${ctx.id}"][data-highlight]`, 'the transcript opened from the search');
           await waitFor('the matches to be marked', async () => (await count(ctx, 'mark.hit')) === 3);
@@ -420,11 +422,9 @@ export default {
           assert(await inView(ctx, 'mark.hit', 0), 'the page opens at the first match');
           assert(!(await inView(ctx, 'mark.hit', 2)), 'the last match is further down, out of view');
           assert((await count(ctx, 'details.tool mark.hit')) === 0, 'a match inside a tool call is not marked');
-          // F3 and Shift+F3 move between matches. They are keys pressed in the page, so the page needs the keyboard
-          // first: a transcript opened from the sidebar into an empty editor area is a new tab that does not take it
-          // (a click that only switches the preview tab's session leaves it in that tab), and Playwright cannot focus
-          // `body`. Click the find bar's query text, which does nothing else, as a person would click into the page.
-          await (await page(ctx)).click('.findbar .find-query');
+          // F3 and Shift+F3 move between matches. The transcript opened into an empty editor area, so it is a new tab,
+          // and a new tab takes the keyboard once its page has loaded: no click into the page first (SA-61).
+          await waitFor('the new transcript tab to take the keyboard', async () => (await page(ctx)).evaluate(() => document.hasFocus()), 5_000);
           const which = async () => (await text(ctx, '.findbar .find-count'))[0];
           const press = async (key) => (await page(ctx)).press('body', key);
           await press('F3');

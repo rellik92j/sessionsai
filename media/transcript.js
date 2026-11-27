@@ -2,6 +2,8 @@
 (function () {
   const vscode = acquireVsCodeApi();
   const saved = vscode.getState() || {};
+  // A new tab is focused by the workbench before its page exists, and that focus is lost; the extension gives it again.
+  vscode.postMessage({ command: 'pageLoaded' });
 
   document.addEventListener('click', (e) => {
     const cmd = e.target.closest('[data-cmd]');

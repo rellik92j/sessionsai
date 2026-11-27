@@ -329,6 +329,29 @@ test('bundled extension activates, fills the sidebar, and renders a transcript',
     assert.equal(state.panels.length, 5, 'closing the preview tab means a new one next time');
     assert.deepEqual(state.errors, []);
 
+    // A new tab is focused again once its first page has loaded, as long as it is still the active tab; the pages
+    // after it (a rebuild, another session in the preview tab) leave focus alone.
+    const reveals = (panel) => {
+      const calls = [];
+      panel.reveal = (...args) => calls.push(args);
+      return calls;
+    };
+    const fresh = state.panels[4];
+    const freshReveals = reveals(fresh);
+    Object.assign(fresh, { active: true, viewColumn: 1 });
+    await fresh.onMessage({ command: 'pageLoaded' });
+    assert.deepEqual(freshReveals, [[1, false]], 'the new tab takes the keyboard once its page has loaded');
+    await fresh.onMessage({ command: 'pageLoaded' });
+    assert.equal(freshReveals.length, 1, 'a later page does not take focus again');
+    fresh.dispose();
+    await open('gggg');
+    assert.equal(state.panels.length, 6, 'gggg opens in a new preview tab');
+    const background = state.panels[5];
+    const backgroundReveals = reveals(background);
+    background.active = false;
+    await background.onMessage({ command: 'pageLoaded' });
+    assert.deepEqual(backgroundReveals, [], 'a tab that is no longer active is not brought forward');
+
     // Continue in new session: the CLI is the terminal's process, with the handoff as one argument (no shell typing).
     await state.panels[0].onMessage({ command: 'continueInNewSession' });
     await waitFor(() => state.terminals.length > 0, 'a terminal');
@@ -422,7 +445,7 @@ test('bundled extension activates, fills the sidebar, and renders a transcript',
     await state.commands['claudeSessions.openOverview']();
     await state.commands['claudeSessions.openOverview']();
     const overview = state.panels[state.panels.length - 1];
-    assert.equal(state.panels.length, 6, 'overview opened once');
+    assert.equal(state.panels.length, 7, 'overview opened once');
     assert.match(overview.webview.html, /overview\.js/);
     state.panelPosts.length = 0;
     overview.onMessage({ type: 'ready', range: 7, scope: 'workspace' });

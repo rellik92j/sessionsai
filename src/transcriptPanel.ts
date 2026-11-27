@@ -286,7 +286,19 @@ export class TranscriptPanels {
         this.pinned.delete(tabKey(tab.session, tab.run));
       }
     });
+    // The workbench focuses a new tab before its page has loaded, and that focus is lost: the keyboard ends up nowhere,
+    // so keys meant for the page (F3, Escape) do nothing until the reader clicks into it. Once the first page has
+    // loaded, a tab that is still the active one is focused again. Later pages (a rebuilt one, another session in the
+    // preview tab) leave focus where it is.
+    let focusOnLoad = true;
     panel.webview.onDidReceiveMessage(async (msg) => {
+      if (msg?.command === 'pageLoaded') {
+        if (focusOnLoad && panel.active) {
+          panel.reveal(panel.viewColumn, false);
+        }
+        focusOnLoad = false;
+        return;
+      }
       if (tab.run && SESSION_ACTIONS.has(msg?.command)) {
         // A subagent run is not a session: nothing resumes, continues, sends to or renames it.
         return;
