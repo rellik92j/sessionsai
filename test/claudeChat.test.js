@@ -779,7 +779,6 @@ test('the picker follows the mode Claude Code switches to: a session grant, an a
   assert.equal(a.chat.answer('req-w1', true, true), true);
   assert.equal(a.chat.status.mode, 'acceptEdits');
   assert.equal(chatStateMessage(a.chat.status, 'ask').mode, 'acceptEdits', 'the page is told the new mode');
-  a.chat.setMode('acceptEdits');
   aChild.say(result());
   await tick();
   await tick();
@@ -853,6 +852,88 @@ test('the picker follows the mode Claude Code switches to: a session grant, an a
   assert.equal(pickerMode('default', 'deny'), 'deny');
   assert.equal(pickerMode('default', 'plan'), 'ask');
   assert.equal(pickerMode('bypassPermissions', 'ask'), undefined);
+});
+
+test('a mode Claude Code switched to ends with its process: the next one starts in the mode the user picked', async () => {
+  const events = readStream('session-permissions.jsonl');
+  const modeArg = (spawn) => spawn.args[spawn.args.indexOf('--permission-mode') + 1];
+  const grantAcceptEdits = async (h) => {
+    h.chat.send('Write a note.');
+    await tick();
+    const child = h.spawns.at(-1).child;
+    child.say(events.find((e) => e.request_id === 'req-w1'));
+    h.chat.answer('req-w1', true, true);
+    assert.equal(h.chat.status.mode, 'acceptEdits');
+    return child;
+  };
+
+  // End chat during the turn: the picker shows Accept edits while the process finishes, then goes back to "Ask me".
+  const a = makeChat();
+  const aChild = await grantAcceptEdits(a);
+  const done = a.chat.end();
+  assert.equal(a.chat.status.mode, 'acceptEdits', 'the process still runs in Accept edits');
+  aChild.say(result());
+  await done;
+  assert.equal(a.chat.status.mode, 'ask');
+  assert.ok(a.logs.some((l) => /Back to the picked mode, ask/.test(l)));
+
+  // The process exits on its own and the next message starts another: back in "Ask me", the grant gone with it.
+  const b = makeChat();
+  const bChild = await grantAcceptEdits(b);
+  bChild.say(result());
+  await tick();
+  bChild.emit('exit', 0, null);
+  assert.equal(b.chat.status.mode, 'ask');
+  b.chat.send('Another note.');
+  await tick();
+  assert.equal(b.spawns.length, 2);
+  assert.equal(modeArg(b.spawns[1]), 'default');
+  assert.equal(b.chat.status.mode, 'ask');
+
+  // A mode the user picks while the grant's mode is shown is theirs, and the next process starts in it.
+  const c = makeChat();
+  const cChild = await grantAcceptEdits(c);
+  c.chat.setMode('acceptEdits');
+  cChild.say(result());
+  await tick();
+  assert.equal(cChild.ended, false, 'picking the mode it is already in restarts nothing');
+  cChild.emit('exit', 0, null);
+  c.chat.send('Another note.');
+  await tick();
+  assert.equal(modeArg(c.spawns[1]), 'acceptEdits');
+  assert.equal(c.chat.status.mode, 'acceptEdits');
+
+  // An approved plan leaves plan mode for the rest of its process only: the next process plans again.
+  const d = makeChat({ mode: 'plan' });
+  d.chat.send('Plan a greeting module.');
+  await tick();
+  const dChild = d.spawns[0].child;
+  dChild.say(...readStream('plan.jsonl'));
+  d.chat.answer('req-plan', true);
+  assert.equal(d.chat.status.mode, 'ask');
+  dChild.say(result());
+  await tick();
+  dChild.emit('exit', 0, null);
+  assert.equal(d.chat.status.mode, 'plan');
+  d.chat.send('Next task.');
+  await tick();
+  assert.equal(modeArg(d.spawns[1]), 'plan');
+
+  // Decline-prompts comes back with its declining: a card in the next process is answered at once.
+  const e = makeChat({ mode: 'deny' });
+  e.chat.send('hi');
+  await tick();
+  const eChild = e.spawns[0].child;
+  eChild.say({ type: 'system', subtype: 'init', session_id: 's', permissionMode: 'auto' });
+  assert.equal(e.chat.status.mode, 'auto');
+  eChild.say(result());
+  await tick();
+  eChild.emit('exit', 0, null);
+  assert.equal(e.chat.status.mode, 'deny');
+  e.chat.send('again');
+  await tick();
+  e.spawns[1].child.say({ type: 'control_request', request_id: 'r-d', request: { subtype: 'can_use_tool', tool_name: 'Bash', input: { command: 'ls' }, tool_use_id: 'toolu_d' } });
+  assert.deepEqual(e.spawns[1].child.controls(), [JSON.parse(denyLine('r-d', DENY_MESSAGE))]);
 });
 
 test('a card never hangs the turn: Stop, ending the chat, switching to decline, or the process exiting resolves it', async () => {

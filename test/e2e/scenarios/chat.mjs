@@ -575,6 +575,18 @@ const SCENARIOS = [
       const all = events(ctx.s, ctx.id);
       assert(all.filter((e) => e.event === 'permission-asked').length === 1, 'asked again after Allow for this session');
       assert(all.filter((e) => e.event === 'start').length === 1, 'the process was restarted, which drops the session grants');
+      // The grant's mode ends with the process: after End chat the picker is back on the mode the user picked (Ask me),
+      // and the next chat in this tab starts in it, not in Accept edits.
+      await click(ctx, '#chat-end');
+      await waitEvent(ctx.s, ctx.id, 'exit', undefined, 10_000);
+      await waitFor('the picker to go back to Ask me', async () => (await (await transcript(ctx)).$eval('#chat-mode', (el) => el.value)) === 'ask', 5_000);
+      await send(await transcript(ctx), 'Say hello in the next chat.');
+      await waitEvent(ctx.s, ctx.id, 'turn-end', (e) => e.how === 'completed' && events(ctx.s, ctx.id).filter((x) => x.event === 'turn-end').length >= 3, 15_000);
+      const starts = events(ctx.s, ctx.id).filter((e) => e.event === 'start');
+      assert(starts.length === 2, `expected a second process, got ${starts.length} starts`);
+      const args = starts[1].args;
+      const mode = args[args.indexOf('--permission-mode') + 1];
+      assert(mode === 'default', `the next chat started in "${mode}", not the picked mode (default)`);
     },
   },
   {

@@ -171,6 +171,7 @@ the `copilot-` scenarios, which set `source: 'copilot-cli'`):
 | `stop` | Stop during the reply: the stand-in gets an interrupt, the turn ends interrupted, the bar says "Last turn stopped", and the process stays up. |
 | `permission-allow` | A permission card shows with Allow and Deny and the bar waits for an answer; Allow reaches the stand-in as `allow` and the reply carries on. |
 | `permission-deny` | Deny reaches the stand-in as `deny` with the extension's deny message, and the reply carries on without the tool. |
+| `permission-allow-for-session` | A card with suggestions offers Allow for this session and says what it grants; the stand-in gets the grants with `destination: "session"` only, the picker follows to Accept edits, and a second turn runs the command without asking or a restart. After End chat the picker is back on Ask me, and the next chat starts with `--permission-mode default`. |
 | `close-tab-mid-reply` | Closing the transcript tab during the reply lets it finish (no interrupt, whole reply in the log), then stdin closes and the process exits. |
 | `resume-while-replying-wait` | Right-click the session in the sidebar, Resume Session: the "still replying" modal shows; Wait for the Reply lets the reply finish, the process exits, and only then does the terminal start. |
 | `resume-while-replying-stop` | The same modal; Stop It Now interrupts the reply, the process exits, then the terminal starts. |

@@ -860,12 +860,19 @@ export class ClaudeChat implements SessionChat {
   private heard = false;
   /** When this chat last heard from its process; its own writes to the log are not another writer's. */
   lastActivity = 0;
+  /** The mode the picker shows: the one picked, or one the running process switched itself to (followCliMode). */
   mode: PermissionMode;
+  /**
+   * The mode the user picked. Every new process starts in it: a mode Claude Code switched to by itself (an "Allow for
+   * this session" grant, a plan approved) ends with the process that switched (doc section 6a).
+   */
+  private picked: PermissionMode;
   /** The --permission-mode the running process was started with. */
   private runningCliMode?: string;
 
   constructor(private readonly opts: ChatOptions) {
     this.mode = opts.mode;
+    this.picked = opts.mode;
     this.live.decline = opts.mode === 'deny' ? DENY_MESSAGE : undefined;
   }
 
@@ -928,7 +935,8 @@ export class ClaudeChat implements SessionChat {
    * The process is now in `cliMode`, by its own doing: a `setMode` grant, a plan approved, or what a turn's `init`
    * reports. The picker follows it (doc section 6a), so it does not say Plan once the plan is approved, and so a mode
    * change that matches it does not restart the process. A change the user picked during the turn still wins: the
-   * process restarts into it after the turn. True when the picker's mode changed.
+   * process restarts into it after the turn. The picked mode stays as it was, so the next process starts in it
+   * (backToPicked). True when the picker's mode changed.
    */
   private followCliMode(cliMode: string): boolean {
     if (cliMode === this.runningCliMode || !this.child) {
@@ -950,6 +958,21 @@ export class ClaudeChat implements SessionChat {
       this.live.decline = undefined;
     }
     return true;
+  }
+
+  /**
+   * The process that followCliMode followed is gone: the picker goes back to the mode the user picked, the one the next
+   * process starts in. A grant's mode or an approved plan's never carries over to a new process.
+   */
+  private backToPicked(): void {
+    if (this.mode === this.picked) {
+      return;
+    }
+    this.opts.log(`Back to the picked mode, ${this.picked}: the process that switched to ${this.mode} has ended.`);
+    this.mode = this.picked;
+    if (!this.disposed) {
+      this.live.decline = this.picked === 'deny' ? DENY_MESSAGE : undefined;
+    }
   }
 
   /**
@@ -977,9 +1000,12 @@ export class ClaudeChat implements SessionChat {
    */
   setMode(mode: PermissionMode): void {
     if (mode === this.mode) {
+      // Already the running process's mode, maybe by its own doing: now it is the user's pick too.
+      this.picked = mode;
       return;
     }
     this.mode = mode;
+    this.picked = mode;
     if (!this.disposed) {
       this.live.decline = mode === 'deny' ? DENY_MESSAGE : undefined;
       if (mode === 'deny') {
@@ -1077,6 +1103,7 @@ export class ClaudeChat implements SessionChat {
       this.failStart(where.error, false);
       return false;
     }
+    this.backToPicked();
     const args = chatArgs(this.opts.sessionId, this.mode);
     this.opts.log(`Starting: ${where.exe} ${args.join(' ')}${where.cwd ? ` (in ${where.cwd})` : ''}`);
     let child: ChatChild;
@@ -1133,6 +1160,8 @@ export class ClaudeChat implements SessionChat {
       return;
     }
     this.child = undefined;
+    // What the process switched itself to ended with it.
+    this.backToPicked();
     // A card still open can no longer be answered: nothing hangs on it, and it says why.
     this.live.abandonPending('Claude Code exited before it was answered.');
     const expected = !!this.closing || this.disposed;

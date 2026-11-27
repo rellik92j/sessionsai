@@ -278,7 +278,11 @@ this session**. It sends every `addRules` (allow), `addDirectories` and `setMode
 rewritten to `"session"`, so nothing is ever written to a settings file, and the card says what it grants. Unknown
 types (and `setMode` to a mode the picker does not know) are left out. The grants last as long as the chat's process:
 until the tab closes, End chat, or a change of permission mode restarts it. The picker follows the CLI's mode: at
-once when a `setMode` grant or a plan approval is sent, and from every `init` after that.
+once when a `setMode` grant or a plan approval is sent, and from every `init` after that. That mode is the process's,
+not the tab's: when the process ends (End chat, a restart, an exit), the picker goes back to the mode the user last
+picked, and the next process starts in it. This holds for an approved plan too, so a tab set to Plan plans again in
+its next process. A plan is approved once, for one plan, and going back to the more restrictive mode the user chose
+never grants something they did not pick.
 
 ## 7. How `--permission-mode` combines with the above
 

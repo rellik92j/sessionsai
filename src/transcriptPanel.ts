@@ -468,7 +468,14 @@ export class TranscriptPanels {
     if (tab.run || !canChatHere(session)) {
       return false;
     }
-    tab.chatMode = chatModeFor(session, mode) ?? tab.chatMode;
+    // The page sends the mode its picker shows. While a chat runs that can be a mode Claude Code switched to by itself
+    // (an "Allow for this session" grant, a plan approved), which ends with its process and is not the tab's mode. So
+    // only a mode other than the one shown is a new pick.
+    const sent = chatModeFor(session, mode);
+    const picked = !!sent && sent !== ((tab.chat ?? tab.ending)?.status.mode ?? tab.chatMode);
+    if (picked) {
+      tab.chatMode = sent;
+    }
     if (tab.waiting) {
       // Already waiting for an ended chat: this one goes after the others, with the new chat.
       tab.waiting.push(text);
@@ -518,7 +525,9 @@ export class TranscriptPanels {
           ? new CopilotChat({ ...common, mode: isCopilotMode(mode) ? mode : DEFAULT_COPILOT_MODE, launch: () => copilotLaunch(tab.session), spawn: spawnCopilot })
           : new ClaudeChat({ ...common, mode: isPermissionMode(mode) ? mode : 'ask', launch: () => chatLaunch(tab.session), spawn: spawnChat });
     }
-    tab.chat.setMode(tab.chatMode);
+    if (picked) {
+      tab.chat.setMode(tab.chatMode);
+    }
     this.hooks.rememberTarget?.(sourceOf(session), 'here');
     // A chat keeps its tab: the shared preview tab would otherwise be taken over by the next transcript opened.
     if (tab.preview) {
@@ -590,11 +599,6 @@ export class TranscriptPanels {
     }
     const chat = tab.chat ?? tab.ending;
     const status = chat?.status;
-    // The chat can change its own mode (a plan approved, an "Allow for this session" that switches to Accept edits):
-    // the tab's mode follows, so the next chat in this tab starts in it.
-    if (tab.chat && status && status.mode !== tab.chatMode) {
-      tab.chatMode = chatModeFor(tab.session, status.mode) ?? tab.chatMode;
-    }
     const waiting = tab.waiting ?? [];
     panelPost(tab, { type: 'chatLive', html: chat || waiting.length ? renderLive(chat?.live.pieces ?? [], !!status?.busy, waiting, chatSpeaker(sourceOf(tab.session))) : '' });
     panelPost(tab, chatStateMessage(status, tab.chatMode, waiting.length));
