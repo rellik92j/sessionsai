@@ -116,7 +116,7 @@ that its `pid` is gone instead.
 ## Areas
 
 Scenarios are grouped by what they exercise, one module per area in `test/e2e/scenarios/`: `chat`, `transcript`,
-`sidebar` and `resume` today, with `overview` and `other-tools` to come. The runner finds areas by file name, so an
+`sidebar`, `resume` and `overview` today, with `other-tools` to come. The runner finds areas by file name, so an
 area's name is its file name and no list needs editing. Two people adding scenarios to different areas never touch the
 same file. Shared steps (`openTranscript`, `chatHere`, `send`, `click`, `sidebarMenu`, `modal`, `assert`, `waitFor`,
 `waitEvent`, ...) live in `harness.mjs`; a helper only one area uses stays in that area's module.
@@ -245,6 +245,27 @@ Search Sessions… (whose rows have a Resume button).
 | `new-session-cancel` | Escape at the folder, model, effort and agent steps opens nothing. |
 
 The folder picker's "Choose a folder…" opens the operating system's dialog, which Playwright cannot drive, so it is not covered.
+
+Area `overview`, `test/e2e/scenarios/overview.mjs`: the Overview tab, and the cost, token, request, context and prompt-cache
+figures wherever they appear. Its sessions are synthetic and seeded in two projects of their own (`overview-north` and
+`overview-south`): five Claude Code sessions with known token counts, one a day old and a second today (the context
+85% full, a warm 1-hour cache, an agent), one half full with an expired 5-minute cache, one nine days old, one forty,
+and one on a model with no price. The module computes every expected figure from the token counts and `src/prices.json`,
+and the overview scenarios narrow the page to the two projects, so the sessions of other areas do not change a total.
+
+| Name | What it checks |
+|---|---|
+| `overview-opens` | The dashboard button at the top of the sidebar opens the tab on the current workspace, with the six ranges; Open Overview from the command palette shows that tab instead of opening a second; the Projects menu offers the workspace and all projects. |
+| `overview-projects` | All projects, then picking projects in the menu (search box, no-match message), pills that remove a project, clicking a project's name in the table to show just it and again to go back. |
+| `overview-totals-and-tables` | The five totals and their notes, the Projects table (sessions, prompts, cost, most expensive first) and the Models table (cost and share, no unpriced model). |
+| `overview-cost-chart` | One bar a day, each worded with its day, cost, sessions and cost by model; the legend by model and by project, plain bars under Total; hovering a bar shows that day's breakdown. |
+| `overview-ranges` | Week, month, 7, 30, 90 days and all time: the totals and the number of bars for each, with the nine- and forty-day-old sessions falling on the right sides; the range survives picking a project. |
+| `overview-sessions-list` | Recent and Most expensive lists with project, agent chip, prompt count and cost in the range (an unpriced session is left out of the second); clicking a row opens its transcript. |
+| `overview-card-figures` | Sidebar cards: the cost; the context badge from half full, yellow from 80%; the cache countdown while warm and no badge once expired; no cost for a model with no price. |
+| `overview-transcript-figures` | The tiles at the top of a transcript (context, prompt cache, cost and requests, tokens and the share read from cache), the cost breakdown row by row and its total, the top bar's copy of them, and the message box saying the context is nearly full. |
+| `overview-transcript-cold-and-unpriced` | An expired cache (time since, 5-minute), a window half full not warned about, a single request worded as one, and the message box saying resuming would re-cache the whole context. |
+| `overview-transcript-unpriced` | A model with no price: tokens counted, cost $0.00, and the breakdown names the model. |
+| `overview-session-details-costs` | Session details lists each prompt with its cost and cost bar, and the conversation shows the same cost beside each prompt. |
 
 ## Writing a scenario
 
