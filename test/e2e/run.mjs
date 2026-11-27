@@ -12,9 +12,10 @@
 import { readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { OUT, events, launch, makeSandbox, removeSandbox, resetOut, sessionIdFor } from './harness.mjs';
+import { OUT, events, launch, makeSandbox, removeSandbox, resetOut, resetWorkbench, sessionIdFor } from './harness.mjs';
 
 const SCENARIO_TIMEOUT_MS = 90_000;
+const RESET_TIMEOUT_MS = 20_000;
 const AREAS_DIR = fileURLToPath(new URL('./scenarios/', import.meta.url));
 
 /** Splits `--flag a,b`, `--flag=a,b` and repeats of them into one list; everything else is a positional word. */
@@ -104,7 +105,12 @@ try {
     const ctx = { page, s, id: sc.id, title: sc.title, fixtures: sc.fixtures };
     try {
       await Promise.race([
-        sc.run(ctx),
+        // Each scenario starts on an empty editor area, whatever the one before left open (see resetWorkbench). The reset
+        // has a limit of its own, so a reset that hangs says so rather than counting against the scenario.
+        Promise.race([
+          resetWorkbench(page),
+          new Promise((_, reject) => setTimeout(() => reject(new Error(`the reset before the scenario took over ${RESET_TIMEOUT_MS / 1000}s`)), RESET_TIMEOUT_MS)),
+        ]).then(() => sc.run(ctx)),
         new Promise((_, reject) => setTimeout(() => reject(new Error(`scenario took over ${SCENARIO_TIMEOUT_MS / 1000}s`)), SCENARIO_TIMEOUT_MS)),
       ]);
       results.push({ area: sc.area, name: sc.name, ok: true, ms: Date.now() - started });

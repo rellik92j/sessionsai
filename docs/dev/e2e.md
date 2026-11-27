@@ -80,6 +80,44 @@ Windows is where it has been run. The harness has a POSIX terminal stub too, but
 - `window.dialogStyle`, `window.titleBarStyle` and `window.menuStyle` are `custom`, so the modals and the sidebar's
   context menu are drawn in the page, where Playwright can see and click them.
 
+## Between scenarios
+
+All scenarios share one VS Code window, so before each one the runner calls `resetWorkbench` (in `harness.mjs`): it
+presses Escape to close any picker or menu left open, then closes every editor and editor group
+(`workbench.action.closeAllGroups`, bound in the sandbox's `keybindings.json` to Ctrl+Alt+Shift+F12) and waits until
+the editor area is one empty group. The sandbox sets `terminal.integrated.confirmOnKill` to `never` so closing the
+terminals asks nothing, and lists the command in `terminal.integrated.commandsToSkipShell` so the key works while a
+terminal has focus.
+
+Before the key, the reset blurs whatever has focus, so the key is pressed in the workbench rather than in a webview. A
+key pressed in a transcript closes the transcript's own webview while the key is still down. That left the window
+with focus nowhere (`document.hasFocus()` false), and once a scenario hung in the reset until its 90 s ran out. After
+the editors close, a window that still has no focus (closing a terminal can do it) gets a click on the empty editor
+area. The reset has its own 20 s limit, and a reset that runs over fails its scenario with "the reset before the
+scenario took over 20s".
+
+The reason: Resume, Continue and Send open their terminal beside the active editor, so each one adds an editor group.
+Over a full run, the dozens of them squeezed the side bar to its narrowest. There a card's hover buttons are wider than the
+view, so Playwright scrolled the card under the sticky group header to click one, and `continue-card-button` failed in
+every full run while passing in its own area. A scenario therefore starts with no tabs open. One that needs a tab opens it
+itself. A transcript closed by the reset while its chat is still replying lets the reply finish, as closing the tab does.
+The reset leaves the sidebar's own state (grouping, chips, search box) alone. Scenarios that change that state still put
+it back themselves.
+
+One side effect to know when writing a scenario: with no preview tab left to reuse, the first transcript a scenario
+opens from the sidebar is a new tab, and a new webview tab does not take the keyboard. The workbench's focus is left on
+nothing. Without the reset, a click usually only switched the shared preview tab to another session, so the keyboard
+stayed in that webview. Typing into the page still works, because Playwright focuses an input before it types. A key
+pressed on the page itself (`frame.press('body', 'F3')`) does not, because `body` cannot take focus, so the key goes to
+the workbench and the page never sees it. A scenario that presses keys in a transcript clicks inside the page first, as
+`transcript-search-highlights` does before F3.
+
+Opening a new tab also takes longer than switching the preview tab, so what a click or double-click sets off lands
+later. A double-click is two clicks and then the double-click: the first click opens the preview tab, and the
+double-click then turns it into a tab of its own and brings it forward, which closes a menu or palette opened in the
+meantime. A scenario that double-clicks a card waits until the page has no Keep open button before it goes on, as
+`overview-opens` does before View > Command Palette.
+
 ## The stand-in claude
 
 It speaks the stream-json protocol of `claude -p --resume <id> --input-format stream-json --output-format stream-json`
