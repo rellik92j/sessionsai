@@ -71,6 +71,12 @@ const LIVE_REDRAW_MS = 60;
 /** A log written this recently by something other than this tab's chat may have another writer (doc section 8). */
 const RECENT_WRITE_MS = 10_000;
 
+/**
+ * A new tab takes the keyboard when its first page loads only if that happens this soon after the tab was created.
+ * A slower load (a big log, a slow git call) leaves focus alone, since by then the reader may be typing elsewhere.
+ */
+const FOCUS_ON_LOAD_MS = 1_500;
+
 /** Messages that act on the session as a whole: resuming, continuing, sending or renaming. A subagent tab ignores them. */
 const SESSION_ACTIONS = new Set([
   'resume',
@@ -287,7 +293,22 @@ export class TranscriptPanels {
         this.pinned.delete(tabKey(tab.session, tab.run));
       }
     });
+    // The workbench focuses a new tab before its page has loaded, and that focus is lost: the keyboard ends up nowhere,
+    // so keys meant for the page (F3, Escape) do nothing until the reader clicks into it. Once the first page has
+    // loaded, a tab that is still the active one is focused again, provided the page came within FOCUS_ON_LOAD_MS:
+    // clicking a terminal or the sidebar does not change the active editor, so a late reveal could pull the keyboard
+    // out from under someone typing there. Later pages (a rebuilt one, another session in the preview tab) leave focus
+    // where it is.
+    let focusOnLoad = true;
+    const createdAt = Date.now();
     panel.webview.onDidReceiveMessage(async (msg) => {
+      if (msg?.command === 'pageLoaded') {
+        if (focusOnLoad && panel.active && Date.now() - createdAt <= FOCUS_ON_LOAD_MS) {
+          panel.reveal(panel.viewColumn, false);
+        }
+        focusOnLoad = false;
+        return;
+      }
       if (tab.run && SESSION_ACTIONS.has(msg?.command)) {
         // A subagent run is not a session: nothing resumes, continues, sends to or renames it.
         return;
