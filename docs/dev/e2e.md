@@ -107,7 +107,7 @@ it back themselves.
 One side effect to know when writing a scenario: with no preview tab left to reuse, the first transcript a scenario
 opens from the sidebar is a new tab. The workbench focuses a new webview tab before its page has loaded, and that focus
 is lost, so the extension focuses the tab again once its first page has loaded (the page's `pageLoaded` message in
-`src/transcriptPanel.ts`). A key pressed on the page itself (`frame.press('body', 'F3')`) only reaches the page once
+`src/transcriptPanel.ts`), provided that page came within 1.5 s of the tab opening (`FOCUS_ON_LOAD_MS`). A key pressed on the page itself (`frame.press('body', 'F3')`) only reaches the page once
 that has happened, since `body` cannot take focus, so a scenario that presses keys in a new transcript first waits until
 the page's `document.hasFocus()` is true, as `transcript-search-highlights` does before F3. It does not click into the
 page: that would hide a tab that never took the keyboard.

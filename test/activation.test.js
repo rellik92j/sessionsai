@@ -351,6 +351,22 @@ test('bundled extension activates, fills the sidebar, and renders a transcript',
     background.active = false;
     await background.onMessage({ command: 'pageLoaded' });
     assert.deepEqual(backgroundReveals, [], 'a tab that is no longer active is not brought forward');
+    // A page that loads late (a big log, a slow git call) leaves focus alone: by then the reader may be typing in a
+    // terminal or the sidebar, which does not make the tab inactive.
+    background.dispose();
+    await open('hhhh');
+    assert.equal(state.panels.length, 7, 'hhhh opens in a new preview tab');
+    const late = state.panels[6];
+    const lateReveals = reveals(late);
+    Object.assign(late, { active: true, viewColumn: 1 });
+    const realNow = Date.now;
+    Date.now = () => realNow() + 2_000;
+    try {
+      await late.onMessage({ command: 'pageLoaded' });
+    } finally {
+      Date.now = realNow;
+    }
+    assert.deepEqual(lateReveals, [], 'a page that loads 2 s after its tab opened does not take the keyboard');
 
     // Continue in new session: the CLI is the terminal's process, with the handoff as one argument (no shell typing).
     await state.panels[0].onMessage({ command: 'continueInNewSession' });
@@ -445,7 +461,7 @@ test('bundled extension activates, fills the sidebar, and renders a transcript',
     await state.commands['claudeSessions.openOverview']();
     await state.commands['claudeSessions.openOverview']();
     const overview = state.panels[state.panels.length - 1];
-    assert.equal(state.panels.length, 7, 'overview opened once');
+    assert.equal(state.panels.length, 8, 'overview opened once');
     assert.match(overview.webview.html, /overview\.js/);
     state.panelPosts.length = 0;
     overview.onMessage({ type: 'ready', range: 7, scope: 'workspace' });
