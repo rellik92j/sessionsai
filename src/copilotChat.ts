@@ -36,6 +36,24 @@ export function copilotChatArgs(sessionId: string, mode: CopilotMode): string[] 
   return [`--resume=${sessionId}`, '--output-format', 'json', '--stream', 'on', ...copilotModeArgs(mode)];
 }
 
+/**
+ * Why a Copilot CLI session id cannot go on a command line, or undefined when it can. The id is the session's folder
+ * name under session-state (a UUID when Copilot CLI made it), and it goes onto a shell's command line unquoted: cmd.exe
+ * for a .cmd shim in Chat here, the terminal's shell for Resume. A folder named `x&calc` would run calc, so anything
+ * beyond letters, digits, `_`, `-` and `.` is refused before a process starts.
+ */
+export function unsafeCopilotSessionId(sessionId: string): string | undefined {
+  if (/^[\w.-]+$/.test(sessionId)) {
+    return undefined;
+  }
+  return (
+    `This GitHub Copilot CLI session's id, ${JSON.stringify(sessionId)}, has characters a shell could run as a command, ` +
+    `so it is not put on a command line and Copilot CLI is not started. Only letters, digits, "_", "-" and "." are ` +
+    `allowed. The id is the session's folder name under Copilot's session-state folder, which Copilot CLI names with a ` +
+    `UUID, so something else made or renamed it.`
+  );
+}
+
 export const COPILOT_EXECUTABLE: ExecutableSpec = {
   base: 'copilot',
   tool: 'GitHub Copilot CLI',
@@ -460,7 +478,8 @@ export class CopilotChat implements SessionChat {
     if (this.busy || !this.queue.length || this.disposed) {
       return;
     }
-    const where = this.opts.launch();
+    const unsafe = unsafeCopilotSessionId(this.opts.sessionId);
+    const where = unsafe ? { error: unsafe } : this.opts.launch();
     if ('error' in where) {
       this.failStart(where.error, false);
       return;

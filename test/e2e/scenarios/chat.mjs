@@ -2,7 +2,7 @@
 // while an ended chat finishes, and what Resume and Open in Claude Code Chat do while a chat is replying or the
 // session is live in another Claude Code process. See docs/dev/e2e.md for how to add a scenario.
 
-import { appendFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { assert, chatHere, click, events, logPath, logText, logged, modal, openTranscript, send, sidebar, sidebarMenu, tab, transcript, waitEvent, waitFor } from '../harness.mjs';
 
@@ -457,7 +457,71 @@ const COPILOT_SCENARIOS = [
       await ctx.page.keyboard.press('Escape');
     },
   },
+  {
+    name: 'copilot-shell-id-refused',
+    source: COPILOT,
+    prompt: 'E2E Copilot shell id (unused: the scenario works on the seeded session)',
+    async run(ctx) {
+      // The seeded session whose folder name, and so its id, has a `&`.
+      const bad = { ...ctx, id: SHELL_ID, title: SHELL_PROMPT };
+      const refused = /id, "e2e00000-shell&echo-e2e-injected", has characters a shell could run as a command/;
+      const nothingRan = async (what) => {
+        await new Promise((r) => setTimeout(r, 2_000));
+        const ran = events(ctx.s).filter((e) => String(e.session ?? e.args ?? '').includes(SHELL_ID.split('&')[0]));
+        assert(!ran.length, `${what} started something: ${JSON.stringify(ran)}`);
+      };
+      const refusedToast = async (what) => {
+        await waitFor(`${what}: the refusal`, async () => refused.test(await toastText(ctx)), 10_000);
+        await nothingRan(what);
+        await ctx.page.keyboard.press('Escape');
+        await waitFor(`${what}: the refusal to be dismissed`, async () => !refused.test(await toastText(ctx)), 5_000);
+      };
+      await sidebarMenu(bad, 'Resume Session');
+      await refusedToast('Resume Session from the sidebar');
+      await sidebarMenu(bad, 'Copy Resume Command');
+      await refusedToast('Copy Resume Command');
+      const frame = await openTranscript(bad);
+      await click(bad, '[data-cmd="resume"]');
+      await refusedToast("The transcript's Resume");
+      // The message box, sent to this session in a Copilot CLI terminal.
+      const text = 'Do not put my id on a command line.';
+      await frame.click('#composer-more');
+      await frame.click('#composer-menu [data-target="copilot-cli"]');
+      await frame.click('#composer-more');
+      await send(frame, text);
+      await refusedToast('Send to this session in GitHub Copilot CLI');
+      await waitFor('the message to stay in the box', async () => (await composerText(bad)) === text, 5_000);
+      // Chat here: the refusal shows in the tab and the message goes back to the box.
+      await chatHere(await transcript(bad));
+      await send(await transcript(bad), text);
+      await waitFor('Chat here: the refusal in the tab', async () => refused.test(await liveText(bad)), 10_000);
+      await nothingRan('Chat here');
+      await waitFor('the message to come back to the box', async () => (await composerText(bad)) === text, 5_000);
+    },
+  },
 ];
+
+/**
+ * A Copilot CLI session whose folder name has a `&`, which Windows allows. Its id is that name, and cmd.exe would run
+ * what follows the `&` if the id reached a command line. Run by the runner before VS Code starts.
+ */
+const SHELL_ID = 'e2e00000-shell&echo-e2e-injected';
+const SHELL_PROMPT = 'E2E Copilot session id with a shell character';
+function seed(s) {
+  const dir = path.join(s.copilot, 'session-state', SHELL_ID);
+  mkdirSync(dir, { recursive: true });
+  const dayAgo = Date.now() - 24 * 3600 * 1000;
+  const at = (ms) => new Date(dayAgo + ms).toISOString();
+  const records = [
+    { type: 'session.start', data: { sessionId: SHELL_ID, version: 1, producer: 'copilot-agent', copilotVersion: '1.0.0', context: { cwd: s.work } }, id: 'shell-c1', timestamp: at(0), parentId: null },
+    { type: 'user.message', data: { content: SHELL_PROMPT, transformedContent: SHELL_PROMPT }, id: 'shell-c2', timestamp: at(1000), parentId: 'shell-c1' },
+    { type: 'assistant.message', data: { messageId: 'shell-m1', model: 'copilot-stand-in', content: 'Ready when you are.', toolRequests: [] }, id: 'shell-c3', timestamp: at(2000), parentId: 'shell-c2' },
+  ];
+  const file = path.join(dir, 'events.jsonl');
+  writeFileSync(file, records.map((r) => JSON.stringify(r)).join('\n') + '\n');
+  writeFileSync(path.join(dir, 'workspace.yaml'), `id: ${SHELL_ID}\ncwd: ${s.work}\ncreated_at: ${at(0)}\nupdated_at: ${at(2000)}\n`);
+  utimesSync(file, new Date(dayAgo), new Date(dayAgo));
+}
 
 // ---------- the scenarios ----------
 const SCENARIOS = [
@@ -762,4 +826,4 @@ const SCENARIOS = [
   ...COPILOT_SCENARIOS,
 ];
 /** The area: every scenario above has its own synthetic session, titled by its `prompt`. */
-export default { name: 'chat', scenarios: SCENARIOS };
+export default { name: 'chat', seed, scenarios: SCENARIOS };
