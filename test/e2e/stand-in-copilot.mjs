@@ -5,12 +5,14 @@
 // id and path is synthetic.
 //
 // The extension starts it only when SESSIONSAI_E2E_COPILOT names this file. It notes what happened to it in the
-// JSON-lines file named by SESSIONSAI_E2E_EVENTS: `start` (with its pid and arguments), `turn-start` (with the message
+// JSON-lines file named by SESSIONSAI_E2E_EVENTS: `start` (with its pid and arguments), `holding` (see "hold" below), `turn-start` (with the message
 // exactly as it came on stdin), `tool` (a call and whether it was allowed), `turn-end`, `exit`. Stop kills the process,
 // so a stopped turn has no `turn-end` and no `exit`; its pid is gone.
 //
 // Scripts, picked by a word in the message:
-//   "edit"         an apply_patch call: it runs when the arguments allow writes (--allow-tool=write or
+//   "hold"         holds the message HOLD_MS before taking it (no user.message yet), noting `holding` once it waits,
+//                  as a copilot still starting up has not taken its message; then plays the slow reply
+//   "edit"      an apply_patch call: it runs when the arguments allow writes (--allow-tool=write or
 //                  --allow-all-tools), and is declined otherwise, as Copilot CLI declines what it cannot ask about;
 //                  then the slow reply
 //   anything else  a slow reply: REPLY_LINES lines, one every LINE_MS
@@ -21,6 +23,7 @@ import { randomUUID } from 'node:crypto';
 
 const REPLY_LINES = 12;
 const LINE_MS = 450;
+const HOLD_MS = 30_000;
 const MODEL = 'copilot-stand-in';
 
 const args = process.argv.slice(2);
@@ -108,6 +111,10 @@ let input = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', (d) => (input += d));
 process.stdin.on('end', async () => {
+  if (/\bhold\b/i.test(input)) {
+    note('holding', { text: input });
+    await sleep(HOLD_MS);
+  }
   note('turn-start', { text: input });
   const interactionId = randomUUID();
   emit('session.resume', { resumeTime: new Date().toISOString(), context: { cwd: process.cwd() }, alreadyInUse: false, sessionWasActive: false });

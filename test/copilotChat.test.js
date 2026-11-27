@@ -278,6 +278,41 @@ test('Stop kills the running turn, marks it stopped, and gives back what was wai
   assert.ok(!chat.live.pieces.some((p) => p.kind === 'notice'), 'a stop is no error');
 });
 
+test('Stop before copilot took the message puts it back in the box, ahead of what was waiting, and starts no turn', async () => {
+  const { chat, spawns, unsent } = makeChat();
+  chat.send('not read yet');
+  chat.send('waiting');
+  chat.interrupt();
+  assert.deepEqual(unsent, ['waiting'], 'what was waiting goes back at once');
+  await tick();
+  // The box prepends each restore, so the message that was running ends up first, as it was typed.
+  assert.deepEqual(unsent, ['waiting', 'not read yet']);
+  assert.equal(spawns.length, 1, 'no new turn starts');
+  assert.ok(!chat.status.busy && !chat.active);
+  assert.ok(chat.status.lastTurn.interrupted && !chat.status.lastTurn.error);
+  assert.ok(!chat.live.pieces.some((p) => p.kind === 'user'), 'no bubble for a message that was never sent');
+  assert.ok(!chat.live.pieces.some((p) => p.kind === 'notice'), 'a stop is no error');
+
+  // A message sent after Stop, while the kill is pending, still runs; only the unread one comes back.
+  const b = makeChat();
+  b.chat.send('unread');
+  b.chat.interrupt();
+  b.chat.send('after stop');
+  await tick();
+  assert.deepEqual(b.unsent, ['unread']);
+  assert.equal(b.spawns.length, 2);
+  assert.equal(b.spawns[1].child.stdinText, 'after stop');
+  assert.deepEqual(b.chat.live.pieces.filter((p) => p.kind === 'user').map((p) => p.text), ['after stop']);
+
+  // Once copilot has taken it, Stop keeps it: the session has it.
+  const c = makeChat();
+  c.chat.send('taken');
+  c.spawns[0].child.say(userRecord('u-1'));
+  c.chat.interrupt();
+  await tick();
+  assert.deepEqual(c.unsent, []);
+});
+
 test('a turn that fails before the session took the message gives it back, with what copilot printed', () => {
   const { chat, spawns, unsent } = makeChat();
   chat.send('hello');

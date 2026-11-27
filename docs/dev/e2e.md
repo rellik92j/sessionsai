@@ -152,9 +152,10 @@ stdin), so the stand-in plays one turn and exits. It writes Copilot CLI's JSON l
 records, with the same `id`s, to the session's `events.jsonl` (shapes from `test/fixtures/copilot-stream/`, synthetic
 text). Every message streams the same 12-line reply as the stand-in claude; one containing the word `edit` first makes
 an `apply_patch` call, which runs when the arguments allow writes (`--allow-tool=write` or `--allow-all-tools`) and is
-declined otherwise, as Copilot CLI declines what it cannot ask about.
+declined otherwise, as Copilot CLI declines what it cannot ask about. One containing the word `hold` waits 30 seconds
+before taking the message (no `user.message` yet), so a scenario can press Stop before copilot has it.
 
-Its events: `start` (with `args`), `turn-start` (`text`: the message exactly as it came on stdin), `tool` (`allowed`),
+Its events: `start` (with `args`), `holding` (a `hold` message is waiting, with its `text`), `turn-start` (`text`: the message exactly as it came on stdin), `tool` (`allowed`),
 `turn-end`, `exit`. Stop kills the process, so a stopped turn records neither `turn-end` nor `exit`; scenarios check
 that its `pid` is gone instead.
 
@@ -228,6 +229,7 @@ the `copilot-` scenarios, which set `source: 'copilot-cli'`):
 | `copilot-stream` | A Copilot CLI session: Chat here starts `--resume=<id> --output-format json --stream on` with no allowances, the reply streams in (the bar says Copilot is working), lands in the logged conversation, and the bar shows the last turn. |
 | `copilot-second-message` | A second message is a new process resuming the same session id, and the session log has both prompts. |
 | `copilot-stop` | Stop kills the turn's process (its pid is gone, no `turn-end`), the bar says "Last turn stopped", the reply never finishes in the log, and the next message starts a new turn. |
+| `copilot-stop-before-taken` | Stop while the stand-in holds the message (not taken yet) and a second one waits: both come back to the box, the held one first, the turn's process is gone, no bubble is left, nothing more starts, and the session log has neither. |
 | `copilot-message-intact` | A message with quotes, a newline, `%`, `$`, backticks, `^`, a pipe and `<b>` reaches the stand-in's stdin and the log exactly as typed, and none of it is on the command line. |
 | `copilot-modes` | The picker offers Read only (the default), Allow edits and Allow all tools; Allow edits passes `--allow-tool=write` and the edit runs; Read only passes nothing, the edit is declined, and the tab notes that Allow edits would let it run. |
 | `copilot-resume-while-replying` | Resume Session from the sidebar during a Copilot reply: the "Copilot is still replying" modal names two GitHub Copilot CLI processes; Stop It Now kills the turn's process, and then the terminal starts. |
