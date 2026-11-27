@@ -209,7 +209,7 @@ The **SessionsAI: Search Sessions…** command in the Command Palette searches t
 | `claudeSessions.currentWorkspaceOnly` | `false` | Only show sessions from the open workspace folders. |
 | `claudeSessions.hideEmptySessions` | `true` | Hide sessions with no prompts or replies. |
 | `claudeSessions.claudeCommand` | `claude` | Command used to launch Claude Code when resuming or continuing. |
-| `claudeSessions.copilotCommand` | `copilot` | Command used to launch GitHub Copilot CLI when resuming or continuing. |
+| `claudeSessions.copilotCommand` | `copilot` | Command used to launch GitHub Copilot CLI, both when resuming or continuing in a terminal and for Chat here. |
 | `claudeSessions.terminalLocation` | `editor` | Open CLI terminals as an `editor` tab or in the bottom `panel`. |
 | `claudeSessions.showThinking` | `false` | Show Claude's thinking blocks in transcripts. |
 | `claudeSessions.transcriptLineWidth` | `full` | How wide transcript text gets: `full` (the whole column), `comfortable` (about 95 characters) or `narrow` (about 75). Code and tool output always use the full column. |
