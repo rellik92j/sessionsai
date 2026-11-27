@@ -390,7 +390,7 @@
         "claudeSessions.copilotCommand": {
           "type": "string",
           "default": "copilot",
-          "description": "Command used to launch GitHub Copilot CLI when resuming a session."
+          "description": "Command used to launch GitHub Copilot CLI, both when resuming a session in a terminal and for Chat here."
         },
         "claudeSessions.groupBy": {
           "type": "string",
