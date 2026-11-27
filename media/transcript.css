@@ -1016,7 +1016,7 @@ body.has-composer .fab { bottom: calc(var(--composer-h, 110px) + 12px); }
   word-break: break-word;
 }
 .perm-plan { margin-top: 6px; max-height: 360px; overflow: auto; }
-.perm-actions { display: flex; gap: 8px; margin-top: 9px; }
+.perm-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 9px; }
 .perm-actions .btn:disabled { opacity: 0.5; cursor: default; }
 .perm-outcome { display: flex; align-items: center; gap: 6px; margin-top: 8px; color: var(--muted); }
 .perm-outcome.allowed .codicon { color: var(--vscode-testing-iconPassed, var(--vscode-charts-green, #388a34)); }

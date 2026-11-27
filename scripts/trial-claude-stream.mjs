@@ -14,6 +14,9 @@
 //   --interrupt-after <ms>   How long after that turn is sent to interrupt (default 4000).
 //   --interrupt-turn <n>     Interrupt turn n (1-based) instead of the last one, so later turns test recovery.
 //   --permissions <answer>   Answer `can_use_tool` requests: allow | deny | ignore (default: ignore).
+//   --suggest <types>        With allow: also send the request's `permission_suggestions` as `updatedPermissions`,
+//                            only those of these types (comma-separated: addRules,addDirectories,setMode; or all).
+//   --suggest-dest <dest>    Send those suggestions with this `destination` instead of their own (e.g. session).
 //   --burst                  Send every --say at once instead of one per `result`; stdin closes at the first `result`
 //                            that reports nothing queued (the queued turns still run).
 //   --initialize             Send an `initialize` control request before the first turn.
@@ -45,6 +48,8 @@ function parseArgs(argv) {
       case '--interrupt-after': opts.interruptAfter = Number(next()); break;
       case '--interrupt-turn': opts.interruptTurn = Number(next()); break;
       case '--permissions': opts.permissions = next(); break;
+      case '--suggest': opts.suggest = next().split(','); break;
+      case '--suggest-dest': opts.suggestDest = next(); break;
       case '--initialize': opts.initialize = true; break;
       case '--burst': opts.burst = true; break;
       case '--log': opts.log = next(); break;
@@ -91,6 +96,9 @@ function summarize(dir, data) {
     if (data.permission_denials?.length) parts.push(`denials=${data.permission_denials.length}`);
   } else if (data.type === 'control_request') {
     parts.push(data.request?.subtype, data.request?.tool_name ?? '');
+    for (const s of data.request?.permission_suggestions ?? []) parts.push(`suggest:${s.type}/${s.destination}`);
+  } else if (data.type === 'system' && data.subtype === 'init') {
+    parts.push(`permissionMode=${data.permissionMode}`);
   }
   if (data.session_id) parts.push(`session=${data.session_id}`);
   return parts.join(' ');
@@ -164,6 +172,12 @@ function answerPermission(msg) {
   const response = opts.permissions === 'allow'
     ? { behavior: 'allow', updatedInput: req.input }
     : { behavior: 'deny', message: 'Denied by the trial script.' };
+  if (opts.permissions === 'allow' && opts.suggest) {
+    const picked = (req.permission_suggestions ?? [])
+      .filter((s) => opts.suggest.includes('all') || opts.suggest.includes(s.type))
+      .map((s) => (opts.suggestDest ? { ...s, destination: opts.suggestDest } : s));
+    if (picked.length) response.updatedPermissions = picked;
+  }
   send({ type: 'control_response', response: { subtype: 'success', request_id: msg.request_id, response } });
 }
 

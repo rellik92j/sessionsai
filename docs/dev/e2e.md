@@ -91,7 +91,7 @@ Each user message plays a script, picked by a word in it:
 
 | Message contains | What happens |
 |---|---|
-| `permission` | A Bash call, then a `can_use_tool` control request. It waits for the answer: Allow logs a tool result and "The command ran…"; Deny logs the error result with the extension's deny message and "…carrying on without it." With `slowly` in the message as well, 12 more lines follow the answer, one every 450 ms, so a scenario can act while that reply runs. |
+| `permission` | A Bash call, then a `can_use_tool` control request. It waits for the answer: Allow logs a tool result and "The command ran…"; Deny logs the error result with the extension's deny message and "…carrying on without it." With `slowly` in the message as well, 12 more lines follow the answer, one every 450 ms, so a scenario can act while that reply runs. With `session` as well, the request offers Claude Code's suggestions (a `Bash(echo *)` rule and Accept edits), as Allow for this session needs. What Allow for this session grants holds for the rest of the process: a later `permission` turn runs without asking (`permission-skipped`), and the next `init` reports the new mode. A grant whose `destination` is not `session` is recorded as `settings-write`, which a scenario asserts never happens. |
 | anything else | A slow reply: 12 lines, one every 450 ms, streamed as `text_delta`s. |
 
 With `lingering` in a message (either script), the process stays up for 2.5 s after its last turn has ended and its stdin has closed, before it exits. That holds open the gap where the reply is over but the process is still there. It must stay under the extension's 3 s grace, after which the extension kills the process.
@@ -101,7 +101,8 @@ user]` record go to the log, and the turn ends with the interrupted `result`. Cl
 running turn finishes and then the process exits, as the real CLI does.
 
 It writes what happened to it to the events file (`SESSIONSAI_E2E_EVENTS`), one JSON line each: `start`,
-`turn-start`, `permission-asked`, `permission-answered` (with `behavior` and `message`), `interrupt`, `turn-end`
+`turn-start`, `permission-asked`, `permission-answered` (with `behavior`, `message` and `updatedPermissions`),
+`permission-skipped`, `settings-write`, `interrupt`, `turn-end`
 (`how`: `completed` or `interrupted`), `stdin-end`, `exit`. The terminal stub adds `terminal-resume` and the Claude
 Code stub `claude-code-open`. Scenarios assert on these, because they show what the process actually saw, which the
 page alone cannot.

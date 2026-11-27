@@ -373,8 +373,9 @@ export class TranscriptPanels {
           await this.endTabChat(tab);
           break;
         case 'chatPermission':
-          // Allow or Deny on a permission card. An answer to a card that is no longer the open one changes nothing.
-          if (typeof msg.requestId === 'string' && !(tab.chat ?? tab.ending)?.answer(msg.requestId, msg.allow === true)) {
+          // Allow, Allow for this session, or Deny on a permission card. An answer to a card that is no longer the open
+          // one changes nothing.
+          if (typeof msg.requestId === 'string' && !(tab.chat ?? tab.ending)?.answer(msg.requestId, msg.allow === true, msg.session === true)) {
             this.postChat(tab);
           }
           break;
@@ -589,6 +590,11 @@ export class TranscriptPanels {
     }
     const chat = tab.chat ?? tab.ending;
     const status = chat?.status;
+    // The chat can change its own mode (a plan approved, an "Allow for this session" that switches to Accept edits):
+    // the tab's mode follows, so the next chat in this tab starts in it.
+    if (tab.chat && status && status.mode !== tab.chatMode) {
+      tab.chatMode = chatModeFor(tab.session, status.mode) ?? tab.chatMode;
+    }
     const waiting = tab.waiting ?? [];
     panelPost(tab, { type: 'chatLive', html: chat || waiting.length ? renderLive(chat?.live.pieces ?? [], !!status?.busy, waiting, chatSpeaker(sourceOf(tab.session))) : '' });
     panelPost(tab, chatStateMessage(status, tab.chatMode, waiting.length));

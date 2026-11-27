@@ -196,12 +196,14 @@
         vscode.postMessage({ command: 'chatMode', mode: chatMode.value });
         describe();
       });
-      // Allow / Deny on a permission card. The buttons go inactive at once; the extension redraws the card.
+      // Allow / Allow for this session / Deny on a permission card. The buttons go inactive at once; the extension
+      // redraws the card.
       chatLive?.addEventListener('click', (e) => {
         const b = e.target.closest('button[data-perm]');
         if (!b || b.disabled) return;
         b.closest('.perm-actions')?.querySelectorAll('button').forEach((x) => (x.disabled = true));
-        vscode.postMessage({ command: 'chatPermission', requestId: b.dataset.request, allow: b.dataset.perm === 'allow' });
+        const perm = b.dataset.perm;
+        vscode.postMessage({ command: 'chatPermission', requestId: b.dataset.request, allow: perm === 'allow' || perm === 'session', session: perm === 'session' });
       });
       chatStop.addEventListener('click', () => vscode.postMessage({ command: 'chatStop' }));
       chatEnd.addEventListener('click', () => vscode.postMessage({ command: 'chatEnd' }));

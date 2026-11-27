@@ -224,9 +224,61 @@ listed one denial. A denial by the host emits no `system`/`permission_denied` ev
 
 The process blocks on the request until it is answered, so the extension must answer every `can_use_tool` (or
 interrupt the turn) or the chat hangs. `permission_suggestions` are the "always allow" options the terminal offers.
-Replying with them (an `updatedPermissions` field) was not tested.
+Replying with them is section 6a.
 
 **So the permission-card task can go ahead.**
+
+## 6a. Allowing with `updatedPermissions`
+
+Finding for SA-37, tested on 2026-11-27 against the same `2.1.332` with the same driver (`--permissions allow
+--suggest <types> [--suggest-dest <destination>]`), each run in a fresh throwaway folder and session, `haiku`, and
+`--setting-sources project` or `project,local`.
+
+An allow reply can carry the request's `permission_suggestions`, as they came or with another `destination`:
+
+```json
+{"type":"control_response","response":{"subtype":"success","request_id":"<request-id>","response":{"behavior":"allow","updatedInput":{"command":"git tag first-tag","description":"…"},"updatedPermissions":[{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"git tag *"}],"behavior":"allow","destination":"session"}]}}}
+```
+
+**What each request offered:**
+
+| Request | `permission_suggestions` |
+|---|---|
+| Bash `git tag first-tag` in the working folder | `addRules` `Bash(git tag *)`, `destination: "localSettings"` |
+| Write a new file in the working folder | `setMode` `acceptEdits`, `destination: "session"` |
+| Write a new file in another folder | `setMode` `acceptEdits` and `addDirectories` (that folder), both `"session"` |
+| Read a file in another folder | `addRules` `Read(//c/<that folder>/**)`, `"session"` (no `addDirectories`); the request also had `decision_reason_type: "workingDir"` |
+| `ExitPlanMode` | none: no `permission_suggestions` key at all, but a `requires_user_interaction` key |
+
+**What each did:**
+
+| Sent | Later request of the same kind, same process | Settings files |
+|---|---|---|
+| `setMode acceptEdits`, `session` | Not asked: the next turn's `system`/`init` said `permissionMode: "acceptEdits"`, and the Write ran with `tool_result_meta` `source: "config"`, `reason_type: "mode"` | none |
+| `addRules`, `localSettings` (as offered) | With `--setting-sources project,local`: not asked (`source: "config"`, `reason_type: "subcommandResults"`). With `--setting-sources project`: **asked again**, since local settings are not read | **Wrote `<cwd>/.claude/settings.local.json`** (folder and file created) with `{"permissions":{"allow":["Bash(git tag *)"]}}`, either way |
+| `addRules` with `destination` changed to `session` | Not asked (`source: "config"`) | none |
+| `addDirectories`, `session` | The next Write in that folder no longer offered `addDirectories` (only `setMode`), so the folder now counts as a working folder; the Write still asked, as one in the working folder does in `default` mode | none |
+
+So all three types are honoured, `destination: "session"` works for every one of them (including the `addRules` that
+was offered as `localSettings`), and only `localSettings` writes a file: the project's own
+`.claude/settings.local.json`, which outlives the chat and every other Claude Code run in that folder.
+
+**"Session" means this process.** A new process resuming the same session (`--resume`) asked again for the rule
+granted with `session` before, and one started with `--permission-mode default` after a `setMode acceptEdits` reported
+`default` and asked again for a Write. Nothing about these grants goes into the session's log.
+
+**Approving a plan leaves plan mode for `default`.** With `--permission-mode plan`, the `ExitPlanMode` request was
+allowed with its input unchanged (no `updatedPermissions`). The model then started on the plan in the same turn, and
+its Write asked as it would in `default` (offering `setMode acceptEdits`). The next turn's `init` said
+`permissionMode: "default"`. So once a plan is approved, the process is no longer in plan mode, and a picker that
+still says Plan is wrong.
+
+**What the chat does with this (SA-37):** a card whose request offers suggestions has a third button, **Allow for
+this session**. It sends every `addRules` (allow), `addDirectories` and `setMode` suggestion with `destination`
+rewritten to `"session"`, so nothing is ever written to a settings file, and the card says what it grants. Unknown
+types (and `setMode` to a mode the picker does not know) are left out. The grants last as long as the chat's process:
+until the tab closes, End chat, or a change of permission mode restarts it. The picker follows the CLI's mode: at
+once when a `setMode` grant or a plan approval is sent, and from every `init` after that.
 
 ## 7. How `--permission-mode` combines with the above
 

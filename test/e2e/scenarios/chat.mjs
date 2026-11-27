@@ -544,6 +544,40 @@ const SCENARIOS = [
     },
   },
   {
+    name: 'permission-allow-for-session',
+    prompt: 'E2E allow a permission for the session',
+    async run(ctx) {
+      const frame = await openTranscript(ctx);
+      await chatHere(frame);
+      await send(frame, 'Run a command that needs permission, for the session.');
+      await waitEvent(ctx.s, ctx.id, 'permission-asked');
+      const button = '#chat-live .chat-permission.active button[data-perm="session"]';
+      await (await transcript(ctx)).waitForSelector(button, { timeout: 10_000 });
+      const card = await liveText(ctx);
+      assert(/Allow for this session/.test(card), 'no Allow for this session button');
+      assert(/For this session: allows Bash\(echo \*\) without asking; switches the permission mode to Accept edits/.test(card), `the card does not say what it grants: ${card}`);
+      const title = await (await transcript(ctx)).$eval(button, (el) => el.getAttribute('title') || '');
+      assert(/Nothing is written to settings files/.test(title), `the button's title does not say it writes no settings: ${title}`);
+      await click(ctx, button);
+      const answer = await waitEvent(ctx.s, ctx.id, 'permission-answered', undefined, 5_000);
+      assert(answer.behavior === 'allow', `the stand-in got "${answer.behavior}", not allow`);
+      const grants = answer.updatedPermissions ?? [];
+      assert(grants.length === 2 && grants.every((g) => g.destination === 'session'), `the grants were ${JSON.stringify(grants)}`);
+      assert(!events(ctx.s, ctx.id).some((e) => e.event === 'settings-write'), 'a grant went to a settings file');
+      await waitFor('the card to say it was allowed for the session', async () => /Allowed for this session/.test(await liveText(ctx)), 5_000);
+      // The process is in Accept edits now, and the picker says so.
+      await waitFor('the picker to follow to Accept edits', async () => (await (await transcript(ctx)).$eval('#chat-mode', (el) => el.value)) === 'acceptEdits', 5_000);
+      await waitEvent(ctx.s, ctx.id, 'turn-end', (e) => e.how === 'completed', 15_000);
+      // The same command again in the same chat: no card, the grant holds, and the process was not restarted.
+      await send(await transcript(ctx), 'Run that permission command again.');
+      await waitEvent(ctx.s, ctx.id, 'permission-skipped', undefined, 15_000);
+      await waitEvent(ctx.s, ctx.id, 'turn-end', (e) => e.how === 'completed' && events(ctx.s, ctx.id).filter((x) => x.event === 'turn-end').length >= 2, 15_000);
+      const all = events(ctx.s, ctx.id);
+      assert(all.filter((e) => e.event === 'permission-asked').length === 1, 'asked again after Allow for this session');
+      assert(all.filter((e) => e.event === 'start').length === 1, 'the process was restarted, which drops the session grants');
+    },
+  },
+  {
     name: 'close-tab-mid-reply',
     prompt: 'E2E close the tab mid-reply',
     async run(ctx) {
