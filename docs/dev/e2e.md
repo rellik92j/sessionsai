@@ -51,8 +51,14 @@ Windows is where it has been run. The harness has a POSIX terminal stub too, but
   temp folder (`sessionsai-e2e-*`), so the user's own VS Code, settings and extensions are never touched. Environment
   variables starting `VSCODE_` or `ELECTRON_` are dropped, so it cannot attach to a VS Code that is already running.
 - **Sessions** come from a temp `CLAUDE_CONFIG_DIR` holding one synthetic session per scenario. The settings point
-  `claudeSessions.projectsDir`, `copilotDir` and `vscodeUserDir` into the sandbox and show only Claude Code sessions (Copilot CLI ones too when a scenario has one),
-  so the real `~/.claude`, `~/.copilot` and VS Code chat folders are never read.
+  `claudeSessions.projectsDir`, `copilotDir` and `vscodeUserDir` into the sandbox, so the real `~/.claude`, `~/.copilot`
+  and VS Code chat folders are never read.
+- **`claudeSessions.sources`**, which tools' sessions the sidebar starts on, is set once for the whole run by
+  `makeSandbox`: `["claude", "copilot-cli"]` when any chosen scenario has `source: 'copilot-cli'` (the chat area's
+  `copilot-` scenarios), otherwise `["claude"]`. So it changes with the areas chosen, and the source chips may be left
+  otherwise by an earlier scenario. A scenario that depends on which tools show sets the chips itself and puts them back
+  afterwards, as `sidebar`'s `withClaudeOnly` and `other-tools`' `withEveryTool` do; it never relies on the starting
+  value.
 - **The chat's `claude`** is `test/e2e/stand-in-claude.mjs`. The extension runs it instead of `claude.exe` only when
   the environment variable `SESSIONSAI_E2E_CLAUDE` names it (see `chatLaunch` and `spawnChat` in
   `src/transcriptPanel.ts`); it runs on VS Code's own Node (`ELECTRON_RUN_AS_NODE`). Nobody else sets that variable,
@@ -145,7 +151,8 @@ An area that needs sessions in several project folders, or another tool's log, e
 calls with the sandbox right after it is made and before VS Code starts, to write them. Use `log` and `files` for a
 session in the default project folder whose log has a particular shape; use `seed(s)` for anything beyond that (the
 `sidebar` area seeds two projects and a Copilot CLI session). Seeded sessions show beside every other area's, so the
-`sidebar` scenarios find theirs by id and ignore every other card, and a scenario that changes shared state (grouping,
+`sidebar` scenarios find theirs by id and ignore every other card, those that count them first set the source chips to
+Claude Code alone (see `claudeSessions.sources` above), and a scenario that changes shared state (grouping,
 filters, the search box, tabs) puts it back, so the next one starts clean.
 
 Scenario names stay unique across areas, since `--only` and the failure screenshots use them. Session ids are numbered
@@ -210,7 +217,7 @@ cost; `beta-web`, three and forty days old) and one Copilot CLI session in `beta
 | `sidebar-groups-by-project` | Projects are groups with an avatar of their initials, their folder, a count and their sessions newest first; a header folds and unfolds its cards. |
 | `sidebar-groups-by-date` | Recent puts each session under its date group (Today, Yesterday, Previous 7 Days, ...), in order, and the cards name their project. |
 | `sidebar-workspace-filter` | Workspace leaves only the sessions started in the open folder, and turns off again. |
-| `sidebar-source-chips` | A chip per tool with its count, and All; the window starts on Claude Code; adding Copilot CLI shows it, with a tag naming each card's tool; with everything on, a click shows just that tool. |
+| `sidebar-source-chips` | A chip per tool with its count, and All; on Claude Code alone only its chip is lit; adding Copilot CLI shows it, with a tag naming each card's tool; with everything on, a click shows just that tool. |
 | `sidebar-card-details` | A card shows its title, latest prompt, agent, tool, branch, prompt count, pull request and cost; a plain session shows none of the optional ones; hovering shows the quick actions. |
 | `sidebar-search-words` | Words in any case, an exact phrase (with the matching passage and its highlight), `-` exclusion, `OR`, file paths searched and tool output not, the no-matches message, the summary. |
 | `sidebar-search-filters` | `source:`, `file:`, `skill:`, `has:commits`, `has:pr`, `has:edits` and their `-` forms, and a filter with a word. |

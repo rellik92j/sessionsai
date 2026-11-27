@@ -4,7 +4,8 @@
 //
 // The sessions are synthetic, in real record shapes, and written by `seed` into the sandbox before VS Code starts:
 // four Claude Code sessions in two projects, at different ages, and one Copilot CLI session. The scenarios find them by
-// id and ignore every other card, so they hold whichever other areas run beside them. Each scenario puts back what it
+// id and ignore every other card, and those that count them set the source chips to Claude Code first (withClaudeOnly),
+// so they hold whichever other areas run beside them. Each scenario puts back what it
 // changed (grouping, filters, search box, tabs) so the next one, in this area or another, starts from the same place.
 
 import { mkdirSync, utimesSync, writeFileSync } from 'node:fs';
@@ -238,12 +239,53 @@ async function chip(frame, source) {
 }
 const chipPressed = async (frame, source) => (await frame.getAttribute(`#sources .chip[data-source="${source}"]`, 'aria-pressed')) === 'true';
 
-/** Back to the window's starting sources: Claude Code only. */
+/** The source chips that are lit, besides All (with All lit, none of the others is). */
+const litSources = (frame) => frame.$$eval('#sources .chip[aria-pressed="true"]', (els) => els.map((e) => e.dataset.source).filter((id) => id !== '*'));
+
+/** Claude Code only, from whatever the chips show: every other tool's chip, this area's or another's, off. */
 async function claudeOnly(frame) {
-  if (!(await chipPressed(frame, 'copilot-cli')) && !(await chipPressed(frame, '*'))) return; // already Claude only
-  if (!(await chipPressed(frame, '*'))) await chip(frame, '*'); // from Copilot CLI alone, All first
+  await frame.waitForSelector('#sources:not([hidden])');
+  const lit = await litSources(frame);
+  if (lit.length === 1 && lit[0] === 'claude') return;
+  if (!(await chipPressed(frame, '*'))) {
+    await chip(frame, '*');
+    await waitFor('All to light', () => chipPressed(frame, '*'));
+  }
   await chip(frame, 'claude'); // with everything on, one click picks just Claude
-  await waitFor('the Claude chip to be the only one lit', async () => (await chipPressed(frame, 'claude')) && !(await chipPressed(frame, '*')));
+  await waitFor('the Claude chip to be the only one lit', async () => {
+    const now = await litSources(frame);
+    return now.length === 1 && now[0] === 'claude';
+  });
+}
+
+/** Puts the chips back to `before` (what `litSources` returned; empty for All), from whatever they show now. */
+async function restoreSources(frame, before) {
+  if (!(await chipPressed(frame, '*'))) await chip(frame, '*');
+  await waitFor('All to light', () => chipPressed(frame, '*'));
+  if (!before.length) return;
+  // From everything on, the first click picks one source, and each next one adds it. A click works from the chips the
+  // page last heard of, so each waits for the one before it to light.
+  for (const id of before) {
+    await chip(frame, id);
+    await waitFor(`the ${id} chip to light`, () => chipPressed(frame, id));
+  }
+  await waitFor(`the sources to be ${before.join(', ')} again`, async () => (await litSources(frame)).sort().join() === [...before].sort().join());
+}
+
+/**
+ * Runs `fn` on Claude Code only, then puts the chips back as they were. The window starts on the sources the harness
+ * set (Claude Code, plus Copilot CLI when another area chose a Copilot CLI scenario), and an area run before this one
+ * may have left another set, so these scenarios do not rely on either.
+ */
+async function withClaudeOnly(frame, fn) {
+  await frame.waitForSelector('#sources:not([hidden])');
+  const before = await litSources(frame);
+  await claudeOnly(frame);
+  try {
+    return await fn();
+  } finally {
+    await restoreSources(frame, before).catch(() => undefined);
+  }
 }
 
 const tabsWith = (page, text) => page.locator('.tabs-container .tab', { hasText: text });
@@ -287,6 +329,30 @@ const NEEDS_OPEN_GROUPS = new Set([
   'sidebar-search-filters',
   'sidebar-search-help',
 ]);
+
+// These count the seeded Claude Code sessions, or switch the Copilot CLI chip on and off, so they run on Claude Code
+// only (withClaudeOnly), whatever sources the window started on or the area before left.
+const NEEDS_CLAUDE_ONLY = new Set([
+  'sidebar-groups-by-project',
+  'sidebar-workspace-filter',
+  'sidebar-source-chips',
+  'sidebar-search-words',
+  'sidebar-search-filters',
+]);
+
+/** Wraps a scenario's run in withClaudeOnly and then withOpenGroups, as its name asks. */
+function wrap(sc) {
+  let run = sc.run;
+  if (NEEDS_OPEN_GROUPS.has(sc.name)) {
+    const inner = run;
+    run = async (ctx) => withOpenGroups(await sidebar(ctx), () => inner(ctx));
+  }
+  if (NEEDS_CLAUDE_ONLY.has(sc.name)) {
+    const inner = run;
+    run = async (ctx) => withClaudeOnly(await sidebar(ctx), () => inner(ctx));
+  }
+  return run === sc.run ? sc : { ...sc, run };
+}
 
 const scenarios = [
     {
@@ -381,15 +447,16 @@ const scenarios = [
       async run(ctx) {
         const frame = await sidebar(ctx);
         await frame.waitForSelector('#sources:not([hidden])');
-        // Two tools have sessions, so there is a chip for each, with its count, and All. The window starts on Claude Code.
-        // (Other areas may add sessions of their own, so a chip for another tool, or more Copilot CLI sessions, is fine.)
+        // Two tools have sessions, so there is a chip for each, with its count, and All. withClaudeOnly has put the chips
+        // on Claude Code alone. (Other areas may add sessions of their own, so a chip for another tool, or more Copilot
+        // CLI sessions, is fine.)
         for (const source of ['*', 'claude', 'copilot-cli']) {
           assert((await frame.locator(`#sources .chip[data-source="${source}"]`).count()) === 1, `there is no ${source} source chip`);
         }
         assert(Number((await frame.locator('#sources .chip[data-source="copilot-cli"] .n').textContent()).trim()) >= 1, 'the Copilot CLI chip does not count its session');
-        assert(await chipPressed(frame, 'claude'), 'the Claude chip is not lit on a window that starts on Claude Code');
-        assert(!(await chipPressed(frame, 'copilot-cli')), 'the Copilot CLI chip is lit on a window that starts on Claude Code');
-        await expectSeeds(frame, CLAUDE_SEEDS, 'the starting sources');
+        assert(await chipPressed(frame, 'claude'), 'the Claude chip is not lit with Claude Code alone shown');
+        assert(!(await chipPressed(frame, 'copilot-cli')), 'the Copilot CLI chip is lit with Claude Code alone shown');
+        await expectSeeds(frame, CLAUDE_SEEDS, 'Claude Code alone');
         try {
           // Adding the other source turns everything on, and All lights.
           await chip(frame, 'copilot-cli');
@@ -619,8 +686,6 @@ export default {
   // Four plain sessions to open in tabs. Their titles share TAB_PREFIX, which is how the scenarios tell their tabs
   // from every other.
   sessions: ['alpha', 'bravo', 'charlie', 'delta'].map((w) => ({ key: w, prompt: `${TAB_PREFIX} ${w}` })),
-  scenarios: scenarios.map((sc) =>
-    NEEDS_OPEN_GROUPS.has(sc.name) ? { ...sc, run: async (ctx) => withOpenGroups(await sidebar(ctx), () => sc.run(ctx)) } : sc,
-  ),
+  scenarios: scenarios.map(wrap),
 };
 
