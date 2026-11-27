@@ -116,7 +116,7 @@ that its `pid` is gone instead.
 ## Areas
 
 Scenarios are grouped by what they exercise, one module per area in `test/e2e/scenarios/`: `chat`, `transcript`,
-`sidebar`, `resume` and `overview` today, with `other-tools` to come. The runner finds areas by file name, so an
+`sidebar`, `resume`, `overview` and `other-tools`. The runner finds areas by file name, so an
 area's name is its file name and no list needs editing. Two people adding scenarios to different areas never touch the
 same file. Shared steps (`openTranscript`, `chatHere`, `send`, `click`, `sidebarMenu`, `modal`, `assert`, `waitFor`,
 `waitEvent`, ...) live in `harness.mjs`; a helper only one area uses stays in that area's module.
@@ -266,6 +266,28 @@ and the overview scenarios narrow the page to the two projects, so the sessions 
 | `overview-transcript-cold-and-unpriced` | An expired cache (time since, 5-minute), a window half full not warned about, a single request worded as one, and the message box saying resuming would re-cache the whole context. |
 | `overview-transcript-unpriced` | A model with no price: tokens counted, cost $0.00, and the breakdown names the model. |
 | `overview-session-details-costs` | Session details lists each prompt with its cost and cost bar, and the conversation shows the same cost beside each prompt. |
+
+Area `other-tools`, `test/e2e/scenarios/other-tools.mjs`, README's "GitHub Copilot CLI and VS Code Chat sessions too".
+Its sessions are synthetic and seeded: a Copilot CLI session (`session-state/<id>/` with a view, a failing command and an
+edit, two prompts, and a record type nobody knows) and a VS Code Chat session (a `.jsonl` patch log under
+`workspaceStorage/<hash>/chatSessions/`, with a reading, a tool call and a custom title). Both have "otools" in their
+title, and each reply has a word nothing else has. The scenarios switch every tool's chip on, search `otools` (a search
+opens every group) and put the chips and the search box back, so they hold whichever areas run beside them.
+
+| Name | What it checks |
+|---|---|
+| `other-tools-sidebar-marking` | Each card names its tool (Copilot CLI, VS Code Chat) with title, branch and prompt count; the tool's chip shows just its sessions; hovering offers Resume (worded for the tool) and Continue, and no Open in Claude Code chat. |
+| `other-tools-menu-offers` | The right-click menu offers Resume, Continue, Open Transcript, Open Raw Log and Copy Session ID for both; Copy Resume Command for Copilot CLI only; Rename and Open in Claude Code Chat for neither. |
+| `other-tools-copilot-transcript` | The Copilot CLI session reads as prompts and replies in order, with its tool calls (view, bash, edit), the failed one marked and showing its error, and neither the injected context nor the reasoning shown; its page has Resume for the GitHub Copilot CLI and no Claude Code buttons. |
+| `other-tools-vscode-chat-transcript` | The VS Code Chat session reads as prompts and replies, a file reference as code, a tool call with its hint and output; Resume is Open in Chat and Continue is a new chat; no Claude Code buttons. |
+| `other-tools-search` | A word in a reply finds each session and the card shows the highlighted passage; a prompt phrase, `source:copilot`, `source:chat` and `-source:chat` pick the right one; the word is marked in the opened chat. |
+| `other-tools-copilot-resume` | Resume Session from the menu runs `<copilotCommand> --resume <id>` in the terminal, once, and starts nothing new. |
+| `other-tools-copilot-continue` | Continue in New Session runs the Copilot command with no `--resume`, a `--name` after the session, access to the handoff folder and a prompt pointing at a handoff file that carries the session's prompts. |
+| `other-tools-vscode-chat-open` | Open in Chat (hover button, and the transcript's button) says the chat belongs to another folder, offering Open Folder in New Window and Read Transcript, which opens the conversation; no terminal starts. |
+| `other-tools-chat-here-offered` | A Copilot CLI session's message-box menu starts with Chat here, chosen, then its tools; a VS Code Chat session's has no Chat here, cannot send to the same session, and has no chat bar. |
+
+Not covered: what Continue in a new chat does in VS Code Chat itself (chat is off in the test window), and Open Folder in
+New Window (it would open a second window).
 
 ## Writing a scenario
 
