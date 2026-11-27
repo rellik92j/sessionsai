@@ -47,3 +47,21 @@ jobs:
       # Full manifest validation (and the prepublish check again); the .vsix goes to the runner's temp folder and is not kept.
       - name: Package
         run: npx vsce package --out "$RUNNER_TEMP/check.vsix"
+
+  # Stopping a Copilot CLI chat turn kills its process group on macOS and Linux, which the Windows job above cannot
+  # exercise. Only that test file runs here: the rest of the suite assumes Windows paths in places.
+  process-tree:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run compile
+      - run: node --test test/copilotProcess.test.js

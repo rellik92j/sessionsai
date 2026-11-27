@@ -65,6 +65,16 @@ declined. So the picker maps:
 
 ## Stop
 
-Stop kills the turn's process. On Windows the chat runs `taskkill /pid <pid> /T /F`, so a shim's `copilot` and any
-command it was running go too. A run killed mid-reply left the log ending at `assistant.turn_start` with no
-`turn_end`; the next `--resume` of the session worked normally.
+Stop kills the turn's process tree (`src/copilotProcess.ts`). On Windows the chat runs `taskkill /pid <pid> /T /F`,
+so a shim's `copilot` and any command it was running go too. On macOS and Linux each turn starts detached, as the
+leader of its own process group, which the commands copilot starts join. Stop sends SIGTERM to that group, and SIGKILL
+3 s later if `copilot` itself is still running. The SIGKILL is skipped once `copilot` has exited, because its pid (the
+group's id) may then belong to another process. A detached turn no longer gets signals sent to the extension host's
+group. If the extension host dies without stopping a turn, the turn's output pipe closes, and copilot is expected to end
+the next time it writes to it. That case has not been tested.
+
+`test/copilotProcess.test.js` checks this with a stand-in turn that starts a command, on the `process-tree` CI job's
+Linux and macOS runners. It has not been checked with the real Copilot CLI on either platform.
+
+A run killed mid-reply left the log ending at `assistant.turn_start` with no `turn_end`; the next `--resume` of the
+session worked normally.

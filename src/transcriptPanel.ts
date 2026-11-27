@@ -8,6 +8,7 @@ import * as vscode from 'vscode';
 import { ChatChild, ClaudeChat, isPermissionMode, resolveClaudeExecutable, resolveExecutable, SessionChat } from './claudeChat';
 import { chatModes, chatSpeaker, chatStateMessage, renderLive } from './chatView';
 import { COPILOT_EXECUTABLE, CopilotChat, DEFAULT_COPILOT_MODE, isCopilotMode } from './copilotChat';
+import { killTurnTree, turnSpawnOptions } from './copilotProcess';
 import { escapeHtml, formatDateTime, formatTokens, formatUsd } from './format';
 import { collectInsights, editsAsDiff, FileTouch, SessionInsights, TodoStatus } from './insights';
 import { LiveProcess, LiveSessions, liveWarning, readRunningTasks, renderLiveNotice, RunningTask, settleWaitingFromDisk, tasksOf } from './liveSessions';
@@ -933,26 +934,16 @@ const COPILOT_STAND_IN_ENV = 'SESSIONSAI_E2E_COPILOT';
 
 /**
  * Starts one Copilot CLI turn: copilot.exe without a shell, or an npm .cmd shim through cmd.exe (its arguments are
- * fixed flags and the session id; the message goes on stdin). Stop kills the whole process tree, so a shim's copilot
- * and the commands it runs go with it.
+ * fixed flags and the session id; the message goes on stdin). Stop kills the whole process tree (taskkill /T on
+ * Windows, the turn's own process group on macOS and Linux), so a shim's copilot and the commands it runs go with it.
  */
 function spawnCopilot(exe: string, args: string[], cwd: string | undefined, shell: boolean): ChatChild {
   const standIn = process.env[COPILOT_STAND_IN_ENV];
   const child =
     standIn && exe === standIn
-      ? spawn(process.execPath, [standIn, ...args], { cwd, shell: false, windowsHide: true, stdio: 'pipe', env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } })
-      : spawn(shell ? `"${exe}"` : exe, args, { cwd, shell, windowsHide: true, stdio: 'pipe' });
-  const kill = () => {
-    if (process.platform === 'win32' && child.pid) {
-      execFile('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true }, (err) => {
-        if (err) {
-          child.kill();
-        }
-      });
-    } else {
-      child.kill();
-    }
-  };
+      ? spawn(process.execPath, [standIn, ...args], turnSpawnOptions({ cwd, shell: false, windowsHide: true, stdio: 'pipe', env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } }))
+      : spawn(shell ? `"${exe}"` : exe, args, turnSpawnOptions({ cwd, shell, windowsHide: true, stdio: 'pipe' }));
+  const kill = () => killTurnTree(child);
   return {
     stdin: child.stdin,
     stdout: child.stdout,
