@@ -376,6 +376,35 @@ const COPILOT_SCENARIOS = [
     },
   },
   {
+    name: 'copilot-stop-before-taken',
+    source: COPILOT,
+    prompt: 'E2E Copilot stop before the message is taken',
+    async run(ctx) {
+      const held = 'Hold this one, then reply.';
+      const queued = 'And this one after it.';
+      const frame = await openTranscript(ctx);
+      await chatHere(frame);
+      await send(frame, held);
+      const { pid } = await waitEvent(ctx.s, ctx.id, 'holding');
+      await send(await transcript(ctx), queued);
+      await waitFor('the message box to empty', async () => (await composerText(ctx)) === '', 5_000);
+      await click(ctx, '#chat-stop');
+      // Both come back, the one that was running first, as they were typed.
+      const both = `${held}\n\n${queued}`;
+      await waitFor('both messages to come back to the box', async () => (await composerText(ctx)) === both, 10_000);
+      await waitFor("the turn's process to be gone", () => pidGone(pid), 10_000);
+      await waitFor('the chat bar to say the turn stopped', async () => /Last turn stopped/.test(await chatState(ctx)), 10_000);
+      const live = await liveText(ctx);
+      assert(!live.includes(held) && !live.includes(queued), `the pending part still shows a message: ${JSON.stringify(live)}`);
+      // Nothing more starts, and the session never got either message.
+      await new Promise((r) => setTimeout(r, 3_000));
+      assert(starts(ctx).length === 1, `${starts(ctx).length} turns started`);
+      assert(!events(ctx.s, ctx.id).some((e) => e.event === 'turn-start'), 'the held message was taken');
+      assert(!copilotUsers(ctx).some((t) => t === held || t === queued), 'the session log has a message that went back to the box');
+      assert((await composerText(ctx)) === both, 'the box changed after the stop');
+    },
+  },
+  {
     name: 'copilot-message-intact',
     source: COPILOT,
     prompt: 'E2E Copilot message arrives intact',

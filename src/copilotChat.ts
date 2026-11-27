@@ -293,6 +293,11 @@ export class CopilotLive extends LiveChat {
     return changed;
   }
 
+  /** The running turn's message never reached the session (Stop before it was taken): its bubble goes. */
+  dropInFlight(): void {
+    this.pieces = this.pieces.filter((p) => !(p.kind === 'user' && !p.uuid && !p.queued));
+  }
+
   /** The turn's process has exited: nothing streams any more, and what never got an id goes at the next log read. */
   endTurn(): void {
     for (const p of this.pieces) {
@@ -400,7 +405,10 @@ export class CopilotChat implements SessionChat {
     return false;
   }
 
-  /** Stop: the running turn's process is killed; messages still waiting go back to the message box. */
+  /**
+   * Stop: the running turn's process is killed; messages still waiting go back to the message box, and so does the
+   * running turn's own message once the process has exited, if copilot never took it.
+   */
   interrupt(): void {
     const dropped = this.queue.splice(0);
     if (dropped.length) {
@@ -610,6 +618,11 @@ export class CopilotChat implements SessionChat {
           this.opts.onUnsent(unsent);
         }
       }
+    } else if (stopped && !this.taken && this.inFlight !== undefined) {
+      // Stopped before the session took the message: it was never sent, so it goes back to the box. Messages sent
+      // after Stop stay queued and run next, as they would after any stopped turn.
+      this.live.dropInFlight();
+      this.opts.onUnsent([this.inFlight]);
     }
     this.live.endTurn();
     this.lastTurn = { durationMs: Date.now() - this.started, error: failed || undefined, interrupted: stopped || undefined };
