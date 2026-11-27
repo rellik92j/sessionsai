@@ -267,7 +267,7 @@ cost; `beta-web`, three and forty days old) and one Copilot CLI session in `beta
 
 Area `resume`, `test/e2e/scenarios/resume.mjs`: resuming, continuing and starting sessions, on the harness's plain
 two-record sessions, one per scenario. `seed` adds a project agent (`e2e-reviewer`) and a user agent (`e2e-planner`) for
-the pickers' agent step. Each scenario reads the terminal stub's `argv` and `cwd` (or the Claude Code stub's
+the pickers' agent step, and a Claude Code session whose log file name has a `&` for `resume-shell-id-refused`. Each scenario reads the terminal stub's `argv` and `cwd` (or the Claude Code stub's
 `claude-code-open`) recorded since its own action. The pickers are the workbench's quick picks, clicked by their exact
 labels (`choose`, `typeIn`, `cancelStep` in the module). Resume Session and the Continue commands are hidden from the
 command palette (`when: false` in `package.json`), so the palette's entries here are New Claude Code Session… and
@@ -277,6 +277,7 @@ Search Sessions… (whose rows have a Resume button).
 |---|---|
 | `resume-sidebar-menu`, `resume-sidebar-card-button`, `resume-sidebar-ctrl-enter`, `resume-topbar`, `resume-search-quick-pick` | Resume Session from the sidebar's right-click menu, the card's play button, Ctrl+Enter on a card, the transcript's top bar and the Search Sessions… picker's Resume button: the terminal runs the stub with `--resume <id>` and starts in the session's folder. |
 | `resume-closes-transcript-setting` | With `closeTranscriptOnResume` on, Resume in the top bar closes the transcript tab after the terminal starts. The setting is put back. |
+| `resume-shell-id-refused` | A Claude Code session whose log file name, and so its id, has a `&` (written by the area's `seed`): Resume Session from the sidebar's right-click menu, the card's play button, Copy Resume Command, the transcript's Resume, and Send to this session in the Claude Code CLI each show the refusal and start no terminal; the message stays in the box. |
 | `continue-sidebar-menu`, `continue-card-button`, `continue-topbar` | Continue in New Session: `--name "Continued: <title>"` and the handoff (the session's title, last prompt and reply) as one argument, with no option flags. |
 | `continue-with-model-sidebar-menu` | Continue in New Session with Tool or Model…: the tool, model, effort and agent pickers list what they should (the session's own model, the project and user agents), and the choices become `--model`, `--effort` and `--agent` before `--name`. |
 | `continue-with-model-topbar-chevron` | The top bar's ⌄: a typed model name, effort left on Default (no `--effort`), an empty agent name goes back to the list, a typed agent name is passed. |

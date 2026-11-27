@@ -12,9 +12,9 @@
 // palette (`when: false`), so the palette reaches this area only through New Claude Code Session and Search Sessions
 // (whose rows have a Resume button). Those are the palette scenarios below.
 
-import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync, utimesSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { assert, click, events, openTranscript, sidebar, sidebarMenu, transcript, waitFor } from '../harness.mjs';
+import { assert, click, events, openTranscript, projectDirName, sidebar, sidebarMenu, transcript, waitFor } from '../harness.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -28,7 +28,36 @@ function seed(s) {
   };
   agent(path.join(s.work, '.claude', 'agents'), 'e2e-reviewer', 'Reviews the demo folder (a synthetic project agent).');
   agent(path.join(s.claudeConfig, 'agents'), 'e2e-planner', 'Plans work (a synthetic user agent).');
+  seedShellId(s);
 }
+
+/**
+ * A Claude Code session whose log file name has a `&`, which Windows allows. Its id is that name, and the terminal's
+ * shell would run what follows the `&` if Resume typed it.
+ */
+const SHELL_ID = 'e2e00000-shell&echo-e2e-injected';
+const SHELL_PROMPT = 'E2E Claude Code session id with a shell character';
+function seedShellId(s) {
+  const dayAgo = Date.now() - 24 * 3600 * 1000;
+  const common = { isSidechain: false, userType: 'external', entrypoint: 'cli', cwd: s.work, sessionId: SHELL_ID, version: '2.1.332', gitBranch: 'main' };
+  const records = [
+    { parentUuid: null, ...common, type: 'user', message: { role: 'user', content: SHELL_PROMPT }, uuid: 'e2e00000-5e11-4000-8000-000000000001', timestamp: new Date(dayAgo).toISOString() },
+    {
+      parentUuid: 'e2e00000-5e11-4000-8000-000000000001',
+      ...common,
+      type: 'assistant',
+      message: { model: 'claude-stand-in', id: 'msg_seed_shell', type: 'message', role: 'assistant', content: [{ type: 'text', text: 'Ready when you are.' }], stop_reason: 'end_turn', stop_sequence: null, usage: { input_tokens: 3, output_tokens: 5 } },
+      uuid: 'e2e00000-5e11-4000-8000-000000000002',
+      timestamp: new Date(dayAgo + 2000).toISOString(),
+    },
+  ];
+  const file = path.join(s.claudeConfig, 'projects', projectDirName(s.work), `${SHELL_ID}.jsonl`);
+  writeFileSync(file, records.map((r) => JSON.stringify(r)).join('\n') + '\n');
+  utimesSync(file, new Date(dayAgo), new Date(dayAgo));
+}
+
+/** The text of the notification toasts showing in the workbench. */
+const toastText = (ctx) => ctx.page.locator('.notifications-toasts .notification-toast').allTextContents().then((t) => t.join('\n'));
 
 // ---------- steps ----------
 
@@ -303,6 +332,41 @@ export default {
         } finally {
           await setSetting(ctx, 'claudeSessions.closeTranscriptOnResume', false);
         }
+      },
+    },
+    {
+      name: 'resume-shell-id-refused',
+      prompt: 'E2E Claude Code shell id (unused: the scenario works on the seeded session)',
+      async run(ctx) {
+        // The seeded session whose log file name, and so its id, has a `&`.
+        const bad = { ...ctx, id: SHELL_ID, title: SHELL_PROMPT };
+        const refused = /Claude Code session's id, "e2e00000-shell&echo-e2e-injected", has characters a shell could run as a command/;
+        const refusedToast = async (what, since) => {
+          await waitFor(`${what}: the refusal`, async () => refused.test(await toastText(ctx)), 10_000);
+          await nothingOpened(ctx, since, what);
+          await ctx.page.keyboard.press('Escape');
+          await waitFor(`${what}: the refusal to be dismissed`, async () => !refused.test(await toastText(ctx)), 5_000);
+        };
+        let since = mark(ctx);
+        await sidebarMenu(bad, 'Resume Session');
+        await refusedToast('Resume Session from the sidebar', since);
+        since = mark(ctx);
+        await cardButton(bad, 'resume');
+        await refusedToast("The card's Resume button", since);
+        since = mark(ctx);
+        await sidebarMenu(bad, 'Copy Resume Command');
+        await refusedToast('Copy Resume Command', since);
+        const frame = await openTranscript(bad);
+        since = mark(ctx);
+        await click(bad, '[data-cmd="resume"]');
+        await refusedToast("The transcript's Resume", since);
+        // The message box, sent to this session in the Claude Code CLI.
+        const text = 'Do not put my id on a command line.';
+        since = mark(ctx);
+        await routeTo(frame, text, 'claude', 'same');
+        await frame.click('#composer-send');
+        await refusedToast('Send to this session in the Claude Code CLI', since);
+        await waitFor('the message to stay in the box', async () => (await (await transcript(bad)).inputValue('#composer-input')) === text, 5_000);
       },
     },
 

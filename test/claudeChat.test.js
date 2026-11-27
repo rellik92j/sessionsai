@@ -18,6 +18,7 @@ const {
   resolveClaudeExecutable,
   resultError,
   turnCost,
+  unsafeClaudeSessionId,
   userLine,
 } = require('../out/claudeChat');
 const { renderLive, chatStateMessage, permissionDetail } = require('../out/chatView');
@@ -50,6 +51,16 @@ test('the chat process is resumed in stream-json mode with an explicit permissio
     parent_tool_use_id: null,
     session_id: '',
   });
+});
+
+test('a session id a shell could act on is refused before it is typed into a terminal', () => {
+  for (const id of ['c0c0c0c0-0000-4000-8000-000000000001', 'agent-a2222222222222222', 'abc_DEF.9-x', '1.0']) {
+    assert.equal(unsafeClaudeSessionId(id), undefined, `${id} is accepted`);
+  }
+  for (const id of ['a&calc', 'a|more', 'a"b', 'a b', '%PATH%', 'a^b', 'a<b', 'a>b', 'a;b', 'a$(b)', 'a`b`', "a'b", 'a\nb', '', 'é']) {
+    assert.match(unsafeClaudeSessionId(id), /This Claude Code session's id, .*, has characters a shell could run as a command/s, `${JSON.stringify(id)} is refused`);
+  }
+  assert.match(unsafeClaudeSessionId('x&calc'), /id, "x&calc", has .* no terminal is started\. .* log file under Claude Code's projects folder/);
 });
 
 test('a turn streams in, a tool request is denied with the neutral message (decline-prompts mode), and the result ends it', () => {

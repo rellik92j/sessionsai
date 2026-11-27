@@ -543,6 +543,55 @@ test('the --agent agent is a label on the sidebar card, the transcript header an
   }
 });
 
+test('a Claude Code session id a shell could act on is refused by Resume, Copy Resume Command and Send to the CLI', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-sessions-shell-id-'));
+  const projectsDir = path.join(root, 'claude');
+  const noSources = path.join(root, 'none');
+  const BAD = 'bad-0002&echo-injected';
+  try {
+    const dir = path.join(projectsDir, 'C--work-demo');
+    const demo = path.join(root, 'demo');
+    fs.mkdirSync(demo, { recursive: true });
+    const log = (prompt) => [{ type: 'user', message: { content: prompt }, cwd: demo, timestamp: '2026-11-19T09:00:00.000Z' }];
+    writeSession(dir, 'good-0001', log('A session with a plain id'));
+    // Windows allows `&` in a file name, so a log named this way is a session whose id is that name.
+    writeSession(dir, BAD, log('A session whose log name has a shell character'));
+    const state = { projectsDir, config: { copilotDir: noSources, vscodeUserDir: noSources, closeTranscriptOnResume: false }, providers: {}, commands: {}, panels: [], panelPosts: [], errors: [], terminals: [] };
+    const { vscode, last } = await activateWithSidebar(state);
+    assert.ok(last('state').groups.flatMap((g) => g.sessions).some((c) => c.id === `claude:${BAD}`), 'the session is listed');
+    const copied = [];
+    vscode.env.clipboard.writeText = async (t) => copied.push(t);
+    const refused = /id, "bad-0002&echo-injected", has characters a shell could run as a command, so it is not put on a command line and no terminal is started/;
+
+    // A plain id still resumes and copies as before.
+    await state.commands['claudeSessions.resume']({ sessionKey: 'claude:good-0001' });
+    assert.equal(state.terminals.pop().sent, 'claude --resume good-0001');
+    await state.commands['claudeSessions.copyResumeCommand']({ sessionKey: 'claude:good-0001' });
+    assert.match(copied.pop(), /claude --resume good-0001$/);
+    assert.deepEqual(state.errors, []);
+
+    await state.commands['claudeSessions.resume']({ sessionKey: `claude:${BAD}` });
+    assert.equal(state.terminals.length, 0, 'Resume started a terminal');
+    assert.match(state.errors.pop(), refused);
+    await state.commands['claudeSessions.copyResumeCommand']({ sessionKey: `claude:${BAD}` });
+    assert.deepEqual(copied, [], 'Copy Resume Command put the line on the clipboard');
+    assert.match(state.errors.pop(), refused);
+
+    // The transcript's Send to the Claude Code CLI, into this session.
+    await state.commands['claudeSessions.openTranscript']({ sessionKey: `claude:${BAD}` });
+    const panel = state.panels[state.panels.length - 1];
+    state.panelPosts.length = 0;
+    await panel.onMessage({ command: 'send', text: 'Carry on', target: 'claude', mode: 'same' });
+    await waitFor(() => state.panelPosts.some((m) => m.type === 'sent' || m.type === 'sendFailed'), 'the page to hear sent or sendFailed');
+    assert.ok(state.panelPosts.some((m) => m.type === 'sendFailed'), 'the message was not given back to the box');
+    assert.equal(state.terminals.length, 0, 'Send started a terminal');
+    assert.match(state.errors.pop(), refused);
+    assert.deepEqual(state.errors, []);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('Copilot CLI and VS Code Chat sessions: source chips, filters, search, transcripts and actions', async () => {
   const fixtures = path.join(__dirname, 'fixtures');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-sessions-sources-'));
