@@ -420,6 +420,10 @@ const scenarios = [
         const side = await sidebar(ctx);
         await side.dblclick(`.card[data-id$=":${ctx.id}"]`);
         await waitFor('the session tab to be in front', async () => (await ctx.page.locator('.tabs-container .tab.active', { hasText: ctx.title }).count()) === 1);
+        // The tab is in front after the double-click's first click, which opens the preview tab. The double-click itself
+        // lands later: it turns that tab into a tab of its own and brings it forward, which closes a menu or palette
+        // opened in the meantime. Once it is done, the page is drawn again without Keep open.
+        await waitFor('the double-click to give the session a tab of its own', async () => !(await (await transcript(ctx)).$('[data-cmd="keepOpen"]')));
         await ctx.page.locator('.menubar .menubar-menu-button', { hasText: 'View' }).first().click();
         await ctx.page.locator('.monaco-menu .action-item', { hasText: 'Command Palette' }).first().click();
         await ctx.page.waitForSelector('.quick-input-widget', { state: 'visible', timeout: 10_000 });

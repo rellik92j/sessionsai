@@ -420,7 +420,11 @@ export default {
           assert(await inView(ctx, 'mark.hit', 0), 'the page opens at the first match');
           assert(!(await inView(ctx, 'mark.hit', 2)), 'the last match is further down, out of view');
           assert((await count(ctx, 'details.tool mark.hit')) === 0, 'a match inside a tool call is not marked');
-          // F3 and Shift+F3 move between matches.
+          // F3 and Shift+F3 move between matches. They are keys pressed in the page, so the page needs the keyboard
+          // first: a transcript opened from the sidebar into an empty editor area is a new tab that does not take it
+          // (a click that only switches the preview tab's session leaves it in that tab), and Playwright cannot focus
+          // `body`. Click the find bar's query text, which does nothing else, as a person would click into the page.
+          await (await page(ctx)).click('.findbar .find-query');
           const which = async () => (await text(ctx, '.findbar .find-count'))[0];
           const press = async (key) => (await page(ctx)).press('body', key);
           await press('F3');

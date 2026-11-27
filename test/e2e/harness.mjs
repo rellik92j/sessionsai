@@ -21,6 +21,14 @@ const CLAUDE_CODE_STUB = path.join(ROOT, 'test', 'e2e', 'claude-code-stub');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * What resetWorkbench runs, bound in the sandbox's keybindings.json to a key no scenario presses. The key is written
+ * once as VS Code reads it and once as Playwright presses it.
+ */
+const RESET_COMMAND = 'workbench.action.closeAllGroups';
+const RESET_KEY = 'ctrl+alt+shift+f12';
+const RESET_PRESS = 'Control+Alt+Shift+F12';
+
 /** Claude Code's folder name for a project: every character that is not a letter or digit becomes '-'. */
 export const projectDirName = (cwd) => cwd.replace(/[^a-zA-Z0-9]/g, '-');
 
@@ -146,6 +154,10 @@ export function makeSandbox(sessions) {
     'git.enabled': false,
     'chat.disableAIFeatures': true,
     'terminal.integrated.defaultProfile.windows': 'Command Prompt',
+    // resetWorkbench closes the terminals scenarios leave open, with no "terminate the process?" question, and its key
+    // reaches the workbench even while a terminal has focus.
+    'terminal.integrated.confirmOnKill': 'never',
+    'terminal.integrated.commandsToSkipShell': [RESET_COMMAND],
     // Every source of sessions points into the sandbox.
     'claudeSessions.projectsDir': path.join(s.claudeConfig, 'projects'),
     // Copilot CLI sessions are listed only when a scenario has one, so the others see the sidebar as before.
@@ -160,6 +172,7 @@ export function makeSandbox(sessions) {
   };
   mkdirSync(path.join(s.userData, 'User'), { recursive: true });
   writeFileSync(path.join(s.userData, 'User', 'settings.json'), JSON.stringify(settings, null, 2));
+  writeFileSync(path.join(s.userData, 'User', 'keybindings.json'), JSON.stringify([{ key: RESET_KEY, command: RESET_COMMAND }], null, 2));
   return s;
 }
 
@@ -265,6 +278,29 @@ export async function launch(s) {
   const page = await app.firstWindow();
   await page.waitForSelector('.monaco-workbench', { timeout: 90_000 });
   return { app, page };
+}
+
+/**
+ * Puts the workbench back to one empty editor group before a scenario: closes whatever picker or menu is open, then every
+ * editor and editor group. Resume, Continue and Send open their terminal beside the active editor, so each adds a group;
+ * left open over a full run they squeeze the side bar to its narrowest, where a card's hover buttons no longer fit and
+ * clicking one fails. A transcript closed here with a chat still replying lets the reply finish, as closing its tab does.
+ */
+export async function resetWorkbench(page) {
+  await page.keyboard.press('Escape').catch(() => undefined);
+  const editors = page.locator('.part.editor .tabs-container .tab');
+  const groups = page.locator('.part.editor .editor-group-container');
+  if ((await editors.count()) === 0 && (await groups.count()) <= 1) return;
+  // Take the keyboard out of any webview first. Pressed in a transcript, the key's keydown closes the tab and its
+  // webview goes with it before the keyups: the window was then left with focus nowhere, and a scenario once hung
+  // here until its time ran out. Blurring the webview's iframe puts focus on the workbench, which stays.
+  await page.evaluate(() => {
+    if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
+  });
+  await page.keyboard.press(RESET_PRESS);
+  await waitFor('every editor and editor group to close', async () => (await editors.count()) === 0 && (await groups.count()) <= 1, 10_000);
+  // Closing a terminal can still leave the window with focus nowhere; a click on the empty editor area gives it back.
+  if (!(await page.evaluate(() => document.hasFocus()))) await page.locator('.part.editor').click();
 }
 
 // ---------- what scenarios use ----------
