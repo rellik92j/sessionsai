@@ -12,6 +12,7 @@ const {
   copilotChatArgs,
   copilotModeArgs,
   isCopilotMode,
+  unsafeCopilotSessionId,
 } = require('../out/copilotChat');
 const { resolveExecutable } = require('../out/claudeChat');
 const { chatModes, chatStateMessage, renderLive, COPILOT_SPEAKER } = require('../out/chatView');
@@ -317,6 +318,31 @@ test('a copilot that cannot start gives every message back', () => {
   thrown.chat.send('hi');
   assert.deepEqual(thrown.unsent, ['hi']);
   assert.match(thrown.chat.live.pieces.find((p) => p.kind === 'notice').text, /Could not start GitHub Copilot CLI: spawn EINVAL/);
+});
+
+test('a session id a shell could act on is refused: nothing starts, the message goes back, and the tab says why', () => {
+  for (const id of ['c0c0c0c0-0000-4000-8000-000000000001', 'abc_DEF.9-x', '1.0']) {
+    assert.equal(unsafeCopilotSessionId(id), undefined, `${id} is accepted`);
+  }
+  for (const id of ['a&calc', 'a|more', 'a"b', 'a b', '%PATH%', 'a^b', 'a<b', 'a>b', 'a;b', 'a$(b)', 'a`b`', "a'b", 'a\nb', '', 'é']) {
+    assert.match(unsafeCopilotSessionId(id), /characters a shell could run as a command/, `${JSON.stringify(id)} is refused`);
+  }
+  let launched = 0;
+  const { chat, spawns, unsent } = makeChat({
+    sessionId: 'e2e&calc',
+    launch: () => {
+      launched++;
+      return { exe: 'C:\\npm\\copilot.cmd', shell: true };
+    },
+  });
+  chat.send('hello');
+  assert.equal(spawns.length, 0, 'no process starts');
+  assert.equal(launched, 0, 'it is refused before copilot is even looked for');
+  assert.deepEqual(unsent, ['hello']);
+  const note = chat.live.pieces.find((p) => p.kind === 'notice');
+  assert.equal(note.tone, 'error');
+  assert.match(note.text, /^This GitHub Copilot CLI session's id, "e2e&calc", has characters a shell could run as a command/);
+  assert.ok(!chat.status.busy && !chat.active);
 });
 
 test('ending the chat lets the running turn finish and starts no more; stopNow and dispose kill it', async () => {

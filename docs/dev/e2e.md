@@ -192,6 +192,7 @@ the `copilot-` scenarios, which set `source: 'copilot-cli'`):
 | `copilot-modes` | The picker offers Read only (the default), Allow edits and Allow all tools; Allow edits passes `--allow-tool=write` and the edit runs; Read only passes nothing, the edit is declined, and the tab notes that Allow edits would let it run. |
 | `copilot-resume-while-replying` | Resume Session from the sidebar during a Copilot reply: the "Copilot is still replying" modal names two GitHub Copilot CLI processes; Stop It Now kills the turn's process, and then the terminal starts. |
 | `copilot-terminal-guard` | Resume Session from the sidebar opens the terminal; then Chat here refuses with a warning naming two GitHub Copilot CLI processes, starts nothing, and the message stays in the box. |
+| `copilot-shell-id-refused` | A Copilot CLI session whose folder name, and so its id, has a `&` (written by the area's `seed`; Windows allows `&` in a folder name, not `"` or `\|`): Resume Session and Copy Resume Command from the sidebar, the transcript's Resume, and Send to this session in GitHub Copilot CLI each show the refusal and start no terminal; Chat here shows it in the tab, starts no stand-in, and the message stays in the box. |
 
 Area `transcript`, `test/e2e/scenarios/transcript.mjs`, reading a session as a chat, each on a synthetic log built for it:
 

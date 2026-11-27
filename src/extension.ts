@@ -5,6 +5,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { AgentInfo, claudeNewSessionArgs, claudeResumeArgs, claudeStartArgs, listAgents, Overrides, userAgentsDir } from './agents';
+import { unsafeCopilotSessionId } from './copilotChat';
 import { formatRelative, isInside } from './format';
 import { buildHandoff, collectHandoffFacts, collectTranscriptFacts } from './handoff';
 import { liveLabel, LiveSessions, liveWarning, readRunningTasks, registryDirFor, tasksOf } from './liveSessions';
@@ -70,6 +71,18 @@ function resumeCommand(session: SessionInfo): string {
     ? config().get<string>('claudeCommand', 'claude') || 'claude'
     : config().get<string>('copilotCommand', 'copilot') || 'copilot';
   return `${command} --resume ${session.id}`;
+}
+
+/**
+ * True, after saying why, when the session is a Copilot CLI one whose id must not be typed into a shell (see
+ * unsafeCopilotSessionId). Resume, Send to it in a terminal and Copy Resume Command all put the id on a command line.
+ */
+function refusesCopilotId(session: SessionInfo): boolean {
+  const unsafe = sourceOf(session) === 'copilot-cli' ? unsafeCopilotSessionId(session.id) : undefined;
+  if (unsafe) {
+    vscode.window.showErrorMessage(unsafe);
+  }
+  return !!unsafe;
 }
 
 /**
@@ -395,6 +408,9 @@ export function activate(context: vscode.ExtensionContext): void {
     if (sourceOf(session) === 'vscode-chat') {
       return openChat(session);
     }
+    if (refusesCopilotId(session)) {
+      return false;
+    }
     if (!(await freeFromChat(session))) {
       return false;
     }
@@ -439,6 +455,9 @@ export function activate(context: vscode.ExtensionContext): void {
    * (see continueInCopilot), so a message that won't survive shell quoting goes in a file its prompt points at.
    */
   const resumeWithMessage = async (session: SessionInfo, message: string, overrides: Overrides, liveChecked = false): Promise<boolean> => {
+    if (refusesCopilotId(session)) {
+      return false;
+    }
     if (!(await freeFromChat(session))) {
       return false;
     }
@@ -847,6 +866,9 @@ export function activate(context: vscode.ExtensionContext): void {
       withSession(async (s) => {
         if (sourceOf(s) === 'vscode-chat') {
           vscode.window.showInformationMessage('VS Code chats have no resume command. Use Open in Chat instead.');
+          return;
+        }
+        if (refusesCopilotId(s)) {
           return;
         }
         const cwd = projectPath(s);
