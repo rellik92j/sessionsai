@@ -28,8 +28,11 @@ had to write 73k tokens again (section 5).
   `--disallowedTools Bash` turned a full cache hit into a full miss. `--permission-mode`, `--effort` and
   `--max-turns` did not affect the cache.
 - **Recommendation: build it**, as a short-lived no-persist ping process per refresh, driven by `ClaudeChat`, with a
-  duration, a spend cap and a status-bar indicator. One check comes first: confirm that a ping also warms the cache
-  for a resume in an interactive terminal, which this trial could not drive (section 8).
+  duration, a spend cap and a status-bar indicator.
+- **It also keeps an interactive terminal's cache warm, if it starts in time.** Checked by hand (section 8): a
+  terminal resume 66 minutes after its last request read 99% of its context from the cache when a ping had landed
+  inside the hour, and 29% when none had. A ping reads the terminal's entry and refreshes its lifetime, but cannot
+  recreate one that has already expired, so the first ping must come before the entry does.
 
 ## 2. Mechanisms tried
 
@@ -203,22 +206,56 @@ Not tested: a ping resuming a log in the middle of another process's turn. The C
 synthetic "No response requested." record in memory (SA-24 doc section 8); with no-persist that record should not be
 written, but the skip above means it should not come up.
 
-## 8. Open risk: does a `-p` ping warm an interactive terminal's cache?
+## 8. Does a `-p` ping warm an interactive terminal's cache? Yes, if it comes in time
 
 Everything above was measured between `-p` processes. The user's next real turn is often in an interactive terminal
-(the sidebar's Resume), and this trial could not drive one without a TTY. The system prompt snapshot and the session's
-model are shared, so the prefix should match if the interactive CLI sends the same tool set. If it adds or removes even
-one tool, a ping warms a prefix the terminal never reads.
+(the sidebar's Resume), which the trial could not drive without a TTY. If the interactive CLI sent a different tool
+set from `-p`, a ping would warm a prefix the terminal never reads. It was checked by hand, on Claude Code 2.1.332 and
+Haiku, with two scratch sessions of about 100k tokens: **warm**, which gets pings, and **control**, which does not.
+[`scripts/prepare-keep-warm-check.mjs`](../../scripts/prepare-keep-warm-check.mjs) sets up the folder and a `README.txt`
+with every command, and [`scripts/show-session-cache.mjs`](../../scripts/show-session-cache.mjs) prints each API
+request's cache read and write from a session's `.jsonl`.
 
-This needs a five-minute manual check before the build (the first follow-up item): resume a scratch session in a
-terminal, exit, run one no-persist ping with `scripts/trial-keep-warm.mjs` (without `--setting-sources`), resume
-in the terminal again and ask one question, then read that request's `cache_read_input_tokens` in the log. A read of
-nearly the whole context means the ping works for terminal resumes.
+**Result.** Times are local; "age" is the time since the session's last terminal request. Context is cache read plus
+cache write plus 2 uncached tokens.
 
-[`scripts/prepare-keep-warm-check.mjs`](../../scripts/prepare-keep-warm-check.mjs) sets this up: it writes a scratch
-folder with two sessions' worth of synthetic files (one to ping, one as the unpinged control) and a `README.txt` with
-every command to type. [`scripts/show-session-cache.mjs`](../../scripts/show-session-cache.mjs) prints each API
-request's cache read and write from a session's `.jsonl`, so the result can be read without opening the log.
+| Request | Age | Cache read | Cache write | Cost |
+|---|---|---|---|---|
+| Ping 1 (warm), after the terminal's entry had expired | about 2 h | 0 | 102,498 | $0.1025 |
+| Ping 2 (warm), after warm's terminal resume at 13:25:54 | not recorded | 100,685 | 1,924 | $0.0070 |
+| Pings 3 and 4 (warm) | not recorded | 102,609 | 0 | $0.0051 each |
+| Ping 5 (warm), 14:15 to 14:25 | under 1 h | 102,609 | 0 | $0.0051 |
+| Terminal resume, warm, 14:32:14 | 66 min | 100,685 of 101,357 (99%) | 670 | |
+| Terminal resume, control, 14:32:46, never pinged | 66 min | 29,124 of 100,124 (29%) | 70,998 | |
+
+- **The ping's prefix matches the terminal's through the whole conversation.** Ping 2 read 100,685 tokens, which is
+  all of the terminal's last request (context 100,687, of which 2 were uncached). The interactive CLI and `-p` send
+  the same system prompt and tools. The ping adds about 1.9k tokens after the conversation, the `-p` mode's own tail
+  plus the ping message, and that is all it writes (ping 2's 1,924). This is also the gap between ping 1's 102,498
+  and the terminal's 100,624.
+- **Terminal Resume benefits.** At 66 minutes, past the 1-hour lifetime of the terminal's own write, warm read 99% of
+  its context from the cache for a $0.006 turn. Control, never pinged, read only the 29,124-token prefix that every
+  session shares (system prompt and tools) and wrote 70,998 again. Rough cost on Haiku: a cold resume of a 100k
+  session about $0.07, a warm one about $0.006, each ping $0.005 to $0.007.
+- **Nothing was written to the session.** The log held at 135 lines across ping 1, 153 across pings 2 to 4 and 166
+  across ping 5. (It went from 153 to 166 between pings 4 and 5 with no API request, probably from opening and closing
+  the interactive CLI.)
+
+**Why the first try missed.** The check as first written pinged more than an hour after the terminal's last request,
+so that only the ping could have warmed anything. By then the terminal's entry had expired. Ping 1 wrote a new entry,
+but one that ends past the 1.9k `-p` tail, and the terminal's next request diverges from it before that point, so
+the terminal read only the shared 29k prefix, the same as control (warm 31,878, control 29,124). A ping can refresh
+an entry that is alive. It cannot recreate one that has expired. Hence: **the first ping has to come before the
+terminal's entry expires**, which is what the ~50-minute schedule in section 9 already does. The check's step 3 now
+says to ping 15 to 50 minutes after the last terminal request and to resume more than an hour after it.
+
+**Open point, for SA-35.** After the first ping, identical pings (3 to 5) read 102,609 tokens, which is the ping's own
+longer entry, not the terminal's 100,685. A read of the ping's entry may or may not also refresh the terminal's
+shorter one; the check cannot tell, because ping 2, which read the terminal's entry directly, may itself have been
+inside the hour. If a later ping does not refresh it, a schedule that outlasts the hour loses the terminal's entry.
+Two ways out: vary the ping text so each ping falls back to the terminal's breakpoint, or measure it with a timed test
+(pings at 0, 50 and 100 minutes, a terminal resume at about 110). The scheduler (SA-35) must settle this before it
+relies on repeated pings.
 
 The build should also report this live: after a kept-warm session's next real turn, compare its cache read with the
 context size and say "Kept warm: the next turn read 198k of 200k tokens from the cache", or that it did not.
@@ -252,7 +289,10 @@ one-click start, and `claudeSessions.keepWarm.spendCapUsd` (per session, default
 and says so.
 
 **Only for sessions whose cache can be read.** Offer it only while the cache is still warm (a cold session's first
-ping would pay the full write, the same as resuming) and only for Claude Code sessions.
+ping would pay the full write, the same as resuming) and only for Claude Code sessions. The same holds for a terminal:
+a ping reads the terminal's entry and keeps it alive, but cannot bring back one that has expired, so the first ping
+must come before expiry (about 50 minutes after the last request on the 1-hour TTL). Section 8 has the open question
+on whether repeated identical pings keep refreshing the terminal's own entry.
 
 **Copilot CLI and VS Code Chat: not applicable.** Neither exposes per-token cache pricing or a cache TTL to the user:
 Copilot bills per premium request, and any prompt caching happens on the service's side, out of view. A ping would
@@ -261,7 +301,8 @@ The entry points above should be hidden for those sources.
 
 **Build tasks**, filed in the agent vault, in order:
 
-1. **SA-33**: confirm by hand that a no-persist ping warms the cache for an interactive terminal resume (section 8).
+1. **SA-33** (done): confirmed by hand that a no-persist ping warms the cache for an interactive terminal resume,
+   provided the first ping comes before the terminal's entry expires (section 8).
 2. **SA-34**: let `ClaudeChat` run a one-shot turn with extra arguments, auto-denying tool requests and handing back
    the `init` model and per-request usage (after SA-26, which is changing the same file).
 3. **SA-35**: the scheduler: pings, wall-clock schedule, skip on another writer, retry, sleep, spend cap, cross-window

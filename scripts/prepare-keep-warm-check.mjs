@@ -217,12 +217,14 @@ A session's second request rewrites about 4.5k tokens even when nothing changed.
 Note the time. --model haiku keeps the terminal on the session's model; the cache is per model.
 
 ${rule}
-Step 3. More than an hour later, ping the warm session only
+Step 3. Between 15 and 50 minutes after step 2, ping the warm session only
 ${rule}
-This account's cache lasts 1 hour. Waiting longer than that after step 2 means that, when you come back in step 4,
-only the ping can have put the warm session's conversation in the cache. (No time to wait? See "Quick version".)
+This account's cache lasts 1 hour from its last read. The ping must land while the terminal's entry from step 2 is
+still alive: a ping reads that entry and refreshes its lifetime, but it cannot recreate one that has expired (its
+own entry ends about 1.9k tokens past the terminal's, so the terminal's next request diverges before it). A first
+run of this check pinged after the hour and measured nothing but that. (No time to wait? See "Quick version".)
 
-More than 60 minutes after step 2:
+Note the time of step 2, then ping 15 to 50 minutes after it:
 
      cd $warm
      node $ping --cwd $warm --resume $warmId --say "Keep-alive ping. Reply with only: ok" '--' --no-session-persistence
@@ -232,15 +234,19 @@ purpose: the ping must use the same model and settings as the terminal.
 
 In its output, check:
   - "turn 1: model claude-haiku-..." (the session's model).
-  - The "request ...: input ..., cache read ..., cache write ..." line. After an hour the cache has expired, so
-    expect a small read and a write of nearly the whole context. That write is what step 4 should read.
+  - The "request ...: input ..., cache read ..., cache write ..." line. The terminal's entry is still alive, so
+    expect a cache read of nearly the whole context (the terminal's) and a write of only about 2k tokens (the
+    ping's own tail). A read of 0 means the entry had already expired: start again.
   - "log N lines before" and "log N lines after" show the same N: the ping left the session's log alone.
 
 Do not ping the control session.
 
 ${rule}
-Step 4. Two minutes after the ping, resume both in the terminal and ask one question
+Step 4. More than 60 minutes after step 2, resume both in the terminal and ask one question
 ${rule}
+Wait until more than an hour has passed since step 2 (so the control's entry has expired), but resume warm within
+an hour of the ping. The ping is what keeps warm's entry alive past that hour.
+
      cd $warm
      claude --resume $warmId --model haiku
        type:  Without using any tools, what is the closing word at the end of part-4.txt? Reply with only that word.
@@ -259,8 +265,8 @@ ${rule}
      node $show --cwd $control --id $controlId
 
 The "last:" line of each is step 4's request (entrypoint "cli", the interactive terminal):
-  - warm:    cache read should be nearly the whole context (well over 90%). The -p ping then wrote the same prefix
-             the interactive terminal reads, and keep-warm works for terminal resumes.
+  - warm:    cache read should be nearly the whole context (well over 90%). The ping then kept the terminal's own
+             entry alive past its hour, and keep-warm works for terminal resumes.
   - control: cache read should be small (the shared tool definitions and system prompt at most) and cache write
              nearly the whole context. That is the cold resume the ping saved.
 If warm looks like control, the ping warmed a prefix the terminal does not send (see "If the warm session missed").
@@ -296,7 +302,8 @@ ${rule}
 If you cannot wait an hour: do steps 1 and 2 for warm only, then step 3 straight away, and step 4 two minutes later.
 The evidence is then the ping's own cache read in step 3: the only cache entry it could read the conversation from
 was written by the terminal in step 2, so a read of nearly the whole context means the -p ping sends the same
-prefix as the terminal. Step 4 proves less in this version, because step 2's cache is still warm anyway.
+prefix as the terminal. Step 4 proves less in this version, because step 2's cache is still warm anyway; it does
+not show that a ping keeps an entry alive past its hour.
 `;
 }
 
