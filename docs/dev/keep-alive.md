@@ -271,8 +271,11 @@ itself after a handful of pings. Proposed shape:
 cache. The process runs in the session's project folder, with the user's own settings sources and no `--model`. Abort
 (`stopNow()`) if `init` reports a model other than the log's last main-thread model. Cost per ping comes from
 `turnCost()` (`model_usage_since_last_result`), and its cache read and write from the `assistant` event's `usage`.
-`ClaudeChat` needs one small change for this: a way to append arguments to `chatArgs` (the trial does it through the
-spawner).
+`runOneShot()` in `src/claudeChat.ts` (SA-34) does all of this on `ClaudeChat`'s own process code: it appends
+`ONE_SHOT_ARGS` to `chatArgs` (the `extraArgs` option), declines every permission request at once without a card
+(`declineAll`), stops the run when its `checkInit` refuses the `init` model or its timeout passes, and resolves after
+the process has exited with the turn's cost, model and per-request usage (`TurnReport`, from the `onTurnEnd` option).
+The trial script still rewrites arguments through its spawner.
 
 **Entry points.**
 
