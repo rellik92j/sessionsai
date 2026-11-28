@@ -104,6 +104,17 @@ itself. A transcript closed by the reset while its chat is still replying lets t
 The reset leaves the sidebar's own state (grouping, chips, search box) alone. Scenarios that change that state still put
 it back themselves.
 
+The reset also scrolls the workbench's box around each webview back to the top (`unscrollWebviews`). VS Code lays each
+webview's iframe in a `.webview-overlay-content` box over its view, and that box can scroll by a few pixels (4 in the
+sidebar). `scrollIntoView` in a webview scrolls every scrollable ancestor up through the frames, so it scrolls the box
+too, and the iframe then sits a few pixels above where VS Code put it. From then on, a click into that webview now and
+then reaches the workbench's iframe element instead of the page in it, and is lost: the sidebar's clear button did
+nothing, a right-click on a card opened no menu. `resume`'s card buttons did this once in each run (they centred the
+card with `scrollIntoView`), and every later sidebar scenario ran with the box scrolled, which is why
+`sidebar-search-help` failed in multi-area runs and passed alone (SA-64). So a scenario that needs to scroll in a
+webview sets the scroller's `scrollTop` itself, as `cardButton` in `resume.mjs` does, rather than calling
+`scrollIntoView`. The transcript's own find (F3) still calls it, which the reset puts right before the next scenario.
+
 One side effect to know when writing a scenario: with no preview tab left to reuse, the first transcript a scenario
 opens from the sidebar is a new tab. The workbench focuses a new webview tab before its page has loaded, and that focus
 is lost, so the extension focuses the tab again once its first page has loaded (the page's `pageLoaded` message in
