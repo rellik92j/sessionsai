@@ -4,7 +4,7 @@
 
 import { appendFileSync, mkdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { assert, chatHere, click, events, logPath, logText, logged, modal, openTranscript, send, sidebar, sidebarMenu, tab, transcript, waitEvent, waitFor } from '../harness.mjs';
+import { assert, chatHere, click, events, frameWith, logPath, logText, logged, modal, openTranscript, send, sidebar, sidebarMenu, tab, transcript, waitEvent, waitFor } from '../harness.mjs';
 
 const FIRST_LINE = 'Line 2 of the stand-in reply.';
 const LAST_LINE = 'Line 12 of the stand-in reply. Done.';
@@ -129,6 +129,7 @@ function letGoWhileWaiting({ name, prompt, from, open, choice }) {
 const LIVE_LABEL = 'Live in a terminal · idle';
 const SUBAGENT = 'Review the pull request';
 const SHELL = 'Run the tests in watch mode';
+const LIVE_AGENT = 'ae2e0000000000001';
 
 /**
  * Makes the session look open in a terminal's Claude Code, idle at its prompt, with a background subagent and a
@@ -163,8 +164,8 @@ function goLive(ctx) {
     {
       ...common,
       type: 'user',
-      message: { role: 'user', content: [{ tool_use_id: 'toolu_live_agent', type: 'tool_result', content: 'Async agent launched successfully.\nagentId: ae2e0000000000001' }] },
-      toolUseResult: { isAsync: true, status: 'async_launched', agentId: 'ae2e0000000000001', description: SUBAGENT },
+      message: { role: 'user', content: [{ tool_use_id: 'toolu_live_agent', type: 'tool_result', content: `Async agent launched successfully.\nagentId: ${LIVE_AGENT}` }] },
+      toolUseResult: { isAsync: true, status: 'async_launched', agentId: LIVE_AGENT, description: SUBAGENT },
       uuid: `${ctx.id}-l3`,
       timestamp: at(38),
     },
@@ -181,10 +182,27 @@ function goLive(ctx) {
   writeFileSync(file, JSON.stringify(entry));
   return {
     endSubagent: () => {
-      const note = `<task-notification>\n<task-id>ae2e0000000000001</task-id>\n<tool-use-id>toolu_live_agent</tool-use-id>\n<status>completed</status>\n<summary>Agent "${SUBAGENT}" finished</summary>\n</task-notification>`;
+      const note = `<task-notification>\n<task-id>${LIVE_AGENT}</task-id>\n<tool-use-id>toolu_live_agent</tool-use-id>\n<status>completed</status>\n<summary>Agent "${SUBAGENT}" finished</summary>\n</task-notification>`;
       appendFileSync(logPath(ctx.s, ctx.id), JSON.stringify({ ...common, type: 'user', message: { role: 'user', content: note }, origin: { kind: 'task-notification' }, uuid: `${ctx.id}-l5`, timestamp: new Date().toISOString() }) + '\n');
     },
     exit: () => rmSync(file, { force: true }),
+  };
+}
+
+/** The running subagent's own log, beside the session's, in the layout Claude Code writes, so Open run has a run to open. */
+function liveRunFiles({ id, cwd }) {
+  const side = (n, rec) => JSON.stringify({ isSidechain: true, agentId: LIVE_AGENT, sessionId: id, cwd, uuid: `${LIVE_AGENT}-${n}`, timestamp: new Date(Date.now() - 30_000 + n * 1000).toISOString(), ...rec });
+  const lines = [
+    side(1, { type: 'user', message: { role: 'user', content: 'Review it.' } }),
+    side(2, {
+      type: 'assistant',
+      message: { id: 'msg_e2e_live_run1', type: 'message', role: 'assistant', model: 'claude-stand-in', content: [{ type: 'text', text: 'Read the diff and left two notes so far.' }], usage: { input_tokens: 50, output_tokens: 12 } },
+    }),
+  ];
+  const meta = { agentType: 'reviewer', description: SUBAGENT, toolUseId: 'toolu_live_agent', spawnDepth: 1 };
+  return {
+    [`${id}/subagents/agent-${LIVE_AGENT}.jsonl`]: lines.join('\n') + '\n',
+    [`${id}/subagents/agent-${LIVE_AGENT}.meta.json`]: JSON.stringify(meta),
   };
 }
 
@@ -231,6 +249,42 @@ const LIVE_SCENARIOS = [
         live.exit();
         await waitFor('the notice to go once the process has exited', async () => (await noticeText(ctx)) === '', 20_000);
         await waitFor('the card tag to go once the process has exited', async () => !(await cardLive(ctx)), 20_000);
+      } finally {
+        live.exit();
+      }
+    },
+  },
+  {
+    name: 'live-open-run',
+    prompt: 'E2E live elsewhere, Open run from the notice',
+    async run(ctx) {
+      const live = goLive(ctx);
+      // The subagent has written its own log by now. (`files` is only written for a scenario with a `log` of its own.)
+      const projectDir = path.dirname(logPath(ctx.s, ctx.id));
+      for (const [rel, text] of Object.entries(liveRunFiles({ id: ctx.id, cwd: ctx.s.work }))) {
+        mkdirSync(path.dirname(path.join(projectDir, rel)), { recursive: true });
+        writeFileSync(path.join(projectDir, rel), text);
+      }
+      try {
+        await openTranscript(ctx);
+        await waitFor('the transcript notice to list the subagent and the shell', async () => {
+          const t = await noticeText(ctx);
+          return t.includes(SUBAGENT) && t.includes(SHELL);
+        }, 20_000);
+        // The subagent's row has Open run; the shell's has no button.
+        const rows = await (await transcript(ctx)).$$eval('#live-elsewhere .live-tasks li', (lis) =>
+          lis.map((li) => ({ text: li.textContent || '', open: [...li.querySelectorAll('button')].map((b) => `${b.dataset.cmd}:${b.dataset.arg}:${b.textContent}`) })),
+        );
+        const agentRow = rows.find((r) => r.text.includes(SUBAGENT));
+        const shellRow = rows.find((r) => r.text.includes(SHELL));
+        assert(agentRow && JSON.stringify(agentRow.open) === JSON.stringify([`openSubagent:${LIVE_AGENT}:Open run`]), `the subagent's row should have one Open run: ${JSON.stringify(rows)}`);
+        assert(shellRow && shellRow.open.length === 0, `the shell's row should have no button: ${JSON.stringify(rows)}`);
+        await click(ctx, '#live-elsewhere [data-cmd="openSubagent"]');
+        // The run opens as a transcript of its own log, the same view the block's Open run gives.
+        const run = await frameWith(ctx.page, 'body.subagent-run', 'the subagent run');
+        await waitFor("the run to show the subagent's own log", async () => /Read the diff and left two notes/.test(await run.innerText('.conversation')));
+        assert(!(await run.$('#composer')), 'a run has no message box to send to');
+        assert((await run.textContent('.topbar-actions [data-cmd="openParent"]')).includes('Back to session'), 'the run has a Back to session button');
       } finally {
         live.exit();
       }

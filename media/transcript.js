@@ -77,8 +77,15 @@
     const notice = document.getElementById('live-elsewhere');
     if (!notice) return;
     const html = typeof e.data.html === 'string' ? e.data.html : '';
+    // A run's Open run button that had the keyboard keeps it when the notice is redrawn and the run is still listed.
+    // Clicks need nothing here: the page's one click listener handles [data-cmd] wherever it is.
+    const focused = notice.contains(document.activeElement) ? document.activeElement.dataset?.arg : undefined;
     notice.innerHTML = html;
     notice.hidden = !html;
+    if (focused) {
+      const again = [...notice.querySelectorAll('[data-cmd="openSubagent"]')].find((b) => b.dataset.arg === focused);
+      if (again) again.focus();
+    }
   });
 
   // ---------- message box ----------

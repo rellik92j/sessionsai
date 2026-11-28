@@ -1053,6 +1053,15 @@ body.has-composer .fab { bottom: calc(var(--composer-h, 110px) + 12px); }
 .live-elsewhere .live-tasks li { display: flex; align-items: baseline; gap: 6px; padding: 1px 0; }
 .live-elsewhere .live-tasks .codicon { flex: none; }
 .live-elsewhere .since { color: var(--muted); }
+/* A running subagent's Open run, at the end of its row, in the notice's yellow rather than the block's green. */
+.live-elsewhere .live-tasks .live-open { align-self: center; color: var(--vscode-foreground); }
+.live-elsewhere .live-tasks .live-open .codicon { color: var(--vscode-charts-yellow, #cca700); }
+.live-elsewhere .live-tasks .live-open:hover,
+.live-elsewhere .live-tasks .live-open:focus-visible {
+  background: color-mix(in srgb, var(--vscode-charts-yellow, #cca700) 16%, transparent);
+  border-color: color-mix(in srgb, var(--vscode-charts-yellow, #cca700) 45%, transparent);
+}
+.live-elsewhere .live-tasks .live-open:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
 
 /* The chat bar above the message box: permission mode, what the chat is doing, Stop, End chat. */
 .chat-bar {
