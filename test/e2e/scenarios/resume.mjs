@@ -187,8 +187,13 @@ async function cardButton(ctx, action) {
     `the ${action} button on the card of ${ctx.title}`,
     async () => {
       const side = await sidebar(ctx);
-      // Centred, because a card scrolled to the very top of a long list sits under the sticky group header.
-      await side.$eval(card, (el) => el.scrollIntoView({ block: 'center' }));
+      // Centred, because a card scrolled to the very top of a long list sits under the sticky group header. Only the list
+      // scrolls: scrollIntoView would also scroll the workbench's box around the webview (see unscrollWebviews).
+      await side.$eval(card, (el) => {
+        const list = el.closest('.list');
+        const [r, l] = [el.getBoundingClientRect(), list.getBoundingClientRect()];
+        list.scrollTop += r.top - l.top - (l.height - r.height) / 2;
+      });
       await side.hover(card, { timeout: 3_000 });
       await side.click(`${card} [data-action="${action}"]`, { timeout: 3_000 });
       return true;

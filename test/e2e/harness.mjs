@@ -288,6 +288,7 @@ export async function launch(s) {
  */
 export async function resetWorkbench(page) {
   await page.keyboard.press('Escape').catch(() => undefined);
+  await unscrollWebviews(page);
   const editors = page.locator('.part.editor .tabs-container .tab');
   const groups = page.locator('.part.editor .editor-group-container');
   if ((await editors.count()) === 0 && (await groups.count()) <= 1) return;
@@ -301,6 +302,33 @@ export async function resetWorkbench(page) {
   await waitFor('every editor and editor group to close', async () => (await editors.count()) === 0 && (await groups.count()) <= 1, 10_000);
   // Closing a terminal can still leave the window with focus nowhere; a click on the empty editor area gives it back.
   if (!(await page.evaluate(() => document.hasFocus()))) await page.locator('.part.editor').click();
+}
+
+/**
+ * Scrolls the workbench's box around each webview back to the top, and returns how many were scrolled.
+ *
+ * VS Code draws a webview as an iframe in a `.webview-overlay-content` box laid over its view. The iframe is inline, so
+ * the box can scroll by a few pixels (4 in the sidebar), and a `scrollIntoView` in the webview, which scrolls every
+ * scrollable ancestor up through the frames, scrolls it. The iframe then sits a few pixels above where VS Code put it,
+ * and from then on a click into that webview now and then reaches the workbench's iframe element instead of the page in
+ * it: the click is lost, and so is a right-click that should open the sidebar's menu (SA-64). `resume`'s card buttons
+ * did it (they centred the card with scrollIntoView), and the transcript's own find (F3) still does it to the transcript's
+ * box. Run before each scenario, so one scenario's scroll cannot break the next one's clicks.
+ */
+export async function unscrollWebviews(page) {
+  return page
+    .evaluate(() => {
+      let n = 0;
+      for (const box of document.querySelectorAll('.webview-overlay-content')) {
+        if (box.scrollTop || box.scrollLeft) {
+          box.scrollTop = 0;
+          box.scrollLeft = 0;
+          n++;
+        }
+      }
+      return n;
+    })
+    .catch(() => 0);
 }
 
 // ---------- what scenarios use ----------
