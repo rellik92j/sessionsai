@@ -1,8 +1,9 @@
 # Keeping a session's prompt cache warm
 
 Proposal for SA-29: let the user keep a Claude Code session's prompt cache from expiring for a set time, so that
-resuming it later reads the conversation from the cache instead of writing all of it again. Nothing here ships in the
-extension yet; the build is split into the follow-up items listed in section 9.
+resuming it later reads the conversation from the cache instead of writing all of it again. The scheduler is built
+(`src/keepWarm.ts`, SA-35), but nothing in the extension starts it yet; the rest of the build is split into the
+follow-up items listed in section 9.
 
 **Tested against:** Claude Code `2.1.332`, the native `claude.exe` on Windows 11, Node 24, on 2026-11-25. Every run
 used throwaway sessions in a scratch folder, the `haiku` model (`claude-haiku-5-5`), and `--setting-sources project`.
@@ -20,8 +21,8 @@ Record shapes below are real, with synthetic text. Ids and paths are placeholder
   On a 52k-token session it read 51,969 tokens from the cache and wrote 469, for $0.0006.
 - **This account's sessions use the 1-hour cache.** Every cache write in the trial was `ephemeral_1h`. On the 1-hour
   TTL a ping is needed only every ~50 minutes, and keeping a session warm costs less than one cold resume for well
-  over a day. On the 5-minute TTL, which other accounts get, a ping is needed every ~4 minutes and keeping warm
-  stops paying for itself after 45 minutes (Haiku) to about 1.5 hours (Opus, Sonnet) (section 4). An hour-long run
+  over a day. On the 5-minute TTL, which other accounts get, a ping is needed every 3.5 minutes and keeping warm
+  stops paying for itself after under half an hour (Haiku) to about 1 h 15 min (Opus, Sonnet) (section 4). An hour-long run
 confirmed it: a session pinged once at 32 minutes was read whole from the cache at 64 minutes, while one left alone
 had to write 73k tokens again (section 5).
 - **The ping must not change the request's prefix.** The model, tool set and settings sources must match the session.
@@ -126,21 +127,32 @@ Measured, on haiku: a no-persist ping on the 52k session cost **$0.00053 to $0.0
 would cost 52k × ($0.20 − $0.01)/M = **$0.0099** extra. The hour-long check in section 5 measured a cold resume
 directly: $0.0147 on an 89k session, against $0.0006 for a warm one.
 
-Computed from `src/prices.json`, with a ping every 50 minutes on the 1-hour TTL and every 4 minutes on the 5-minute
-TTL:
+**The built ping writes about 1.9k tokens every time.** Its text differs on every ping (section 8's open point), so
+each one reads the conversation from the terminal's own cache entry and writes the `-p` tail and its message again:
+1,924 tokens in SA-33, `PING_WRITE_TOKENS` in `src/keepWarm.ts`. That adds 1,924 × w to each ping: $0.0154 on Opus
+5.5 at the 1-hour write price, $0.0019 on Haiku 5.5 above 100k, whatever the context size. `estimateKeepWarm()`
+counts it.
 
-| Model | Context | Ping | Cold resume extra (1 h TTL) | Cold resume extra (5 min TTL) |
-|---|---|---|---|---|
-| Opus 5.5 | 50k | $0.010 | $0.39 | $0.24 |
-| Opus 5.5 | 200k | $0.040 | $1.56 | $0.96 |
-| Opus 5.5 | 500k | $0.100 | $3.90 | $2.40 |
-| Sonnet 5.5 | 200k | $0.020 | $0.78 | $0.48 |
-| Haiku 5.5 | 50k | $0.0005 | $0.0095 | $0.0058 |
+Computed from `src/prices.json` by `estimateKeepWarm()`, with a ping every 50 minutes on the 1-hour TTL and every 3.5
+minutes on the 5-minute TTL (section 6), each writing 1,924 tokens:
 
-| Model | Break-even, 1 h TTL | Break-even, 5 min TTL |
-|---|---|---|
-| Opus 5.5, Sonnet 5.5 (read = 5% of input, 1 h write = 200%) | 39 pings, about **32 hours** | 24 pings, about **1 h 36 min** |
-| Haiku 5.5 (read = 10% of input) | 19 pings, about **16 hours** | 11.5 pings, about **46 min** |
+| Model | Context | Ping (1 h TTL) | Ping (5 min TTL) | Cold resume extra (1 h TTL) | Cold resume extra (5 min TTL) |
+|---|---|---|---|---|---|
+| Opus 5.5 | 50k | $0.026 | $0.020 | $0.39 | $0.24 |
+| Opus 5.5 | 200k | $0.056 | $0.050 | $1.56 | $0.96 |
+| Opus 5.5 | 500k | $0.116 | $0.110 | $3.90 | $2.40 |
+| Sonnet 5.5 | 200k | $0.028 | $0.025 | $0.78 | $0.48 |
+| Haiku 5.5 | 50k | $0.0009 | $0.0007 | $0.0095 | $0.0057 |
+
+| Model | Context | Break-even, 1 h TTL | Break-even, 5 min TTL |
+|---|---|---|---|
+| Opus 5.5 | 50k | 15 pings, about **12.5 hours** | 12 pings, about **43 min** |
+| Opus 5.5, Sonnet 5.5 | 200k | 28 pings, about **23 hours** | 19 pings, about **1 h 8 min** |
+| Opus 5.5 | 500k | 34 pings, about **28 hours** | 22 pings, about **1 h 17 min** |
+| Haiku 5.5 | 50k | 11 pings, about **9 hours** | 8 pings, about **27 min** |
+
+Before the fixed write, a ping cost N × r alone, and break-even was a flat (w − r) / r pings: 39 on Opus and Sonnet
+and 19 on Haiku at the 1-hour TTL. The write matters most on small sessions, where it is a large share of the ping.
 
 So on the 1-hour TTL, keeping a session warm through lunch or overnight is clearly cheaper than a cold resume, as
 long as the user does come back to it. On the 5-minute TTL it pays for gaps up to one or two hours, and the UI should
@@ -171,8 +183,12 @@ then grew by 11 lines with the real turn.
 ## 6. Timing, failures and sleep
 
 - **Interval.** Ping when the cache has a margin left: at TTL − 10 minutes on the 1-hour TTL (every 50 minutes), and
-  at TTL − 60 seconds on the 5-minute TTL (every 4 minutes). The TTL comes from the log's last cache write, as
+  at TTL − 90 seconds on the 5-minute TTL (every 3.5 minutes). The TTL comes from the log's last cache write, as
   `usage.ts` already works out. A ping takes 1 to 2 seconds, including process start.
+- **Too close to the expiry.** A ping is not started with under a minute left (`MIN_LEFT_MS`): claude.exe's start-up
+  (MCP servers, Windows) could take its request past the expiry, and a late ping pays the full write. The 5-minute
+  margin is 90 seconds rather than 60 for this reason, plus the 4-second claim below; it leaves no room for a retry or
+  a skipped ping on that TTL, so those stop as expired. SA-72's run measures the real spawn-to-request time.
 - **Schedule from the wall clock.** Each tick computes the next ping from `max(last logged request, last ping)` and
   `Date.now()`, rather than counting `setTimeout`s, so drift does not add up and a real turn in a terminal (which
   refreshes the cache by itself) pushes the next ping back.
@@ -187,8 +203,14 @@ then grew by 11 lines with the real turn.
 - **One process per ping, not a long-lived one.** A fresh `--resume` reads the current log each time, so if the user
   has added turns elsewhere in the meantime, the ping warms the new prefix. A long-lived no-persist process would
   keep pinging the conversation as it was when it started.
-- **Two VS Code windows** could both keep one session warm. The scheduler should record its pings in `globalState`
-  (session id, window, last ping time) and skip a ping another window has just made.
+- **Two VS Code windows** could both keep one session warm. They compute the same due time from the same log, and
+  `globalState` reaches the other window late, so a claim read back at once would show each window only its own. So
+  a window that is due writes a claim (its window id and the claim time) into the session's record in `globalState`,
+  waits 2 seconds, reads the claims again, and does that once more: an earlier claim from another window, by claim
+  time and then window id, makes it back off and count that window's ping as its own. A claim that another window's
+  write has overwritten is written again after the first wait, so after the second both windows see both claims.
+  Each ping therefore starts 4 seconds after it is due. The record also keeps the last ping (window and time), which
+  every window reads.
 
 ## 7. Conflicts with other writers
 
@@ -257,6 +279,14 @@ Two ways out: vary the ping text so each ping falls back to the terminal's break
 (pings at 0, 50 and 100 minutes, a terminal resume at about 110). The scheduler (SA-35) must settle this before it
 relies on repeated pings.
 
+**Decided in SA-35 (user, in chat): vary the text, and measure it as well.** Each ping says
+`Keep-alive ping <n> at <ISO time>. Reply with only: ok` (`pingText()` in `src/keepWarm.ts`), so the request diverges
+from every earlier ping's right after the conversation, and its read should fall back to, and refresh, the terminal's
+own entry. The cost is the ~1.9k tail written on every ping (section 4). The timed check is SA-72, run by hand:
+`node scripts/prepare-keep-warm-check.mjs --check sa72` writes its folder and README, and
+[`scripts/keep-session-warm.mjs`](../../scripts/keep-session-warm.mjs) sends its pings through the built module
+(`out/keepWarm.js`), not the trial script. Its result goes here when it is in.
+
 The build should also report this live: after a kept-warm session's next real turn, compare its cache read with the
 context size and say "Kept warm: the next turn read 198k of 200k tokens from the cache", or that it did not.
 
@@ -266,8 +296,8 @@ context size and say "Kept warm: the next turn read 198k of 200k tokens from the
 itself after a handful of pings. Proposed shape:
 
 **The ping.** Spawn through `ClaudeChat` with the chat's command line plus `--no-session-persistence --max-turns 1
---permission-mode dontAsk`, send the fixed text `Keep-alive ping. Reply with only: ok`, wait for the `result`, then
-`end()`. `dontAsk` denies any tool call without asking, and `--max-turns 1` stops a tool loop; neither changed the
+--permission-mode dontAsk`, send a text that differs on every ping (`Keep-alive ping <n> at <time>. Reply with only:
+ok`, section 8), wait for the `result`, then `end()`. `dontAsk` denies any tool call without asking, and `--max-turns 1` stops a tool loop; neither changed the
 cache. The process runs in the session's project folder, with the user's own settings sources and no `--model`. Abort
 (`stopNow()`) if `init` reports a model other than the log's last main-thread model. Cost per ping comes from
 `turnCost()` (`model_usage_since_last_result`), and its cache read and write from the `assistant` event's `usage`.
@@ -276,6 +306,20 @@ cache. The process runs in the session's project folder, with the user's own set
 (`declineAll`), stops the run when its `checkInit` refuses the `init` model or its timeout passes, and resolves after
 the process has exited with the turn's cost, model and per-request usage (`TurnReport`, from the `onTurnEnd` option).
 The trial script still rewrites arguments through its spawner.
+
+**The scheduler** is `KeepWarm` in `src/keepWarm.ts` (SA-35), with no VS Code imports, so `test/keepWarm.test.js`
+drives it with a fake clock, a fake `globalState` and a fake `claude`. Each tick reads the session again and decides
+from the wall clock: stop (the chosen duration, the spend cap, an expiry, a sleep past the expiry), wait, skip (the
+log written in the last `RECENT_WRITE_MS`, or the caller's `busy` reason: the in-view chat replying, a terminal
+open, another window's claim), or claim and ping. A failed ping is retried once after 30 seconds. Claims and pings
+are recorded in `globalState` under `keepWarm.pings` (section 6), and another window's ping counts as this window's
+own. Each ping's cost, cache
+read and write, `init` model and `init.permissionMode` are kept and logged: the last one shows whether the appended
+`--permission-mode dontAsk` wins over the one `chatArgs` gives (PR #108 review). The real CLI's answer is not
+recorded yet; SA-72's README asks for it. `get()` gives the effective expiry (`max(last request, last ping) + TTL`) for the timers,
+`estimateKeepWarm()` the per-ping and cold-resume costs, and `observe()` reports whether the next real turn read its
+context from the cache. It refuses to start on a cache that has already expired. The spend cap is a start option
+(default $1.00); the `claudeSessions.keepWarm.spendCapUsd` setting that feeds it comes with the UI (SA-36).
 
 **Entry points.**
 
@@ -306,11 +350,13 @@ The entry points above should be hidden for those sources.
 
 1. **SA-33** (done): confirmed by hand that a no-persist ping warms the cache for an interactive terminal resume,
    provided the first ping comes before the terminal's entry expires (section 8).
-2. **SA-34**: let `ClaudeChat` run a one-shot turn with extra arguments, auto-denying tool requests and handing back
-   the `init` model and per-request usage (after SA-26, which is changing the same file).
+2. **SA-34** (done): let `ClaudeChat` run a one-shot turn with extra arguments, auto-denying tool requests and handing
+   back the `init` model and per-request usage.
 3. **SA-35**: the scheduler: pings, wall-clock schedule, skip on another writer, retry, sleep, spend cap, cross-window
    coordination, effective expiry and cost estimates, all unit-tested with a fake clock.
-4. **SA-36**: the UI on every entry point in the table above, and the two settings.
+4. **SA-72**: the timed check by hand that repeated pings keep a terminal's entry alive past two hours (section 8).
+5. **SA-36**: the transcript's tile, timer and ⌄ menu entry, and the spend-cap setting.
+6. **SA-71**: the sidebar, command palette and status bar, and the default-duration setting.
 
 ## 10. Trial spend
 
