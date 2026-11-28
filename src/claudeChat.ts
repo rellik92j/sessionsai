@@ -181,6 +181,43 @@ export function turnCost(result: unknown): number | undefined {
   return any ? sum : undefined;
 }
 
+/** One API request's token counts, from the `usage` on its `assistant` events (keep-alive doc section 2). */
+export interface RequestUsage {
+  /** The API message id: one request may send several `assistant` events (one per content block). */
+  messageId?: string;
+  model?: string;
+  /** Prompt tokens sent uncached. */
+  input: number;
+  /** Prompt tokens read from the cache. */
+  cacheRead: number;
+  /** Prompt tokens written to the cache, and how many of them on each TTL. */
+  cacheWrite: number;
+  cacheWrite5m: number;
+  cacheWrite1h: number;
+  output: number;
+}
+
+/** The usage of an `assistant` event's message, or undefined when it carries none. Missing or odd counts read as 0. */
+export function requestUsage(message: unknown): RequestUsage | undefined {
+  const m = obj(message);
+  const u = obj(m?.usage);
+  if (!u) {
+    return undefined;
+  }
+  const n = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0);
+  const split = obj(u.cache_creation);
+  return {
+    messageId: str(m?.id),
+    model: str(m?.model),
+    input: n(u.input_tokens),
+    cacheRead: n(u.cache_read_input_tokens),
+    cacheWrite: n(u.cache_creation_input_tokens),
+    cacheWrite5m: n(split?.ephemeral_5m_input_tokens),
+    cacheWrite1h: n(split?.ephemeral_1h_input_tokens),
+    output: n(u.output_tokens),
+  };
+}
+
 /** What a failed turn's `result` says went wrong: its `errors`, else its `result` text. */
 export function resultError(result: Record<string, unknown>): string {
   const errors = Array.isArray(result.errors) ? result.errors.filter((e): e is string => typeof e === 'string' && !!e.trim()) : [];
@@ -345,6 +382,8 @@ export interface ApplyResult {
   reply?: string;
   turnEnd?: TurnEnd;
   init?: { permissionMode?: string; model?: string };
+  /** A main-thread `assistant` event's usage: what that API request read from and wrote to the prompt cache. */
+  request?: RequestUsage;
   /** The live pieces changed. */
   changed: boolean;
 }
@@ -390,6 +429,11 @@ export class LiveChat {
    * decline-prompts mode, or a chat that has ended (nobody is left to answer, and the turn must not hang).
    */
   decline?: string;
+  /**
+   * Like `decline`, but fixed for the chat's whole life, whatever the mode does: a one-shot run (a keep-warm ping) that
+   * nobody watches, so no request may ever raise a card.
+   */
+  declineAlways?: string;
 
   /** The cards still waiting for an answer, oldest first. Only the first can be answered: requests go in order. */
   pendingPermissions(): PermissionPiece[] {
@@ -502,7 +546,7 @@ export class LiveChat {
       case 'stream_event':
         return { changed: this.streamEvent(obj(ev.event), str(ev.api_message_id)) };
       case 'assistant':
-        return { changed: this.assistant(ev) };
+        return { changed: this.assistant(ev), request: requestUsage(ev.message) };
       case 'user':
         return { changed: this.user(ev) };
       case 'result':
@@ -655,6 +699,10 @@ export class LiveChat {
     // Every request is answered, or the turn hangs (doc section 6): by the user on a card, or at once when declining.
     const name = str(request.tool_name) ?? 'a tool';
     const toolUseId = str(request.tool_use_id);
+    if (this.declineAlways !== undefined) {
+      const changed = this.denied(toolUseId, name, undefined, 'oneShot');
+      return { changed, reply: denyLine(requestId, this.declineAlways) };
+    }
     if (this.decline !== undefined) {
       const changed = this.denied(toolUseId, name, undefined, this.decline === DENY_MESSAGE ? 'mode' : 'ended');
       return { changed, reply: denyLine(requestId, this.decline) };
@@ -680,7 +728,7 @@ export class LiveChat {
   }
 
   /** Marks a tool call declined, and says so; the log records it only as a failed tool result. */
-  private denied(toolUseId: string | undefined, name: string | undefined, reason: string | undefined, by: 'mode' | 'ended' | 'cli' = 'cli'): boolean {
+  private denied(toolUseId: string | undefined, name: string | undefined, reason: string | undefined, by: 'mode' | 'ended' | 'oneShot' | 'cli' = 'cli'): boolean {
     const tool = toolUseId ? this.pieces.find((p) => p.kind === 'tool' && p.toolUseId === toolUseId) : undefined;
     if (tool && tool.kind === 'tool') {
       tool.status = 'denied';
@@ -691,7 +739,9 @@ export class LiveChat {
         ? `Declined ${what}: the chat is set to decline what needs approval. Pick "Ask me" in the permission mode to approve it here.`
         : by === 'ended'
           ? `Declined ${what}: the chat was ended, so nobody was there to approve it.`
-          : `Declined ${what}: it needs approval.${reason ? ` (${reason})` : ''}`;
+          : by === 'oneShot'
+            ? `Declined ${what}: this run takes no tool calls.`
+            : `Declined ${what}: it needs approval.${reason ? ` (${reason})` : ''}`;
     this.pieces.push({ kind: 'notice', id: this.nextId++, text, tone: 'info', expire: true });
     return true;
   }
@@ -794,6 +844,28 @@ export interface ChatOptions {
   onUnsent: (texts: string[]) => void;
   /** Diagnostics: stderr, spawns and exits. */
   log: (line: string) => void;
+  /**
+   * Appended to chatArgs on every start, e.g. a keep-warm ping's `--no-session-persistence --max-turns 1`. The CLI
+   * takes the last of a repeated option, so a `--permission-mode` here overrides the one chatArgs gives.
+   */
+  extraArgs?: string[];
+  /**
+   * Every permission request is declined at once with this message, whatever the mode: no card is ever shown. For a
+   * run nobody watches (a keep-warm ping).
+   */
+  declineAll?: string;
+  /** A process reported its `init`: the model it runs on, so a caller can stopNow() a run on the wrong one. */
+  onInit?: (init: { permissionMode?: string; model?: string }) => void;
+  /** A turn ended: its result, the model `init` reported, and the usage of each API request it made. */
+  onTurnEnd?: (turn: TurnReport) => void;
+}
+
+/** One finished turn, for onTurnEnd. */
+export interface TurnReport extends TurnEnd {
+  /** The model the process's `init` reported. */
+  model?: string;
+  /** Each main-thread API request of the turn, in order, with its latest usage. */
+  requests: RequestUsage[];
 }
 
 export interface ChatStatus {
@@ -888,11 +960,16 @@ export class ClaudeChat implements SessionChat {
   private picked: PermissionMode;
   /** The --permission-mode the running process was started with. */
   private runningCliMode?: string;
+  /** The model the running process's `init` reported. */
+  private initModel?: string;
+  /** The running turn's API requests by message id, for onTurnEnd. */
+  private requests = new Map<string, RequestUsage>();
 
   constructor(private readonly opts: ChatOptions) {
     this.mode = opts.mode;
     this.picked = opts.mode;
     this.live.decline = opts.mode === 'deny' ? DENY_MESSAGE : undefined;
+    this.live.declineAlways = opts.declineAll;
   }
 
   get status(): ChatStatus {
@@ -1111,6 +1188,7 @@ export class ClaudeChat implements SessionChat {
     this.busy = true;
     this.inFlight = text;
     this.heard = false;
+    this.requests = new Map();
     this.live.markSent();
     this.write(userLine(text));
     this.opts.onChange();
@@ -1123,7 +1201,7 @@ export class ClaudeChat implements SessionChat {
       return false;
     }
     this.backToPicked();
-    const args = chatArgs(this.opts.sessionId, this.mode);
+    const args = [...chatArgs(this.opts.sessionId, this.mode), ...(this.opts.extraArgs ?? [])];
     this.opts.log(`Starting: ${where.exe} ${args.join(' ')}${where.cwd ? ` (in ${where.cwd})` : ''}`);
     let child: ChatChild;
     try {
@@ -1135,6 +1213,7 @@ export class ClaudeChat implements SessionChat {
     }
     this.child = child;
     this.runningCliMode = cliPermissionMode(this.mode);
+    this.initModel = undefined;
     this.stdout = '';
     this.stderrTail = [];
     child.stdin?.on('error', (err) => this.opts.log(`stdin: ${err.message}`));
@@ -1230,8 +1309,16 @@ export class ClaudeChat implements SessionChat {
       }
       const r = this.live.apply(ev);
       changed ||= r.changed;
+      if (r.init) {
+        this.initModel = r.init.model ?? this.initModel;
+        this.opts.onInit?.(r.init);
+      }
       if (r.init?.permissionMode && this.followCliMode(r.init.permissionMode)) {
         changed = true;
+      }
+      if (r.request) {
+        // One request sends an `assistant` event per content block; the last one's usage is the request's.
+        this.requests.set(r.request.messageId ?? `request-${this.requests.size}`, r.request);
       }
       if (r.reply) {
         this.write(r.reply);
@@ -1250,6 +1337,9 @@ export class ClaudeChat implements SessionChat {
     this.busy = false;
     this.inFlight = undefined;
     this.lastTurn = { cost: end.cost, durationMs: end.durationMs, error: end.isError || undefined, interrupted: end.interrupted || undefined };
+    const requests = [...this.requests.values()];
+    this.requests = new Map();
+    this.opts.onTurnEnd?.({ ...end, model: this.initModel, requests });
     // An ended chat's last turn is in: now its stdin closes.
     this.letGo?.();
     if (this.restartAfterTurn) {
@@ -1326,4 +1416,102 @@ export class ClaudeChat implements SessionChat {
     this.opts.onChange();
     return this.closing;
   }
+}
+
+// ---------- a one-shot turn: the keep-warm ping ----------
+
+/**
+ * What a keep-warm ping adds to chatArgs (keep-alive doc section 9): the turn leaves the session's log alone, a tool
+ * loop stops after one request, and Claude Code denies any tool call itself without asking.
+ */
+export const ONE_SHOT_ARGS: readonly string[] = ['--no-session-persistence', '--max-turns', '1', '--permission-mode', 'dontAsk'];
+
+/** What a one-shot run answers a permission request with, should one still come. */
+export const ONE_SHOT_DENY_MESSAGE = 'Not approved: this run takes no tool calls. Reply in text only.';
+
+export interface OneShotOptions {
+  sessionId: string;
+  launch: ChatOptions['launch'];
+  spawn: Spawner;
+  log: (line: string) => void;
+  /** The one user turn. */
+  text: string;
+  /** Appended to chatArgs; ONE_SHOT_ARGS when not given. */
+  extraArgs?: readonly string[];
+  /** Asked when `init` arrives: a reason to stop the run (the model is not the session's), or undefined to go on. */
+  checkInit?: (init: { permissionMode?: string; model?: string }) => string | undefined;
+  /** Stops the run when no `result` has come by then. */
+  timeoutMs?: number;
+}
+
+/** How a one-shot run went. Its process has exited by the time this is known. */
+export type OneShotResult =
+  | { ok: true; turn: TurnReport }
+  | {
+      ok: false;
+      error: string;
+      /** The turn, when it ended with an error or was stopped. */
+      turn?: TurnReport;
+      /** The model `init` reported, when it came. */
+      model?: string;
+    };
+
+/**
+ * Runs one turn in its own ClaudeChat and ends it: the same process code as the chat, with `extraArgs` on the command
+ * line and every permission request declined at once, since nobody is there to answer a card. Resolves once the
+ * process has exited, with the turn's model and per-request usage, or with why there was none: the CLI would not
+ * start or exited early, checkInit refused the run, the timeout passed, or the turn failed.
+ */
+export function runOneShot(o: OneShotOptions): Promise<OneShotResult> {
+  if (!o.text.trim()) {
+    return Promise.resolve({ ok: false, error: 'Nothing to send.' });
+  }
+  return new Promise<OneShotResult>((resolve) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let model: string | undefined;
+    const lastError = (): string | undefined => {
+      const notes = chat.live.pieces.filter((p): p is Extract<LivePiece, { kind: 'notice' }> => p.kind === 'notice' && p.tone === 'error');
+      return notes[notes.length - 1]?.text;
+    };
+    const finish = (r: OneShotResult, stop = false): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      void (stop ? chat.stopNow() : chat.end()).then(() => resolve(r));
+    };
+    const chat: ClaudeChat = new ClaudeChat({
+      sessionId: o.sessionId,
+      launch: o.launch,
+      // Overridden by the --permission-mode in extraArgs when it has one; declineAll answers any request either way.
+      mode: 'deny',
+      spawn: o.spawn,
+      log: o.log,
+      extraArgs: [...(o.extraArgs ?? ONE_SHOT_ARGS)],
+      declineAll: ONE_SHOT_DENY_MESSAGE,
+      onUnsent: () => undefined,
+      onChange: () => {
+        // Nothing running and no result: the CLI would not start, or exited before the turn ended.
+        if (!settled && !chat.active) {
+          finish({ ok: false, error: lastError() ?? 'Claude Code exited before the turn ended.', model });
+        }
+      },
+      onInit: (init) => {
+        model = init.model ?? model;
+        const why = o.checkInit?.(init);
+        if (why) {
+          finish({ ok: false, error: why, model }, true);
+        }
+      },
+      onTurnEnd: (turn) =>
+        finish(turn.isError || turn.interrupted ? { ok: false, error: turn.error ?? 'The turn was stopped.', turn, model: turn.model } : { ok: true, turn }),
+    });
+    if (o.timeoutMs !== undefined) {
+      const ms = o.timeoutMs;
+      timer = setTimeout(() => finish({ ok: false, error: `No reply within ${Math.round(ms / 1000)}s.`, model }, true), ms);
+    }
+    chat.send(o.text);
+  });
 }

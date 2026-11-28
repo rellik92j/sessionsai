@@ -12,8 +12,12 @@ const {
   denyLine,
   ENDED_DENY_MESSAGE,
   LiveChat,
+  ONE_SHOT_ARGS,
+  ONE_SHOT_DENY_MESSAGE,
   PLAN_DENY_MESSAGE,
   pickerMode,
+  requestUsage,
+  runOneShot,
   sessionGrants,
   STOP_DENY_MESSAGE,
   USER_DENY_MESSAGE,
@@ -1043,4 +1047,223 @@ test('a card shows what the call does: the command, the file and its content or 
   assert.match(permissionDetail('mcp__thing__do', { target: 'x', count: 2 }), /&quot;target&quot;: &quot;x&quot;/);
   assert.equal(permissionDetail('Mystery', {}), '');
   assert.doesNotThrow(() => permissionDetail('Edit', { file_path: 3, old_string: null }));
+});
+
+// ---------- one-shot runs: the keep-warm ping (SA-34, keep-alive doc section 9) ----------
+
+const pingFixture = fs
+  .readFileSync(path.join(__dirname, 'fixtures', 'claude-stream', 'ping.jsonl'), 'utf8')
+  .split('\n')
+  .filter(Boolean)
+  .map((l) => JSON.parse(l));
+
+const pingUsage = {
+  messageId: 'msg_P',
+  model: 'claude-haiku-test',
+  input: 2,
+  cacheRead: 51969,
+  cacheWrite: 469,
+  cacheWrite5m: 0,
+  cacheWrite1h: 469,
+  output: 4,
+};
+
+test("a request's usage: cache read and write with the TTL split; unknown fields skipped, odd counts read as 0", () => {
+  const asst = pingFixture.find((e) => e.type === 'assistant');
+  assert.deepEqual(requestUsage(asst.message), pingUsage);
+  assert.deepEqual(new LiveChat().apply(asst).request, pingUsage, 'apply hands the usage back with the event');
+  assert.equal(requestUsage({ id: 'msg_X', content: [] }), undefined, 'no usage, no request');
+  for (const bad of [undefined, null, 'x', 3, [], { usage: 'x' }, { usage: [] }]) {
+    assert.equal(requestUsage(bad), undefined);
+  }
+  assert.deepEqual(requestUsage({ usage: { input_tokens: '5', cache_read_input_tokens: -1, cache_creation_input_tokens: NaN, cache_creation: 'x', output_tokens: 3 } }), {
+    messageId: undefined,
+    model: undefined,
+    input: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    cacheWrite5m: 0,
+    cacheWrite1h: 0,
+    output: 3,
+  });
+  // The existing turn fixture's assistant events, which carry only input and output, still parse.
+  assert.deepEqual(
+    fixture.filter((e) => e.type === 'assistant' && !e.parent_tool_use_id).map((e) => requestUsage(e.message)?.output),
+    [6, 30, undefined, undefined],
+  );
+});
+
+test('extra arguments go after chatArgs; declineAll answers every request at once, in any mode, and never shows a card', async () => {
+  const turns = [];
+  const inits = [];
+  const { chat, spawns } = makeChat({
+    mode: 'ask',
+    extraArgs: ['--no-session-persistence', '--permission-mode', 'dontAsk'],
+    declineAll: 'no tools here',
+    onInit: (i) => inits.push(i),
+    onTurnEnd: (t) => turns.push(t),
+  });
+  chat.send('ping');
+  await tick();
+  const { child, args } = spawns[0];
+  assert.deepEqual(args, [...chatArgs('sess-0001', 'ask'), '--no-session-persistence', '--permission-mode', 'dontAsk']);
+
+  child.say({ type: 'system', subtype: 'init', model: 'claude-haiku-test', permissionMode: 'dontAsk' });
+  assert.deepEqual(inits, [{ permissionMode: 'dontAsk', model: 'claude-haiku-test' }]);
+  child.say({ type: 'control_request', request_id: 'r-1', request: { subtype: 'can_use_tool', tool_name: 'Bash', input: { command: 'ls' }, tool_use_id: 'toolu_1' } });
+  assert.deepEqual(child.controls(), [JSON.parse(denyLine('r-1', 'no tools here'))]);
+  // In "Ask me" this would be a card; the plan too is declined.
+  child.say({ type: 'control_request', request_id: 'r-2', request: { subtype: 'can_use_tool', tool_name: 'ExitPlanMode', input: {} } });
+  assert.deepEqual(child.controls().at(-1), JSON.parse(denyLine('r-2', 'no tools here')));
+  assert.ok(!chat.live.pieces.some((p) => p.kind === 'permission'), 'no card');
+  assert.equal(chat.status.awaiting, undefined);
+  assert.match(renderLive(chat.live.pieces, true), /Declined Bash: this run takes no tool calls/);
+
+  // Two requests: one sends an event per content block (the last usage wins), and one with no usage is left out.
+  child.say(
+    { type: 'assistant', message: { id: 'msg_1', model: 'm', content: [{ type: 'text', text: 'a' }], usage: { input_tokens: 1, cache_read_input_tokens: 10, output_tokens: 1 } } },
+    { type: 'assistant', message: { id: 'msg_1', model: 'm', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Bash', input: {} }], usage: { input_tokens: 1, cache_read_input_tokens: 10, output_tokens: 9 } } },
+    { type: 'assistant', parent_tool_use_id: 'toolu_T', message: { id: 'msg_sub', usage: { input_tokens: 99 } } },
+    { type: 'assistant', message: { id: 'msg_2', content: [] } },
+    { type: 'assistant', message: { id: 'msg_3', model: 'm', content: [{ type: 'text', text: 'b' }], usage: { cache_creation_input_tokens: 5, output_tokens: 2 } } },
+    result(),
+  );
+  await tick();
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0].model, 'claude-haiku-test');
+  assert.equal(turns[0].cost, 0.01);
+  assert.deepEqual(
+    turns[0].requests.map((r) => [r.messageId, r.cacheRead, r.cacheWrite, r.output]),
+    [
+      ['msg_1', 10, 0, 9],
+      ['msg_3', 0, 5, 2],
+    ],
+    "a subagent's requests are not the turn's",
+  );
+
+  // The next turn starts its own list; the model stays the process's.
+  chat.send('again');
+  await tick();
+  child.say(result());
+  await tick();
+  assert.deepEqual(turns[1].requests, []);
+  assert.equal(turns[1].model, 'claude-haiku-test');
+});
+
+test('without the new options the chat is as before: no extra arguments, and "Ask me" still shows a card', async () => {
+  const { chat, spawns } = makeChat();
+  chat.send('hi');
+  await tick();
+  assert.deepEqual(spawns[0].args, chatArgs('sess-0001', 'ask'));
+  spawns[0].child.say({ type: 'control_request', request_id: 'r-1', request: { subtype: 'can_use_tool', tool_name: 'Bash', input: {} } });
+  assert.equal(chat.status.awaiting, 1);
+  assert.deepEqual(spawns[0].child.controls(), []);
+});
+
+function oneShot(overrides = {}) {
+  const { spawns, spawn } = fakeSpawner();
+  const logs = [];
+  const done = runOneShot({
+    sessionId: 'sess-0001',
+    launch: () => ({ exe: '/bin/claude', cwd: '/work/demo' }),
+    spawn,
+    log: (l) => logs.push(l),
+    text: 'Keep-alive ping. Reply with only: ok',
+    ...overrides,
+  });
+  return { spawns, logs, done };
+}
+
+test('a one-shot ping: chatArgs plus the no-persist arguments, one turn, then the process ends; model and usage come back', async () => {
+  const { spawns, done } = oneShot();
+  await tick();
+  assert.equal(spawns.length, 1);
+  const { child, args, cwd } = spawns[0];
+  assert.equal(cwd, '/work/demo');
+  assert.deepEqual(args.slice(-ONE_SHOT_ARGS.length), [...ONE_SHOT_ARGS]);
+  assert.deepEqual(args.slice(0, -ONE_SHOT_ARGS.length), chatArgs('sess-0001', 'deny'));
+  assert.deepEqual(ONE_SHOT_ARGS, ['--no-session-persistence', '--max-turns', '1', '--permission-mode', 'dontAsk']);
+  assert.deepEqual(child.users(), ['Keep-alive ping. Reply with only: ok']);
+  assert.equal(child.ended, false, 'stdin stays open until the result');
+
+  child.say(...pingFixture);
+  const r = await done;
+  assert.equal(child.ended, true, 'the process was ended after its one turn');
+  assert.equal(r.ok, true);
+  assert.equal(r.turn.model, 'claude-haiku-test');
+  assert.ok(Math.abs(r.turn.cost - 0.0058) < 1e-12, 'the turn cost, not total_cost_usd');
+  assert.equal(r.turn.durationMs, 1900);
+  assert.deepEqual(r.turn.requests, [pingUsage]);
+  assert.equal(spawns.length, 1);
+  assert.deepEqual(child.users(), ['Keep-alive ping. Reply with only: ok'], 'one turn only');
+});
+
+test('a one-shot run that asks for a tool is denied at once and never waits on a card', async () => {
+  const { spawns, done } = oneShot();
+  await tick();
+  const { child } = spawns[0];
+  child.say(
+    pingFixture[0],
+    { type: 'control_request', request_id: 'req-7', request: { subtype: 'can_use_tool', tool_name: 'Read', input: { file_path: '/work/demo/a.txt' }, tool_use_id: 'toolu_R' } },
+    { type: 'control_request', request_id: 'req-8', request: { subtype: 'some_future_request' } },
+  );
+  assert.deepEqual(child.controls()[0], JSON.parse(denyLine('req-7', ONE_SHOT_DENY_MESSAGE)));
+  assert.equal(child.controls()[1].response.subtype, 'error');
+  child.say({ type: 'result', subtype: 'error_max_turns', is_error: true, errors: ['Reached maximum number of turns (1)'], model_usage_since_last_result: { m: { costUSD: 0.002 } } });
+  const r = await done;
+  assert.equal(r.ok, false);
+  assert.equal(r.error, 'Reached maximum number of turns (1)');
+  assert.equal(r.turn.cost, 0.002, 'a failed ping still says what it cost');
+  assert.equal(r.model, 'claude-haiku-test');
+  assert.equal(child.ended, true);
+});
+
+test('a one-shot run stops when checkInit refuses the model, when it times out, or when the CLI fails', async () => {
+  // The wrong model: the turn is interrupted and the process ends.
+  const a = oneShot({ checkInit: (init) => (init.model === 'claude-opus-test' ? undefined : `Runs on ${init.model}, not the session's model.`) });
+  await tick();
+  const aChild = a.spawns[0].child;
+  aChild.say(pingFixture[0]);
+  const ra = await a.done;
+  assert.deepEqual(ra, { ok: false, error: "Runs on claude-haiku-test, not the session's model.", model: 'claude-haiku-test' });
+  assert.deepEqual(aChild.controls().map((c) => c.request?.subtype), ['interrupt']);
+  assert.equal(aChild.ended, true);
+
+  // No result in time.
+  const b = oneShot({ timeoutMs: 20 });
+  await tick();
+  const rb = await b.done;
+  assert.equal(rb.ok, false);
+  assert.match(rb.error, /^No reply within 0s\.$/);
+  assert.equal(b.spawns[0].child.ended, true);
+
+  // The CLI cannot be found.
+  const c = oneShot({ launch: () => ({ error: 'Claude Code was not found.' }) });
+  assert.deepEqual(await c.done, { ok: false, error: 'Claude Code was not found.', model: undefined });
+  assert.equal(c.spawns.length, 0);
+
+  // spawn throws (a .cmd shim without a shell).
+  const d = oneShot({
+    spawn: () => {
+      throw new Error('spawn EINVAL');
+    },
+  });
+  assert.deepEqual(await d.done, { ok: false, error: 'Could not start Claude Code: spawn EINVAL', model: undefined });
+
+  // The process dies mid-turn.
+  const e = oneShot();
+  await tick();
+  const eChild = e.spawns[0].child;
+  eChild.say(pingFixture[0]);
+  eChild.emit('exit', 3, null);
+  const re = await e.done;
+  assert.equal(re.ok, false);
+  assert.match(re.error, /Claude Code stopped in the middle of the turn \(exit code 3\)/);
+  assert.equal(re.model, 'claude-haiku-test');
+
+  // Nothing to send.
+  assert.deepEqual(await runOneShot({ sessionId: 's', launch: () => ({ error: 'x' }), spawn: () => assert.fail('no spawn'), log: () => {}, text: '  ' }), {
+    ok: false,
+    error: 'Nothing to send.',
+  });
 });
