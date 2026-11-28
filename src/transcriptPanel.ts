@@ -5,7 +5,7 @@ import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { ChatChild, ClaudeChat, isPermissionMode, resolveClaudeExecutable, resolveExecutable, SessionChat } from './claudeChat';
+import { ChatChild, ClaudeChat, isPermissionMode, RECENT_WRITE_MS, resolveClaudeExecutable, resolveExecutable, SessionChat } from './claudeChat';
 import { chatModes, chatSpeaker, chatStateMessage, renderLive } from './chatView';
 import { COPILOT_EXECUTABLE, CopilotChat, DEFAULT_COPILOT_MODE, isCopilotMode } from './copilotChat';
 import { killTurnTree, turnSpawnOptions } from './copilotProcess';
@@ -67,9 +67,6 @@ const RUN_UPDATE_DELAY = 500;
 
 /** How often the pending part of a chat is redrawn while a reply streams in. */
 const LIVE_REDRAW_MS = 60;
-
-/** A log written this recently by something other than this tab's chat may have another writer (doc section 8). */
-const RECENT_WRITE_MS = 10_000;
 
 /**
  * A new tab takes the keyboard when its first page loads only if that happens this soon after the tab was created.

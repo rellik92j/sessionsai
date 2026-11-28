@@ -1426,6 +1426,12 @@ export class ClaudeChat implements SessionChat {
  */
 export const ONE_SHOT_ARGS: readonly string[] = ['--no-session-persistence', '--max-turns', '1', '--permission-mode', 'dontAsk'];
 
+/**
+ * A log written this recently by something other than the extension's own chat may have another writer (doc section
+ * 8): the chat asks before starting, and keep-warm skips its ping.
+ */
+export const RECENT_WRITE_MS = 10_000;
+
 /** What a one-shot run answers a permission request with, should one still come. */
 export const ONE_SHOT_DENY_MESSAGE = 'Not approved: this run takes no tool calls. Reply in text only.';
 

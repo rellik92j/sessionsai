@@ -4,7 +4,7 @@
 import prices from './prices.json';
 
 /** USD per million tokens. */
-interface Rates {
+export interface Rates {
   input: number;
   output: number;
   cacheRead: number;
@@ -30,8 +30,9 @@ const K200 = 200_000;
 const PRICES: Record<string, Price> = prices;
 
 const WEB_SEARCH_PRICE = 0.01;
-const TTL_5M = 5 * 60 * 1000;
-const TTL_1H = 60 * 60 * 1000;
+/** The prompt cache's two lifetimes. */
+export const TTL_5M = 5 * 60 * 1000;
+export const TTL_1H = 60 * 60 * 1000;
 
 /** "claude-opus-4-1-20250805", "us.anthropic.claude-sonnet-4-5-20250929-v1:0" or "claude-opus-5-5[1m]" -> price key. */
 export function modelKey(model: string): string {
@@ -57,6 +58,16 @@ function priceFor(model: string): Price | undefined {
   return PRICES[modelKey(model)];
 }
 
+/** The model's list rates for a prompt of `promptTokens` (long-context rates above their threshold); undefined when unpriced. */
+export function ratesFor(model: string, promptTokens: number): Rates | undefined {
+  const p = priceFor(model);
+  if (!p) {
+    return undefined;
+  }
+  const r: Rates = p.long && promptTokens > p.long.above ? p.long : p;
+  return { input: r.input, output: r.output, cacheRead: r.cacheRead, cacheWrite5m: r.cacheWrite5m, cacheWrite1h: r.cacheWrite1h };
+}
+
 export interface TokenCounts {
   input: number;
   cacheWrite5m: number;
@@ -79,6 +90,10 @@ export interface UsageSummary {
   unpriced: string[];
   /** How full the context window was at the last main-thread request. */
   context?: { tokens: number; limit: number };
+  /** Prompt tokens the last main-thread request read from the cache. */
+  lastCacheRead?: number;
+  /** The model of the last main-thread request: the one whose cache that request used. */
+  lastModel?: string;
   /** Time of the last main-thread request and the TTL of the cache it was using; the cache expires at the sum. */
   cache?: { lastRequest: number; ttlMs: number };
   /** Effort level of the last request, when the log records it. */
@@ -216,6 +231,8 @@ export class UsageCollector {
       const limit = priceFor(last.model)?.context ?? K200;
       // Older models could run with a 1M window (beta); never show more than 100%.
       summary.context = { tokens: used, limit: used > limit ? M : limit };
+      summary.lastCacheRead = num(u.cache_read_input_tokens);
+      summary.lastModel = last.model;
       if (last.time !== undefined && ttlMs !== undefined) {
         summary.cache = { lastRequest: last.time, ttlMs };
       }
