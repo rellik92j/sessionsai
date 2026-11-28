@@ -217,6 +217,27 @@ test('the transcript notice: live elsewhere with what runs, only what this chat 
   assert.doesNotMatch(renderLiveNotice([p], undefined, []), /live-tasks/);
 });
 
+test('the transcript notice: each running subagent opens its run, a background shell has no button', () => {
+  const tasks = [
+    { kind: 'agent', id: 'a1111111111111111', name: 'reviewer', description: 'Review it' },
+    { kind: 'agent', id: 'a2222222222222222', description: 'Wait for the build', waiting: true },
+    { kind: 'shell', id: 'b3333', description: 'npm test' },
+  ];
+  const p = { pid: 1, sessionId: SESSION, kind: 'interactive', entrypoint: 'cli', status: 'idle' };
+  // Both forms of the notice: live in another process, and what this tab's own chat still runs.
+  for (const html of [renderLiveNotice([p], undefined, tasks), renderLiveNotice([], p, tasks)]) {
+    const rows = [...html.matchAll(/<li>([\s\S]*?)<\/li>/g)].map((m) => m[1]);
+    assert.equal(rows.length, 3);
+    const open = (row) => [...row.matchAll(/<button class="subagent-open live-open" data-cmd="openSubagent" data-arg="([^"]+)"[^>]*>[\s\S]*?Open run<\/button>/g)].map((m) => m[1]);
+    assert.deepEqual(open(rows[0]), ['a1111111111111111'], 'a running subagent has Open run');
+    assert.deepEqual(open(rows[1]), ['a2222222222222222'], 'so does one waiting on its own background work');
+    assert.deepEqual(open(rows[2]), [], 'a background shell has no run to open');
+    assert.doesNotMatch(rows[2], /<button/);
+  }
+  // An id is markup-escaped like any other text from the log.
+  assert.match(renderLiveNotice([], p, [{ kind: 'agent', id: 'x"><b>' }]), /data-arg="x&quot;&gt;&lt;b&gt;"/);
+});
+
 const waitingDir = path.join(__dirname, 'fixtures', 'claude-live', 'projects', 'C--repo');
 const WAIT_SESSION = 'd9000000-1111-4222-8333-944455556666';
 const waitingFile = path.join(waitingDir, `${WAIT_SESSION}.jsonl`);

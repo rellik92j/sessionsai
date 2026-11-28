@@ -584,7 +584,12 @@ export function renderLiveNotice(elsewhere: LiveProcess[], own: LiveProcess | un
     .map((t) => {
       const since = t.since === undefined ? '' : ` <span class="since">since ${timeHtml(t.since)}</span>`;
       const waiting = t.waiting ? ' <span class="since">· waiting on its own background work</span>' : '';
-      return `<li><i class="codicon codicon-${t.kind === 'shell' ? 'terminal' : 'hubot'}"></i><span>${escapeHtml(taskLabel(t))}</span>${since}${waiting}</li>`;
+      // A subagent's run opens as the block that started it does (openSubagent); a background shell has no run.
+      const open =
+        t.kind === 'agent'
+          ? `<button class="subagent-open live-open" data-cmd="openSubagent" data-arg="${escapeHtml(t.id)}" title="Open this run's full log: its tool calls and messages"><i class="codicon codicon-go-to-file"></i>Open run</button>`
+          : '';
+      return `<li><i class="codicon codicon-${t.kind === 'shell' ? 'terminal' : 'hubot'}"></i><span>${escapeHtml(taskLabel(t))}</span>${since}${waiting}${open}</li>`;
     })
     .join('');
   const others = elsewhere.length - 1;
