@@ -33,9 +33,10 @@ function seed(s) {
 
 /**
  * A Claude Code session whose log file name has a `&`, which Windows allows. Its id is that name, and the terminal's
- * shell would run what follows the `&` if Resume typed it.
+ * shell would run what follows the `&` if Resume typed it. Its id differs from the chat area's Copilot CLI one
+ * (`e2e00000-shell&…`): a full run seeds both, and a scenario that finds its session by id would get the other.
  */
-const SHELL_ID = 'e2e00000-shell&echo-e2e-injected';
+const SHELL_ID = 'e2e00001-shell&echo-e2e-injected';
 const SHELL_PROMPT = 'E2E Claude Code session id with a shell character';
 function seedShellId(s) {
   const dayAgo = Date.now() - 24 * 3600 * 1000;
@@ -340,7 +341,7 @@ export default {
       async run(ctx) {
         // The seeded session whose log file name, and so its id, has a `&`.
         const bad = { ...ctx, id: SHELL_ID, title: SHELL_PROMPT };
-        const refused = /Claude Code session's id, "e2e00000-shell&echo-e2e-injected", has characters a shell could run as a command/;
+        const refused = /Claude Code session's id, "e2e00001-shell&echo-e2e-injected", has characters a shell could run as a command/;
         const refusedToast = async (what, since) => {
           await waitFor(`${what}: the refusal`, async () => refused.test(await toastText(ctx)), 10_000);
           await nothingOpened(ctx, since, what);

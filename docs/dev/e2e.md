@@ -196,7 +196,9 @@ Claude Code alone (see `claudeSessions.sources` above), and a scenario that chan
 filters, the search box, tabs) puts it back, so the next one starts clean.
 
 Scenario names stay unique across areas, since `--only` and the failure screenshots use them. Session ids are numbered
-over every area, so a scenario's session does not change with the areas chosen.
+over every area, so a scenario's session does not change with the areas chosen. An id written by an area's `seed`
+must be unique over every area too: a full run seeds them all, and a scenario that finds its session by id gets
+whichever card matches first (`chat` and `resume` once both seeded `e2e00000-shell&echo-e2e-injected`).
 
 ## The scenarios
 
