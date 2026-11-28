@@ -359,3 +359,116 @@ background sessions, but plain `-p --resume` did not use it.
 7. **Guard against a second writer.** Before spawning, warn when the session's file was written in the last
    few seconds or a terminal for it is open, since two writers fork the log (section 8).
 8. **Errors come in `result`.** Show `result.result` or `errors[]` when `is_error` is true, and log stderr.
+
+## 10. Remote Control from a stream-json process
+
+Finding for SA-76, tested on 2026-11-28 against the same `2.1.332`. Every run used a fresh throwaway folder, `haiku`,
+`--setting-sources project` and `--permission-prompt-tool stdio`, through a small driver that redacted every URL and id
+before printing, so no link was ever shown or opened. Remote Control was turned off at the end of every run, and the
+last run on the one resumed throwaway session left its `bridge-session` record cleared. No real session was used.
+
+**Short answer: yes.** The `/rc` slash command is refused in `-p` mode, but a `remote_control` control request on
+stdin turns Remote Control on and off for the running process, on a new or a `--resume`d session, before the first turn
+or between turns.
+
+### What does not work
+
+| Tried | Result |
+|---|---|
+| `/remote-control` (or `/rc`) sent as a user turn | Refused locally, no API call. A synthetic `assistant` message `"/remote-control isn't available in this environment."` with `"local_command_outcome":{"kind":"unavailable_headless"}`, then a `result` with that text and `num_turns: 0`. The log gets two `system`/`local_command` records |
+| `--remote-control` on the command line with `-p` | Ignored silently. The help says it starts an *interactive* session; no `bridge_state` event appeared |
+| `--settings '{"remoteControlAtStartup":true}'` with `-p` | Ignored silently, as above |
+| `system`/`init` `slash_commands` | Lists no `remote-control` command in `-p` mode |
+
+### The control request
+
+```json
+{"type":"control_request","request_id":"rc-1","request":{"subtype":"remote_control","enabled":true}}
+```
+
+The CLI's own SDK client sends the same request, with optional `name`, `reattach_session_id`, `keep_session_on_exit`
+and `work_secret` fields (read from the CLI's bundled code; only `enabled` was tested). The stream, in order:
+
+```json
+{"type":"system","subtype":"bridge_state","state":"ready","uuid":"<uuid>","session_id":"<session-id>"}
+{"type":"system","subtype":"background_tasks_changed","tasks":[],"uuid":"<uuid>","session_id":"<session-id>"}
+{"type":"control_response","response":{"subtype":"success","request_id":"rc-1","response":{"session_url":"<redacted-url>","connect_url":"<redacted-url>","environment_id":"","bridge_epoch":1,"bridge_session_id":"cse_<id>"}}}
+{"type":"system","subtype":"bridge_state","state":"connected","bridge_epoch":1,"uuid":"<uuid>","session_id":"<session-id>"}
+```
+
+So the process prints **two links, in the control response** (not as text): `session_url`, the claude.ai page for this
+session, and `connect_url`. There is no pairing code. The reply came within about a second. `bridge_state` `connected`
+can arrive after the `control_response`, and in one run it arrived after the next request had already been sent.
+
+Turning it off:
+
+```json
+{"type":"control_request","request_id":"rc-2","request":{"subtype":"remote_control","enabled":false}}
+```
+
+```json
+{"type":"control_response","response":{"subtype":"success","request_id":"rc-2"}}
+```
+
+No `bridge_state` event follows the off reply. Sending `enabled: false` when it is already off also answers `success`.
+
+While it was on, a turn's stream also carried a `system`/`post_turn_summary` event (`status_category`, `status_detail`,
+`needs_action`), which did not appear in turns without Remote Control. It is safe to skip.
+
+### What it leaves in the session log
+
+Enabling appends a record the transcript does not need, and disabling appends the same record with an empty id:
+
+```json
+{"type":"bridge-session","sessionId":"<session-id>","bridgeSessionId":"cse_<id>","lastSequenceNum":0,"ownerAccountUuid":"<uuid>","ownerOrganizationUuid":"<uuid>"}
+{"type":"bridge-session","sessionId":"<session-id>","bridgeSessionId":"","lastSequenceNum":0}
+```
+
+A `data-flow-records` record also listed `RemoteControlLinked` and `RemoteControlInput` entries. The extension's parser
+read the resulting file without errors and showed the same turns as before. The `bridge-session` record has no `uuid`
+or `message`, so it is skipped like the other bookkeeping records in section 3.
+
+### Process lifetime
+
+- **Closing stdin with Remote Control on** let the process exit normally (code 0, under a second after the turn), but
+  **no clearing `bridge-session` record was written**, so the log still names the bridge session.
+- **The next `--resume` does not reconnect by itself.** A turn in a new process showed no `bridge_state` event.
+- **Turning it on again in that new process reused the same `bridge_session_id`**, so the same remote session (and,
+  presumably, the same links) comes back. An `enabled: false` then wrote the clearing record.
+
+So "on" belongs to the process, like the `session` permission grants in section 6a. A chat that wants Remote Control to
+survive a restart (End chat, a permission-mode change, an exit) has to send the request again in the new process.
+
+### What was not tested
+
+These need the remote side, which means opening the link, and that was out of scope:
+
+- **A message typed on claude.ai or the phone while the extension is also sending.** Both reach the same process: the
+  bridge is inside the process the extension spawned, not a second CLI, so there is one writer and the log does not
+  fork the way section 8's two processes did. The CLI's inbound filter accepts `user`, `control_request` and
+  `control_cancel_request` messages from the bridge. Expect a remote turn to queue like a typed one (section 1), and to
+  show up on stdout as an ordinary turn; whether it carries `isReplay` or any marker of where it came from is unknown.
+- **Permission prompts.** The bundled code registers hooks on every control request the CLI sends to the host
+  (`setOnControlRequestSent`, `setOnControlRequestResolved`) and, when the host resolves one, sends the bridge a
+  `control_cancel_request` for it. That reads as: a `can_use_tool` prompt goes to both the extension's card and the
+  remote surface, the first answer wins, and the other side is told to drop its copy. If the remote side answers
+  first, the extension most likely receives a `control_cancel_request` (`{"type":"control_cancel_request",
+  "request_id":"…"}`) on stdout for the card it is showing. `src/claudeChat.ts` does not handle that type today, so a
+  build must close the card on it, and must not answer a request that was cancelled.
+- **The first-use confirmation.** The code has a path that refuses with "Remote Control asks for a one-time
+  confirmation before it's first enabled, and this session can't show it. Run /remote-control from an interactive
+  Claude Code session." It did not trigger here, likely because this account had already used Remote Control. A build
+  must show the error text of a failed `control_response` (`subtype: "error"`) as it comes, since that is where this
+  and the org-policy refusals ("Remote Control is turned off for your organization") would arrive.
+
+### For the build
+
+1. **On:** send `{"subtype":"remote_control","enabled":true}`, show `session_url` (with a copy button) from the
+   reply, and show plainly that the session is reachable remotely. Treat `bridge_state` as status only.
+2. **Off:** send `enabled: false` and clear the link. Send it before closing stdin too, so the log does not keep a
+   stale `bridge-session` record.
+3. **`/rc` and `/remote-control` typed in the box** should be caught by the extension and turned into the request, since
+   sent as a turn they are refused.
+4. **Restarts drop it.** Re-send on the next process if the user had it on, or show it as off.
+5. **Handle `control_cancel_request`** by closing the matching permission card.
+6. **Skip `system`/`post_turn_summary`** and the `bridge-session` log record, like any other unknown type.
