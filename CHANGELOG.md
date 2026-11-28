@@ -4,6 +4,24 @@ All notable changes to SessionsAI (published as Claude Sessions before 0.4.0) ar
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 Numbers in parentheses are the pull requests that made each change. Each version heading links to its GitHub release, which has the release notes and the `.vsix` for installing that version with **Install from VSIX…**.
 
+## [0.4.11](https://github.com/rellik92j/sessionsai/releases/tag/v0.4.11) - 2026-11-27
+
+### Added
+- **Chat here: talk to a Claude Code session in its transcript.** The message box on a Claude Code transcript now starts on **Chat here**. Your message shows at once, Claude's reply streams in below the transcript, and the tab stays open, so you can keep reading and talking in one place. Further messages go to the same chat, and one typed while Claude is working waits until the turn ends. **Stop** interrupts the running turn without ending the chat. **End chat**, or closing the tab, ends the chat once the reply in progress has finished and been saved. A message you send while that reply finishes shows with a **waits for the previous reply to finish** pill and starts a new chat afterwards. (#74, #77)
+- **Answer Claude's permission requests in the chat.** The bar above the message box picks the permission mode: **Ask me** (the default), Accept edits, Plan, Auto or **Decline prompts**. A tool call that needs approval shows a card naming the tool and what it would do (the command, or the file with a preview of its content or diff), with **Allow** and **Deny**. In Plan mode the plan comes as a card with **Approve plan** and **Keep planning**. (#76)
+- **Allow for this session.** When Claude Code offers a standing permission for a request, its card also has **Allow for this session**. It lets the call run and grants what the card lists, so you aren't asked again, until you close the tab, press **End chat** or change the permission mode. Nothing is written to your settings files. After you approve a plan or a grant switches to Accept edits, the mode picker shows the mode Claude Code is now in. (#97)
+- **Chat here for GitHub Copilot CLI sessions.** A Copilot CLI transcript's message box starts on **Chat here** too. Each message continues the same session and the reply streams into the tab. The bar picks what Copilot may do: **Read only** (the default), **Allow edits** or **Allow all tools**. A tool call the mode doesn't allow is declined, with a note naming the mode that would let it run. **Stop** ends the running turn and any command it started, and a message Copilot hadn't picked up yet goes back to the message box. (#90, #99, #101)
+- **Open transcripts keep up with their session.** When a session's log grows, for example while you talk to Claude in a terminal, new messages and tool results appear in its open tab without moving your scroll position, losing a half-typed message or collapsing what you expanded. At the bottom, the tab follows along; scrolled up, the jump-to-latest button gets a dot and reads "New messages below". A subagent's **Open run** tab updates the same way. (#71)
+- **A warning before opening a session that is live elsewhere.** A Claude Code session open in another Claude Code process right now, such as a terminal, gets a **Live in a terminal · idle** or **· working** tag on its sidebar card, and its transcript shows a notice listing the subagents and background shells still running in it. Resume, **Open in Claude Code Chat**, **Chat here** and sending to the CLI ask first, because a second process would fork the session's log; choose the button ending in **Anyway** to go ahead. (#82, #84)
+
+### Changed
+- **The `claudeSessions.copilotCommand` setting** now says it is used for Chat here as well as for resuming in a terminal. (#95)
+
+### Fixed
+- **Replies stay under the prompt they answer when two processes share a session.** If two Claude Code processes write to one session at once, a reply is no longer folded into the answer to a later prompt. A reply logged after the other branch went on is marked **other branch**, and the "No response requested." placeholder that closed that turn is hidden once the real answer arrives. (#73, #75)
+- **A transcript opened into an empty editor area has the keyboard.** F3, Shift+F3 and Escape work in it straight away, without clicking into the page first. (#102)
+- **Session ids with shell characters are refused.** A Claude Code or Copilot CLI session whose id contains characters a shell would act on is no longer typed into a terminal. Resume, Copy Resume Command and sending to the CLI (and Chat here, for Copilot CLI) refuse it and say why. Real session ids are not affected. (#96, #100)
+
 ## [0.4.10](https://github.com/rellik92j/sessionsai/releases/tag/v0.4.10) - 2026-11-25
 
 ### Added
