@@ -20,8 +20,19 @@ export const TICK_MAX_MS = 60_000;
 /** A tick this much later than it was set for means the computer slept (or the host stalled) in between. */
 export const LATE_MS = 2 * 60_000;
 
-/** A ping started with less than this left before the expiry might reach the API after it: the cache counts as gone. */
-export const MIN_LEFT_MS = 15_000;
+/**
+ * A ping started with less than this left before the expiry might reach the API after it (claude.exe's start-up, MCP
+ * servers, Windows): the cache counts as gone. SA-72's run measures the real spawn-to-request time.
+ */
+export const MIN_LEFT_MS = 60_000;
+
+/**
+ * How long a window waits after writing its claim to ping, before it reads the claims again. Twice per ping (see
+ * KeepWarm.claim), so a ping starts COORD_MS after it was due. globalState reaches other windows asynchronously; this
+ * is well above the time that takes.
+ */
+export const SETTLE_MS = 2_000;
+export const COORD_MS = 2 * SETTLE_MS;
 
 /** A ping with no `result` by then is stopped, and counts as failed. */
 export const PING_TIMEOUT_MS = 2 * 60_000;
@@ -45,9 +56,12 @@ export const SHARED_KEY = 'keepWarm.pings';
 /** Shared records older than this are dropped: their cache has expired whatever the TTL. */
 const SHARED_KEEP_MS = 2 * 60 * 60_000;
 
-/** How long before the expiry to ping: 10 minutes on the 1-hour TTL, 60 seconds on the 5-minute one (doc section 6). */
+/**
+ * How long before the expiry to ping: 10 minutes on the 1-hour TTL, 90 seconds on the 5-minute one (doc section 6).
+ * The short margin must exceed MIN_LEFT_MS plus COORD_MS, or every ping would be refused as too late.
+ */
 export function marginFor(ttlMs: number): number {
-  return ttlMs > TTL_5M ? 10 * 60_000 : 60_000;
+  return ttlMs > TTL_5M ? 10 * 60_000 : 90_000;
 }
 
 /** When the cache was last refreshed: the later of the log's last request and the last ping. */
@@ -172,13 +186,16 @@ export interface SharedState {
   update(key: string, value: unknown): PromiseLike<void> | void;
 }
 
-/** One window's last ping of a session, as other windows see it. */
+/** A session's pings, as every window sees them (under SHARED_KEY, by session id). */
 export interface SharedPing {
-  window: string;
-  /** When the ping started. */
-  at: number;
-  /** The ping is running now. */
-  pinging?: boolean;
+  /** The last ping that refreshed the cache: which window ran it, and when it started. */
+  window?: string;
+  at?: number;
+  /**
+   * Windows about to ping the session or pinging it now, each with when it claimed. Kept per window, and each window
+   * changes only its own entry, so a claim lost to another window's write can be put back (KeepWarm.claim).
+   */
+  claims?: Record<string, number>;
 }
 
 export interface KeepWarmDeps {
@@ -305,9 +322,8 @@ export class KeepWarm {
   start(sessionId: string, opts: StartOptions = {}): { ok: true } | { ok: false; error: string } {
     const s = this.deps.state(sessionId);
     const now = this.deps.now();
-    // A ping another window is running now has not refreshed anything yet; tick() waits for it instead.
-    const shared = this.sharedPing(sessionId);
-    const lastPing = shared && !shared.pinging ? shared.at : undefined;
+    // A ping another window is running now has not refreshed anything yet (it is only a claim); tick() waits for it.
+    const lastPing = this.sharedPing(sessionId)?.at;
     if (!s || s.ttlMs === undefined || lastWarmed(s.lastRequest, lastPing) === undefined) {
       return { ok: false, error: "This session's log does not say when its prompt cache was last used." };
     }
@@ -420,7 +436,7 @@ export class KeepWarm {
     e.stopped = { reason, message: message ?? STOP_MESSAGES[reason as keyof typeof STOP_MESSAGES] ?? 'Stopped keeping the cache warm.', at: now };
     if (e.pinging) {
       // Take back this window's claim, so another window does not wait on a ping nobody will finish recording.
-      void this.writeShared(e.sessionId, undefined, true);
+      void this.dropClaim(e.sessionId);
     }
     this.deps.log(`keep-warm ${e.sessionId}: stopped (${reason}): ${e.stopped.message} Spent ${usd(e.spent)} on ${e.pings.length} ping(s).`);
     this.changed(e);
@@ -439,31 +455,131 @@ export class KeepWarm {
     }, Math.max(0, fire - now));
   }
 
-  private sharedAll(): Record<string, SharedPing> {
-    const all = this.deps.shared.get<Record<string, SharedPing>>(SHARED_KEY);
+  private sharedAll(): Record<string, unknown> {
+    const all = this.deps.shared.get<Record<string, unknown>>(SHARED_KEY);
     return all && typeof all === 'object' ? all : {};
   }
 
-  private sharedPing(sessionId: string): SharedPing | undefined {
-    const r = this.sharedAll()[sessionId];
-    return r && typeof r.at === 'number' && typeof r.window === 'string' ? r : undefined;
-  }
-
-  /** Records this window's ping (or, with `undefined`, removes this window's claim), dropping records long expired. */
-  private async writeShared(sessionId: string, rec: SharedPing | undefined, onlyIfMine = false): Promise<void> {
-    const now = this.deps.now();
-    const all = { ...this.sharedAll() };
-    for (const [id, r] of Object.entries(all)) {
-      if (!r || typeof r.at !== 'number' || now - r.at > SHARED_KEEP_MS) {
-        delete all[id];
+  /**
+   * A shared record as this build reads it: a last ping kept while its cache could still be warm, and only the claims
+   * young enough that their ping could still be running. Undefined when nothing is left; anything malformed is dropped.
+   */
+  private cleanShared(r: unknown, now: number): SharedPing | undefined {
+    if (!r || typeof r !== 'object') {
+      return undefined;
+    }
+    const o = r as Record<string, unknown>;
+    const out: SharedPing = {};
+    if (typeof o.at === 'number' && typeof o.window === 'string' && now - o.at <= SHARED_KEEP_MS) {
+      out.window = o.window;
+      out.at = o.at;
+    }
+    if (o.claims && typeof o.claims === 'object') {
+      for (const [w, at] of Object.entries(o.claims as Record<string, unknown>)) {
+        if (typeof at === 'number' && now - at < PING_TIMEOUT_MS + COORD_MS) {
+          (out.claims ??= {})[w] = at;
+        }
       }
     }
-    if (rec) {
-      all[sessionId] = rec;
-    } else if (!onlyIfMine || all[sessionId]?.window === this.deps.windowId) {
+    return out.at !== undefined || out.claims ? out : undefined;
+  }
+
+  private sharedPing(sessionId: string): SharedPing | undefined {
+    return this.cleanShared(this.sharedAll()[sessionId], this.deps.now());
+  }
+
+  /** Changes the session's shared record through `f`, leaving every other window's part of it as this window sees it. */
+  private async updateShared(sessionId: string, f: (r: SharedPing) => SharedPing): Promise<void> {
+    const now = this.deps.now();
+    const all: Record<string, SharedPing> = {};
+    for (const [id, r] of Object.entries(this.sharedAll())) {
+      const c = this.cleanShared(r, now);
+      if (c) {
+        all[id] = c;
+      }
+    }
+    const next = this.cleanShared(f({ ...all[sessionId], claims: { ...all[sessionId]?.claims } }), now);
+    if (next) {
+      all[sessionId] = next;
+    } else {
       delete all[sessionId];
     }
     await this.deps.shared.update(SHARED_KEY, all);
+  }
+
+  private putClaim(sessionId: string, at: number): Promise<void> {
+    return this.updateShared(sessionId, (r) => ({ ...r, claims: { ...r.claims, [this.deps.windowId]: at } }));
+  }
+
+  /** Removes this window's claim; with `ping`, also records that this window's ping, started then, refreshed the cache. */
+  private dropClaim(sessionId: string, ping?: number): Promise<void> {
+    return this.updateShared(sessionId, (r) => {
+      const claims = { ...r.claims };
+      delete claims[this.deps.windowId];
+      const last = ping === undefined ? { window: r.window, at: r.at } : { window: this.deps.windowId, at: ping };
+      return { ...last, claims: Object.keys(claims).length ? claims : undefined };
+    });
+  }
+
+  /** Waits on this entry's timer, so Stop and window close cancel the wait (and what comes after it). */
+  private wait(e: Entry, ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      e.timerFor = undefined;
+      e.timer = this.deps.setTimer(() => {
+        e.timer = undefined;
+        resolve();
+      }, ms);
+    });
+  }
+
+  /**
+   * Claims the next ping of the session for this window, and says whether to go ahead. Two windows kept warm from the
+   * same log are due at the same moment, and globalState reaches the other window late, so a claim is not enough by
+   * itself: both would see no claim but their own. So the window writes its claim, waits SETTLE_MS, and reads the
+   * claims again, twice. An earlier claim from another window, by claim time and then window id, makes this one back
+   * off. A claim that another window's write has overwritten is written again after the first wait, merged with what
+   * is there by then, so after the second wait both windows see both claims, and only the first goes ahead.
+   */
+  private async claim(e: Entry, at: number): Promise<boolean> {
+    const me = this.deps.windowId;
+    e.pinging = true;
+    await this.putClaim(e.sessionId, at);
+    for (let round = 1; round <= 2; round++) {
+      await this.wait(e, SETTLE_MS);
+      if (!e.active) {
+        return false;
+      }
+      const claims = this.sharedPing(e.sessionId)?.claims ?? {};
+      const mine = claims[me] === at;
+      const first = Object.entries(claims).some(([w, t]) => w !== me && (t < at || (t === at && w < me)));
+      if (first || (round === 2 && !mine)) {
+        e.pinging = false;
+        // The other window's ping is the refresh pingNow asked for.
+        e.pingNow = false;
+        // The claim is left to go stale rather than taken back: a write now, from a view the winner's ping record
+        // has not reached yet, could overwrite that record in the other windows.
+        const now = this.deps.now();
+        e.lastSkip = { at: now, why: 'another window is refreshing it' };
+        this.deps.log(`keep-warm ${e.sessionId}: skipped a refresh: another window claimed it first`);
+        this.changed(e);
+        if (e.active) {
+          this.schedule(e, now + RETRY_MS);
+        }
+        return false;
+      }
+      if (!mine) {
+        await this.putClaim(e.sessionId, at);
+      }
+    }
+    return true;
+  }
+
+  /** Why something else is writing the session now, if it is: its turn refreshes the cache by itself. */
+  private writer(s: SessionCacheState, now: number): string | undefined {
+    return (
+      s.busy ??
+      (s.logWrittenAt !== undefined && now - s.logWrittenAt < RECENT_WRITE_MS ? `its log was written ${Math.max(1, Math.round((now - s.logWrittenAt) / 1000))}s ago` : undefined)
+    );
   }
 
   private checkNextTurn(e: Entry, s: SessionCacheState): void {
@@ -498,7 +614,7 @@ export class KeepWarm {
     }
     // Another window's later ping counts as this one's.
     const other = this.sharedPing(sessionId);
-    if (other && other.window !== this.deps.windowId && !other.pinging && other.at > (e.lastPing ?? -Infinity)) {
+    if (other?.at !== undefined && other.window !== this.deps.windowId && other.at > (e.lastPing ?? -Infinity)) {
       e.lastPing = other.at;
     }
     const expiry = cacheExpiry(s.lastRequest, e.lastPing, e.ttlMs)!;
@@ -521,9 +637,7 @@ export class KeepWarm {
     }
     // Due (or a retry): skip while something else writes the session; its turn refreshes the cache by itself.
     const busy =
-      s.busy ??
-      (s.logWrittenAt !== undefined && now - s.logWrittenAt < RECENT_WRITE_MS ? `its log was written ${Math.max(1, Math.round((now - s.logWrittenAt) / 1000))}s ago` : undefined) ??
-      (other && other.window !== this.deps.windowId && other.pinging && now - other.at < PING_TIMEOUT_MS ? 'another window is refreshing it' : undefined);
+      this.writer(s, now) ?? (Object.keys(other?.claims ?? {}).some((w) => w !== this.deps.windowId) ? 'another window is refreshing it' : undefined);
     if (busy) {
       e.lastSkip = { at: now, why: busy };
       this.deps.log(`keep-warm ${sessionId}: skipped a refresh: ${busy}`);
@@ -537,16 +651,28 @@ export class KeepWarm {
     if (e.spent + estimate > e.spendCapUsd) {
       return this.halt(e, 'spendCap', `Stopped keeping the cache warm: the next refresh (about ${usd(estimate)}) would pass the ${usd(e.spendCapUsd)} spend cap. Spent ${usd(e.spent)}.`);
     }
-    await this.ping(e, s, now);
+    const lastRequest = s.lastRequest;
+    if (!(await this.claim(e, now))) {
+      return;
+    }
+    // The claim took COORD_MS. If anything changed meanwhile (a real turn, a writer, the time left), let the
+    // schedule decide again, from the start.
+    const s2 = this.deps.state(sessionId);
+    const at = this.deps.now();
+    if (!s2 || this.writer(s2, at) || s2.lastRequest !== lastRequest || at >= cacheExpiry(s2.lastRequest, e.lastPing, e.ttlMs)! - MIN_LEFT_MS) {
+      e.pinging = false;
+      await this.dropClaim(sessionId);
+      return this.tick(sessionId);
+    }
+    await this.ping(e, s2, at);
   }
 
+  /** One ping, once claim() has said go: `e.pinging` is already set, and this window's claim is in the shared record. */
   private async ping(e: Entry, s: SessionCacheState, now: number): Promise<void> {
     const n = e.pings.length + 1;
     const record: PingRecord = { n, at: now, ok: false, cacheRead: 0, cacheWrite: 0 };
     let wrongModel = false;
-    e.pinging = true;
     e.pingNow = false;
-    await this.writeShared(e.sessionId, { window: this.deps.windowId, at: now, pinging: true });
     this.deps.log(`keep-warm ${e.sessionId}: ping ${n}`);
     const r: OneShotResult = await runOneShot({
       sessionId: e.sessionId,
@@ -588,7 +714,7 @@ export class KeepWarm {
     if (r.ok) {
       // Recorded even when keep-warm was stopped while it ran: the cache was refreshed all the same.
       e.lastPing = now;
-      await this.writeShared(e.sessionId, { window: this.deps.windowId, at: now });
+      await this.dropClaim(e.sessionId, now);
     }
     if (!e.active) {
       // Stopped while the ping ran; halt() has already said so.
@@ -605,8 +731,7 @@ export class KeepWarm {
       }
       return this.tick(e.sessionId);
     }
-    // Put back what was there before this window's claim: the last ping this window or another made.
-    await this.writeShared(e.sessionId, e.lastPing === undefined ? undefined : { window: this.deps.windowId, at: e.lastPing }, true);
+    await this.dropClaim(e.sessionId);
     this.changed(e);
     if (wrongModel) {
       return this.halt(e, 'model', `Stopped keeping the cache warm: ${r.error}`);

@@ -8,6 +8,8 @@ const {
   KeepWarm,
   SHARED_KEY,
   RETRY_MS,
+  COORD_MS,
+  MIN_LEFT_MS,
   PING_WRITE_TOKENS,
   marginFor,
   nextPingAt,
@@ -21,6 +23,8 @@ const { UsageCollector, TTL_1H, TTL_5M } = require('../out/usage');
 
 const MIN = 60_000;
 const T0 = Date.parse('2026-11-25T10:00:00.000Z');
+/** A ping starts this long after it is due: the claim's two settle waits (KeepWarm.claim). */
+const C = COORD_MS;
 
 const pingEvents = fs
   .readFileSync(path.join(__dirname, 'fixtures', 'claude-stream', 'ping.jsonl'), 'utf8')
@@ -114,6 +118,36 @@ function fakeShared() {
   return { get: (k) => data.get(k), update: (k, v) => void data.set(k, JSON.parse(JSON.stringify(v))), data };
 }
 
+/**
+ * A globalState whose writes reach the other windows `delay` ms late, as VS Code's do. Each window gets its own view.
+ * - 'crossing': a write reaches the other views as written, so two writes that cross leave each window holding the
+ *   other's (the PR #111 review's repro).
+ * - 'lastWins': writes reach one store in order, and every view, the writer's too, then holds the store's value, so the
+ *   window that wrote first loses its write everywhere.
+ */
+function delayedShared(clock, delay, mode) {
+  const store = new Map();
+  const views = [];
+  return {
+    store,
+    view() {
+      const local = new Map();
+      views.push(local);
+      return {
+        get: (k) => local.get(k),
+        update: (k, v) => {
+          const val = JSON.parse(JSON.stringify(v));
+          local.set(k, val);
+          clock.setTimer(() => {
+            store.set(k, val);
+            for (const o of views) if (mode === 'lastWins' || o !== local) o.set(k, store.get(k));
+          }, delay);
+        },
+      };
+    },
+  };
+}
+
 /** A kept-warm setup: the session's state is `st`, which a test changes as the log would. */
 function setup(o = {}) {
   const clock = o.clock ?? fakeClock();
@@ -141,11 +175,13 @@ function setup(o = {}) {
 
 test('schedule: next ping at max(last request, last ping) + TTL - margin; expiry at the same base + TTL', () => {
   assert.equal(marginFor(TTL_1H), 10 * MIN);
-  assert.equal(marginFor(TTL_5M), MIN);
+  assert.equal(marginFor(TTL_5M), 1.5 * MIN);
+  assert.ok(marginFor(TTL_5M) > MIN_LEFT_MS + C, 'a 5-minute ping is not refused as too close to the expiry');
+  assert.equal(MIN_LEFT_MS, MIN);
   assert.equal(nextPingAt(T0, undefined, TTL_1H), T0 + 50 * MIN);
   assert.equal(nextPingAt(T0, T0 + 20 * MIN, TTL_1H), T0 + 70 * MIN);
   assert.equal(nextPingAt(T0 + 30 * MIN, T0 + 20 * MIN, TTL_1H), T0 + 80 * MIN, 'a later real turn pushes the ping back');
-  assert.equal(nextPingAt(T0, undefined, TTL_5M), T0 + 4 * MIN);
+  assert.equal(nextPingAt(T0, undefined, TTL_5M), T0 + 3.5 * MIN);
   assert.equal(cacheExpiry(T0, T0 + 20 * MIN, TTL_1H), T0 + 80 * MIN);
   assert.equal(cacheExpiry(undefined, undefined, TTL_1H), undefined);
 });
@@ -174,10 +210,10 @@ test('estimates from prices.json: a ping, a warm and a cold resume, break-even, 
   // The cache was last refreshed 40 minutes ago: the first ping is 10 minutes away.
   assert.equal(estimateKeepWarm({ model: 'claude-opus-5-5', contextTokens: 200_000, ttlMs: TTL_1H, durationMs: 30 * MIN, sinceLastMs: 40 * MIN }).pings, 1);
   assert.equal(estimateKeepWarm({ model: 'claude-opus-5-5', contextTokens: 200_000, ttlMs: TTL_1H, durationMs: 30 * MIN }).pings, 0);
-  // 5-minute TTL: a ping every 4 minutes, at the 5-minute write price.
+  // 5-minute TTL: a ping every 3.5 minutes, at the 5-minute write price.
   const short = estimateKeepWarm({ model: 'claude-opus-5-5', contextTokens: 200_000, ttlMs: TTL_5M, durationMs: 60 * MIN });
-  assert.equal(short.intervalMs, 4 * MIN);
-  assert.equal(short.pings, 15);
+  assert.equal(short.intervalMs, 3.5 * MIN);
+  assert.equal(short.pings, 17);
   close(short.coldResume, 1.0);
   // Haiku over 100k: the long-context rates (read $0.05/M, 1h write $1/M), as the SA-33 check's ping 2 measured.
   const haiku = estimateKeepWarm({ model: 'claude-haiku-5-5', contextTokens: 100_685, ttlMs: TTL_1H });
@@ -222,19 +258,25 @@ test('pings on schedule through runOneShot: no-persist arguments, no --model, it
   await clock.to(T0 + 45 * MIN - 1);
   assert.equal(spawns.length, 0);
   await clock.to(T0 + 45 * MIN);
+  assert.equal(spawns.length, 0, 'due, and claimed');
+  assert.deepEqual(shared.data.get(SHARED_KEY), { 'sess-0001': { claims: { 'win-A': T0 + 45 * MIN } } });
+  await clock.to(T0 + 45 * MIN + C - 1);
+  assert.equal(spawns.length, 0, 'still waiting to see whether another window claimed it');
+  await clock.to(T0 + 45 * MIN + C);
   assert.equal(spawns.length, 1);
+  const P1 = T0 + 45 * MIN + C;
   const { args, cwd, child } = spawns[0];
   assert.equal(cwd, '/work/demo');
   assert.deepEqual(args, [...chatArgs('sess-0001', 'deny'), ...ONE_SHOT_ARGS]);
   assert.ok(!args.includes('--model'));
-  assert.deepEqual(child.users(), [pingText(1, T0 + 45 * MIN)]);
+  assert.deepEqual(child.users(), [pingText(1, P1)]);
   assert.equal(child.ended, true);
 
   const k = kw.get('sess-0001');
   assert.equal(k.pings.length, 1);
   assert.deepEqual(k.pings[0], {
     n: 1,
-    at: T0 + 45 * MIN,
+    at: P1,
     ok: true,
     cost: 0.0058,
     cacheRead: 51_969,
@@ -243,15 +285,15 @@ test('pings on schedule through runOneShot: no-persist arguments, no --model, it
     permissionMode: 'dontAsk',
   });
   assert.ok(Math.abs(k.spent - 0.0058) < 1e-12);
-  assert.equal(k.lastPing, T0 + 45 * MIN);
-  assert.equal(k.expiresAt, T0 + 105 * MIN, 'the timer shows the last ping + TTL, not the log');
-  assert.equal(k.nextPingAt, T0 + 95 * MIN);
-  assert.deepEqual(shared.data.get(SHARED_KEY), { 'sess-0001': { window: 'win-A', at: T0 + 45 * MIN } });
+  assert.equal(k.lastPing, P1);
+  assert.equal(k.expiresAt, P1 + 60 * MIN, 'the timer shows the last ping + TTL, not the log');
+  assert.equal(k.nextPingAt, P1 + 50 * MIN);
+  assert.deepEqual(shared.data.get(SHARED_KEY), { 'sess-0001': { window: 'win-A', at: P1 } }, 'the claim gives way to the ping record');
   assert.ok(logs.some((l) => /ping 1 init: model claude-haiku-test, permissionMode dontAsk/.test(l)), 'init.permissionMode is logged');
 
-  await clock.to(T0 + 95 * MIN);
+  await clock.to(P1 + 50 * MIN + C);
   assert.equal(spawns.length, 2);
-  assert.deepEqual(spawns[1].child.users(), [pingText(2, T0 + 95 * MIN)]);
+  assert.deepEqual(spawns[1].child.users(), [pingText(2, P1 + 50 * MIN + C)]);
   assert.notEqual(spawns[1].child.users()[0], spawns[0].child.users()[0]);
 });
 
@@ -259,17 +301,18 @@ test('pingNow refreshes at once, then at 50 and 100 minutes from that ping (the 
   const { kw, clock, spawns } = setup();
   kw.start('s', { pingNow: true, durationMs: 105 * MIN });
   await settle();
+  await clock.to(T0 + C);
   assert.equal(spawns.length, 1);
-  assert.deepEqual(spawns[0].child.users(), [pingText(1, T0)]);
-  await clock.to(T0 + 50 * MIN);
+  assert.deepEqual(spawns[0].child.users(), [pingText(1, T0 + C)]);
+  await clock.to(T0 + 50 * MIN + 2 * C);
   assert.equal(spawns.length, 2);
-  await clock.to(T0 + 100 * MIN);
+  await clock.to(T0 + 100 * MIN + 3 * C);
   assert.equal(spawns.length, 3);
   await clock.to(T0 + 106 * MIN);
   assert.equal(kw.get('s').stopped.reason, 'duration');
   assert.deepEqual(
     kw.get('s').pings.map((p) => p.at),
-    [T0, T0 + 50 * MIN, T0 + 100 * MIN],
+    [T0 + C, T0 + 50 * MIN + 2 * C, T0 + 100 * MIN + 3 * C],
   );
 
   const busy = setup();
@@ -279,29 +322,54 @@ test('pingNow refreshes at once, then at 50 and 100 minutes from that ping (the 
   assert.equal(busy.spawns.length, 0);
   assert.equal(busy.kw.get('s').lastSkip.why, 'it is open in a terminal');
   busy.st.busy = undefined;
-  await busy.clock.to(T0 + RETRY_MS);
+  await busy.clock.to(T0 + RETRY_MS + C);
   assert.equal(busy.spawns.length, 1, 'the asked-for refresh goes once the writer is gone');
+
+  // A writer that turns up during the claim's wait: no ping, and the refresh is tried again later.
+  const late = setup();
+  late.kw.start('s', { pingNow: true });
+  await settle();
+  await late.clock.to(T0 + C - 1);
+  late.st.busy = 'the in-view chat is replying';
+  await late.clock.to(T0 + C);
+  assert.equal(late.spawns.length, 0);
+  assert.equal(late.kw.get('s').lastSkip.why, 'the in-view chat is replying');
+  assert.equal(late.shared.data.get(SHARED_KEY).s, undefined, 'the claim is taken back');
+  late.st.busy = undefined;
+  await late.clock.to(T0 + C + RETRY_MS + C);
+  assert.equal(late.spawns.length, 1);
 });
 
-test('a real turn elsewhere pushes the next ping back; the 5-minute TTL pings a minute before expiry', async () => {
+test('a real turn elsewhere pushes the next ping back; the 5-minute TTL pings 90 seconds before expiry', async () => {
   const { kw, clock, spawns, st } = setup();
   kw.start('s');
-  await clock.to(T0 + 45 * MIN);
+  await clock.to(T0 + 45 * MIN + C);
   assert.equal(spawns.length, 1);
   st.lastRequest = T0 + 60 * MIN; // the user typed a turn in a terminal
   await clock.to(T0 + 100 * MIN);
   assert.equal(spawns.length, 1, 'not at 95: the real turn refreshed the cache');
-  await clock.to(T0 + 110 * MIN);
+  await clock.to(T0 + 110 * MIN + C);
   assert.equal(spawns.length, 2);
+
+  // A real turn during the claim's wait: no ping, the schedule moves from that turn.
+  const mid = setup();
+  mid.kw.start('s');
+  await mid.clock.to(T0 + 45 * MIN + 1000);
+  mid.st.lastRequest = T0 + 45 * MIN + 1000;
+  await mid.clock.to(T0 + 45 * MIN + C);
+  assert.equal(mid.spawns.length, 0);
+  assert.equal(mid.kw.get('s').active, true);
+  assert.equal(mid.kw.get('s').nextPingAt, T0 + 95 * MIN + 1000);
 
   const five = setup({ st: { lastRequest: T0, ttlMs: TTL_5M, model: 'claude-haiku-test', contextTokens: 1000 } });
   five.kw.start('s');
-  await five.clock.to(T0 + 4 * MIN - 1);
+  await five.clock.to(T0 + 3.5 * MIN + C - 1);
   assert.equal(five.spawns.length, 0);
-  await five.clock.to(T0 + 4 * MIN);
+  await five.clock.to(T0 + 3.5 * MIN + C);
   assert.equal(five.spawns.length, 1);
-  await five.clock.to(T0 + 8 * MIN);
+  await five.clock.to(T0 + 7 * MIN + 2 * C);
   assert.equal(five.spawns.length, 2);
+  assert.equal(five.kw.get('s').active, true);
 });
 
 test('skips a ping while another writer has the session, then pings once it is free', async () => {
@@ -317,7 +385,7 @@ test('skips a ping while another writer has the session, then pings once it is f
   await clock.to(T0 + 45 * MIN + RETRY_MS);
   assert.equal(spawns.length, 0, 'the log was written 5s ago');
   assert.match(kw.get('s').lastSkip.why, /its log was written 5s ago/);
-  await clock.to(T0 + 45 * MIN + 2 * RETRY_MS);
+  await clock.to(T0 + 45 * MIN + 2 * RETRY_MS + C);
   assert.equal(spawns.length, 1);
 
   // A writer that never lets go: the cache expires, and keep-warm says why.
@@ -341,27 +409,28 @@ test('skips a ping while another writer has the session, then pings once it is f
   await c.clock.to(T0 + 95 * MIN);
   assert.equal(c.spawns.length, 0);
   assert.equal(c.kw.get('s').active, true);
-  await c.clock.to(T0 + 96 * MIN);
+  await c.clock.to(T0 + 96 * MIN + C);
   assert.equal(c.spawns.length, 1);
 });
 
 test('a failed ping is retried once after 30s; a second failure stops it', async () => {
   const { kw, clock, spawns } = setup({ plan: (i) => (i === 0 ? { events: failedResult } : {}) });
   kw.start('s');
-  await clock.to(T0 + 45 * MIN);
+  await clock.to(T0 + 45 * MIN + C);
   assert.equal(spawns.length, 1);
   let k = kw.get('s');
   assert.equal(k.active, true);
   assert.equal(k.pings[0].ok, false);
   assert.equal(k.pings[0].error, 'API Error: 529 overloaded');
   assert.ok(Math.abs(k.spent - 0.001) < 1e-12, 'a failed ping still counts what it cost');
-  await clock.to(T0 + 45 * MIN + RETRY_MS - 1);
+  const retry = T0 + 45 * MIN + C + RETRY_MS + C;
+  await clock.to(retry - 1);
   assert.equal(spawns.length, 1);
-  await clock.to(T0 + 45 * MIN + RETRY_MS);
+  await clock.to(retry);
   assert.equal(spawns.length, 2);
   k = kw.get('s');
   assert.equal(k.pings[1].ok, true);
-  assert.equal(k.lastPing, T0 + 45 * MIN + RETRY_MS);
+  assert.equal(k.lastPing, retry);
 
   const twice = setup({ plan: () => ({ events: failedResult }) });
   twice.kw.start('s');
@@ -375,13 +444,13 @@ test('a failed ping is retried once after 30s; a second failure stops it', async
 test('a ping whose CLI fails after spawn (async error) counts as failed and is retried', async () => {
   const { kw, clock, spawns } = setup({ plan: (i) => (i === 0 ? { asyncError: true, reply: false } : {}) });
   kw.start('s');
-  await clock.to(T0 + 45 * MIN);
+  await clock.to(T0 + 45 * MIN + C);
   assert.equal(spawns.length, 1);
   const k = kw.get('s');
   assert.equal(k.pings[0].ok, false);
   assert.match(k.pings[0].error, /ENOENT|not found|could not/i);
   assert.equal(k.active, true);
-  await clock.to(T0 + 45 * MIN + RETRY_MS);
+  await clock.to(T0 + 45 * MIN + 2 * C + RETRY_MS);
   assert.equal(spawns.length, 2);
   assert.equal(kw.get('s').pings[1].ok, true);
 });
@@ -389,7 +458,7 @@ test('a ping whose CLI fails after spawn (async error) counts as failed and is r
 test('a ping is recorded only once its process has exited (exitOnEnd: false)', async () => {
   const { kw, clock, spawns } = setup({ plan: () => ({ exitOnEnd: false }) });
   kw.start('s');
-  await clock.to(T0 + 45 * MIN);
+  await clock.to(T0 + 45 * MIN + C);
   assert.equal(spawns.length, 1);
   const { child } = spawns[0];
   assert.equal(child.ended, true, 'the result came and stdin was closed');
@@ -404,14 +473,14 @@ test('a ping is recorded only once its process has exited (exitOnEnd: false)', a
 test('after a sleep past the expiry it stops instead of pinging; an expired cache is never pinged', async () => {
   const { kw, clock, spawns } = setup();
   kw.start('s');
-  await clock.to(T0 + 45 * MIN);
+  await clock.to(T0 + 45 * MIN + C);
   assert.equal(spawns.length, 1);
   await clock.sleep(3 * 60 * MIN);
   assert.equal(spawns.length, 1);
   const k = kw.get('s');
   assert.equal(k.stopped.reason, 'slept');
   assert.match(k.stopped.message, /expired while the computer was asleep/);
-  assert.equal(k.expiresAt, T0 + 105 * MIN);
+  assert.equal(k.expiresAt, T0 + 105 * MIN + C);
   assert.equal(clock.pending(), 0);
 
   // A start on a cache that has expired, or with no cache state at all, is refused.
@@ -420,15 +489,28 @@ test('after a sleep past the expiry it stops instead of pinging; an expired cach
   const none = setup({ st: { model: 'claude-haiku-test' } });
   assert.match(none.kw.start('s').error, /does not say when/);
   assert.equal(cold.spawns.length + none.spawns.length, 0);
+
+  // Under a minute (MIN_LEFT_MS) left counts as expired: claude.exe's start-up might take the ping past the expiry.
+  const close = setup({ st: { lastRequest: T0 - 60 * MIN + MIN_LEFT_MS - 1000, ttlMs: TTL_1H, model: 'claude-haiku-test' } });
+  assert.match(close.kw.start('s').error, /already expired/);
+  // On the 5-minute TTL, a skip at the due time leaves too little for the re-check at 4:00: it stops, no ping.
+  const five = setup({ st: { lastRequest: T0, ttlMs: TTL_5M, model: 'claude-haiku-test', contextTokens: 1000, busy: 'it is open in a terminal' } });
+  five.kw.start('s');
+  await five.clock.to(T0 + 3.5 * MIN);
+  assert.equal(five.kw.get('s').lastSkip.why, 'it is open in a terminal');
+  five.st.busy = undefined;
+  await five.clock.to(T0 + 4 * MIN + C);
+  assert.equal(five.spawns.length, 0);
+  assert.equal(five.kw.get('s').stopped.reason, 'expired');
 });
 
 test('stops at the spend cap, at the chosen duration, on Stop, when the window closes, and when the session goes', async () => {
   // Each fixture ping costs $0.0058; with a $0.01 cap the second would pass it.
   const cap = setup();
   cap.kw.start('s', { spendCapUsd: 0.01 });
-  await cap.clock.to(T0 + 45 * MIN);
+  await cap.clock.to(T0 + 45 * MIN + C);
   assert.equal(cap.spawns.length, 1);
-  await cap.clock.to(T0 + 95 * MIN);
+  await cap.clock.to(T0 + 95 * MIN + 2 * C);
   assert.equal(cap.spawns.length, 1);
   assert.equal(cap.kw.get('s').stopped.reason, 'spendCap');
   assert.match(cap.kw.get('s').stopped.message, /would pass the \$0\.01 spend cap/);
@@ -474,10 +556,11 @@ test('stops at the spend cap, at the chosen duration, on Stop, when the window c
 test('Stop during a ping: the ping finishes and counts, nothing more is scheduled, the claim is taken back', async () => {
   const { kw, clock, spawns, shared } = setup({ plan: () => ({ reply: false }) });
   kw.start('s');
-  await clock.to(T0 + 45 * MIN);
+  await clock.to(T0 + 45 * MIN + C);
   assert.equal(spawns.length, 1);
-  assert.equal(shared.data.get(SHARED_KEY).s.pinging, true);
+  assert.deepEqual(shared.data.get(SHARED_KEY).s.claims, { 'win-A': T0 + 45 * MIN });
   kw.stop('s');
+  await settle();
   assert.equal(shared.data.get(SHARED_KEY).s, undefined);
   spawns[0].child.say(...pingEvents);
   await settle();
@@ -486,8 +569,19 @@ test('Stop during a ping: the ping finishes and counts, nothing more is schedule
   assert.equal(k.stopped.reason, 'user');
   assert.equal(clock.pending(), 0);
   // It did refresh the cache, so the expiry moves and other windows see the ping.
-  assert.equal(k.expiresAt, T0 + 105 * MIN);
-  assert.deepEqual(shared.data.get(SHARED_KEY).s, { window: 'win-A', at: T0 + 45 * MIN });
+  assert.equal(k.expiresAt, T0 + 105 * MIN + C);
+  assert.deepEqual(shared.data.get(SHARED_KEY).s, { window: 'win-A', at: T0 + 45 * MIN + C });
+
+  // Stop during the claim's wait: no ping at all, and the claim is taken back.
+  const early = setup();
+  early.kw.start('s');
+  await early.clock.to(T0 + 45 * MIN + 1000);
+  assert.ok(early.shared.data.get(SHARED_KEY).s.claims['win-A']);
+  early.kw.stop('s');
+  await early.clock.to(T0 + 60 * MIN);
+  assert.equal(early.spawns.length, 0);
+  assert.equal(early.shared.data.get(SHARED_KEY).s, undefined);
+  assert.equal(early.clock.pending(), 0);
 });
 
 test("stops without retrying when init reports a model other than the log's", async () => {
@@ -510,22 +604,23 @@ test('two windows share one session: only one pings, the other counts that ping 
   const b = setup({ clock, shared, st, windowId: 'win-B' });
   a.kw.start('s');
   b.kw.start('s');
-  await clock.to(T0 + 45 * MIN);
+  await clock.to(T0 + 45 * MIN + C);
   assert.equal(a.spawns.length + b.spawns.length, 1);
-  const [pinger, other] = a.spawns.length ? [a, b] : [b, a];
-  assert.equal(other.kw.get('s').lastPing, T0 + 45 * MIN);
-  assert.equal(other.kw.get('s').expiresAt, T0 + 105 * MIN);
-  assert.equal(other.kw.get('s').spent, 0);
-  await clock.to(T0 + 95 * MIN);
+  assert.equal(a.spawns.length, 1, 'the claims tie on time, so the lower window id goes first');
+  assert.equal(b.kw.get('s').lastSkip.why, 'another window is refreshing it');
+  await clock.to(T0 + 45 * MIN + C + RETRY_MS);
+  assert.equal(b.kw.get('s').lastPing, T0 + 45 * MIN + C);
+  assert.equal(b.kw.get('s').expiresAt, T0 + 105 * MIN + C);
+  assert.equal(b.kw.get('s').spent, 0);
+  await clock.to(T0 + 95 * MIN + 2 * C);
   assert.equal(a.spawns.length + b.spawns.length, 2);
-  assert.ok(pinger.spawns.length >= 1);
 
   // A window that is mid-ping makes the other wait rather than ping as well.
   const clock2 = fakeClock();
   const shared2 = fakeShared();
   const c = setup({ clock: clock2, shared: shared2, st: { ...st }, windowId: 'win-C', plan: () => ({ reply: false }) });
   c.kw.start('s');
-  await clock2.to(T0 + 45 * MIN);
+  await clock2.to(T0 + 45 * MIN + C);
   assert.equal(c.spawns.length, 1);
   const d = setup({ clock: clock2, shared: shared2, st: { ...st }, windowId: 'win-D' });
   d.kw.start('s');
@@ -535,10 +630,32 @@ test('two windows share one session: only one pings, the other counts that ping 
   // C's ping lands: D counts it as its own and does not ping.
   c.spawns[0].child.say(...pingEvents);
   await settle();
-  await clock2.to(T0 + 45 * MIN + RETRY_MS);
+  await clock2.to(T0 + 45 * MIN + C + RETRY_MS + C);
   assert.equal(d.spawns.length, 0);
-  assert.equal(d.kw.get('s').lastPing, T0 + 45 * MIN);
+  assert.equal(d.kw.get('s').lastPing, T0 + 45 * MIN + C);
 });
+
+for (const mode of ['crossing', 'lastWins']) {
+  test(`two windows due at the same moment, their shared views 100 ms late (${mode}): exactly one ping per refresh`, async () => {
+    const clock = fakeClock();
+    const net = delayedShared(clock, 100, mode);
+    const st = { lastRequest: T0 - 5 * MIN, ttlMs: TTL_1H, model: 'claude-haiku-test', contextTokens: 52_440 };
+    const a = setup({ clock, shared: net.view(), st, windowId: 'win-A' });
+    const b = setup({ clock, shared: net.view(), st, windowId: 'win-B' });
+    a.kw.start('s');
+    b.kw.start('s');
+    await clock.to(T0 + 46 * MIN);
+    assert.equal(a.spawns.length + b.spawns.length, 1, 'one ping at the first refresh');
+    const [pinger, other] = a.spawns.length ? [a, b] : [b, a];
+    assert.equal(other.kw.get('s').lastPing, pinger.kw.get('s').lastPing, 'the other window counts that ping as its own');
+    assert.equal(other.kw.get('s').active, true);
+    await clock.to(T0 + 97 * MIN);
+    assert.equal(a.spawns.length + b.spawns.length, 2, 'one ping at the second refresh');
+    await clock.to(T0 + 148 * MIN);
+    assert.equal(a.spawns.length + b.spawns.length, 3, 'and at the third');
+    assert.equal(a.kw.get('s').active && b.kw.get('s').active, true);
+  });
+}
 
 test("after a kept-warm session's next real turn, reports whether it read the context from the cache", async () => {
   const { kw, clock, st, changes } = setup();

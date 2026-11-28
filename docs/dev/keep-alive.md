@@ -21,8 +21,8 @@ Record shapes below are real, with synthetic text. Ids and paths are placeholder
   On a 52k-token session it read 51,969 tokens from the cache and wrote 469, for $0.0006.
 - **This account's sessions use the 1-hour cache.** Every cache write in the trial was `ephemeral_1h`. On the 1-hour
   TTL a ping is needed only every ~50 minutes, and keeping a session warm costs less than one cold resume for well
-  over a day. On the 5-minute TTL, which other accounts get, a ping is needed every ~4 minutes and keeping warm
-  stops paying for itself after 45 minutes (Haiku) to about 1.5 hours (Opus, Sonnet) (section 4). An hour-long run
+  over a day. On the 5-minute TTL, which other accounts get, a ping is needed every 3.5 minutes and keeping warm
+  stops paying for itself after under half an hour (Haiku) to about 1 h 15 min (Opus, Sonnet) (section 4). An hour-long run
 confirmed it: a session pinged once at 32 minutes was read whole from the cache at 64 minutes, while one left alone
 had to write 73k tokens again (section 5).
 - **The ping must not change the request's prefix.** The model, tool set and settings sources must match the session.
@@ -133,8 +133,8 @@ each one reads the conversation from the terminal's own cache entry and writes t
 5.5 at the 1-hour write price, $0.0019 on Haiku 5.5 above 100k, whatever the context size. `estimateKeepWarm()`
 counts it.
 
-Computed from `src/prices.json` by `estimateKeepWarm()`, with a ping every 50 minutes on the 1-hour TTL and every 4
-minutes on the 5-minute TTL, each writing 1,924 tokens:
+Computed from `src/prices.json` by `estimateKeepWarm()`, with a ping every 50 minutes on the 1-hour TTL and every 3.5
+minutes on the 5-minute TTL (section 6), each writing 1,924 tokens:
 
 | Model | Context | Ping (1 h TTL) | Ping (5 min TTL) | Cold resume extra (1 h TTL) | Cold resume extra (5 min TTL) |
 |---|---|---|---|---|---|
@@ -146,10 +146,10 @@ minutes on the 5-minute TTL, each writing 1,924 tokens:
 
 | Model | Context | Break-even, 1 h TTL | Break-even, 5 min TTL |
 |---|---|---|---|
-| Opus 5.5 | 50k | 15 pings, about **12.5 hours** | 12 pings, about **49 min** |
-| Opus 5.5, Sonnet 5.5 | 200k | 28 pings, about **23 hours** | 19 pings, about **1 h 17 min** |
-| Opus 5.5 | 500k | 34 pings, about **28 hours** | 22 pings, about **1 h 28 min** |
-| Haiku 5.5 | 50k | 11 pings, about **9 hours** | 8 pings, about **31 min** |
+| Opus 5.5 | 50k | 15 pings, about **12.5 hours** | 12 pings, about **43 min** |
+| Opus 5.5, Sonnet 5.5 | 200k | 28 pings, about **23 hours** | 19 pings, about **1 h 8 min** |
+| Opus 5.5 | 500k | 34 pings, about **28 hours** | 22 pings, about **1 h 17 min** |
+| Haiku 5.5 | 50k | 11 pings, about **9 hours** | 8 pings, about **27 min** |
 
 Before the fixed write, a ping cost N × r alone, and break-even was a flat (w − r) / r pings: 39 on Opus and Sonnet
 and 19 on Haiku at the 1-hour TTL. The write matters most on small sessions, where it is a large share of the ping.
@@ -183,8 +183,12 @@ then grew by 11 lines with the real turn.
 ## 6. Timing, failures and sleep
 
 - **Interval.** Ping when the cache has a margin left: at TTL − 10 minutes on the 1-hour TTL (every 50 minutes), and
-  at TTL − 60 seconds on the 5-minute TTL (every 4 minutes). The TTL comes from the log's last cache write, as
+  at TTL − 90 seconds on the 5-minute TTL (every 3.5 minutes). The TTL comes from the log's last cache write, as
   `usage.ts` already works out. A ping takes 1 to 2 seconds, including process start.
+- **Too close to the expiry.** A ping is not started with under a minute left (`MIN_LEFT_MS`): claude.exe's start-up
+  (MCP servers, Windows) could take its request past the expiry, and a late ping pays the full write. The 5-minute
+  margin is 90 seconds rather than 60 for this reason, plus the 4-second claim below; it leaves no room for a retry or
+  a skipped ping on that TTL, so those stop as expired. SA-72's run measures the real spawn-to-request time.
 - **Schedule from the wall clock.** Each tick computes the next ping from `max(last logged request, last ping)` and
   `Date.now()`, rather than counting `setTimeout`s, so drift does not add up and a real turn in a terminal (which
   refreshes the cache by itself) pushes the next ping back.
@@ -199,8 +203,14 @@ then grew by 11 lines with the real turn.
 - **One process per ping, not a long-lived one.** A fresh `--resume` reads the current log each time, so if the user
   has added turns elsewhere in the meantime, the ping warms the new prefix. A long-lived no-persist process would
   keep pinging the conversation as it was when it started.
-- **Two VS Code windows** could both keep one session warm. The scheduler should record its pings in `globalState`
-  (session id, window, last ping time) and skip a ping another window has just made.
+- **Two VS Code windows** could both keep one session warm. They compute the same due time from the same log, and
+  `globalState` reaches the other window late, so a claim read back at once would show each window only its own. So
+  a window that is due writes a claim (its window id and the claim time) into the session's record in `globalState`,
+  waits 2 seconds, reads the claims again, and does that once more: an earlier claim from another window, by claim
+  time and then window id, makes it back off and count that window's ping as its own. A claim that another window's
+  write has overwritten is written again after the first wait, so after the second both windows see both claims.
+  Each ping therefore starts 4 seconds after it is due. The record also keeps the last ping (window and time), which
+  every window reads.
 
 ## 7. Conflicts with other writers
 
@@ -301,8 +311,9 @@ The trial script still rewrites arguments through its spawner.
 drives it with a fake clock, a fake `globalState` and a fake `claude`. Each tick reads the session again and decides
 from the wall clock: stop (the chosen duration, the spend cap, an expiry, a sleep past the expiry), wait, skip (the
 log written in the last `RECENT_WRITE_MS`, or the caller's `busy` reason: the in-view chat replying, a terminal
-open, another window mid-ping), or ping. A failed ping is retried once after 30 seconds. Pings are recorded in
-`globalState` under `keepWarm.pings`, and another window's ping counts as this window's own. Each ping's cost, cache
+open, another window's claim), or claim and ping. A failed ping is retried once after 30 seconds. Claims and pings
+are recorded in `globalState` under `keepWarm.pings` (section 6), and another window's ping counts as this window's
+own. Each ping's cost, cache
 read and write, `init` model and `init.permissionMode` are kept and logged: the last one shows whether the appended
 `--permission-mode dontAsk` wins over the one `chatArgs` gives (PR #108 review). The real CLI's answer is not
 recorded yet; SA-72's README asks for it. `get()` gives the effective expiry (`max(last request, last ping) + TTL`) for the timers,
