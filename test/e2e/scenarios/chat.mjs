@@ -257,9 +257,14 @@ const LIVE_SCENARIOS = [
   {
     name: 'live-open-run',
     prompt: 'E2E live elsewhere, Open run from the notice',
-    files: liveRunFiles,
     async run(ctx) {
       const live = goLive(ctx);
+      // The subagent has written its own log by now. (`files` is only written for a scenario with a `log` of its own.)
+      const projectDir = path.dirname(logPath(ctx.s, ctx.id));
+      for (const [rel, text] of Object.entries(liveRunFiles({ id: ctx.id, cwd: ctx.s.work }))) {
+        mkdirSync(path.dirname(path.join(projectDir, rel)), { recursive: true });
+        writeFileSync(path.join(projectDir, rel), text);
+      }
       try {
         await openTranscript(ctx);
         await waitFor('the transcript notice to list the subagent and the shell', async () => {
